@@ -3,7 +3,7 @@
 SQL Server User Activity Audit - Ingestion Job
 ==============================================================================
 Purpose:  Create SQL Agent job to periodically ingest Extended Events data
-          from .xel files into DBA.dbo.UserActivityHistory table.
+          from .xel files into DBA.dbo.useractivityhist table.
 
 Schedule: Every 15 minutes (adjustable)
 Target:   SQL Server 2019 Enterprise Edition
@@ -44,12 +44,16 @@ EXEC @ReturnCode = msdb.dbo.sp_add_job
     @notify_level_email = 2,
     @notify_level_page = 0,
     @delete_level = 0,
-    @description = N'Ingests Extended Events user activity data from .xel files into DBA.dbo.UserActivityHistory table for historical reporting.',
+    @description = N'Ingests Extended Events user activity data from .xel files into DBA.dbo.useractivityhist table for historical reporting.',
     @category_name = N'DBA Maintenance',
     @owner_login_name = N'sa',
     @job_id = @jobId OUTPUT;
 
-IF (@@ERROR <> 0 OR @ReturnCode <> 0) GOTO QuitWithRollback;
+IF (@@ERROR <> 0 OR @ReturnCode <> 0)
+BEGIN
+    RAISERROR('Failed to create job.', 16, 1);
+    RETURN;
+END
 
 -- Job step: Ingest XE data
 EXEC @ReturnCode = msdb.dbo.sp_add_jobstep
@@ -75,6 +79,7 @@ BEGIN TRY
     
     CREATE TABLE #XEStaging
     (
+        xe_file_name         nvarchar(260),
         event_time_utc       datetime2(3),
         event_name           varchar(60),
         database_name        sysname,
@@ -85,13 +90,13 @@ BEGIN TRY
         session_id           int,
         statement_text       nvarchar(max),
         object_name          sysname,
-        is_success           bit,
-        xe_file_name         nvarchar(260)
+        is_success           bit
     );
 
     -- Read XE files and extract relevant fields
     INSERT INTO #XEStaging
     (
+        xe_file_name,
         event_time_utc,
         event_name,
         database_name,
@@ -102,39 +107,37 @@ BEGIN TRY
         session_id,
         statement_text,
         object_name,
-        is_success,
-        xe_file_name
+        is_success
     )
     SELECT
-        event_data.value(''(event/@timestamp)[1]'', ''datetime2(3)'') AS event_time_utc,
-        event_data.value(''(event/@name)[1]'', ''varchar(60)'') AS event_name,
-        event_data.value(''(event/action[@name="database_name"]/value)[1]'', ''sysname'') AS database_name,
-        event_data.value(''(event/action[@name="server_principal_name"]/value)[1]'', ''sysname'') AS server_principal_name,
-        event_data.value(''(event/action[@name="client_app_name"]/value)[1]'', ''nvarchar(128)'') AS client_app_name,
-        event_data.value(''(event/action[@name="client_hostname"]/value)[1]'', ''nvarchar(128)'') AS client_hostname,
-        event_data.value(''(event/data[@name="client_ip"]/value)[1]'', ''varchar(48)'') AS client_ip_address,
-        event_data.value(''(event/action[@name="session_id"]/value)[1]'', ''int'') AS session_id,
+        xe_data.file_name,
+        xe_data.event_xml.value(''(event/@timestamp)[1]'', ''datetime2(3)'') AS event_time_utc,
+        xe_data.event_xml.value(''(event/@name)[1]'', ''varchar(60)'') AS event_name,
+        xe_data.event_xml.value(''(event/action[@name=\"database_name\"]/value)[1]'', ''sysname'') AS database_name,
+        xe_data.event_xml.value(''(event/action[@name=\"server_principal_name\"]/value)[1]'', ''sysname'') AS server_principal_name,
+        xe_data.event_xml.value(''(event/action[@name=\"client_app_name\"]/value)[1]'', ''nvarchar(128)'') AS client_app_name,
+        xe_data.event_xml.value(''(event/action[@name=\"client_hostname\"]/value)[1]'', ''nvarchar(128)'') AS client_hostname,
+        xe_data.event_xml.value(''(event/data[@name=\"client_ip\"]/value)[1]'', ''varchar(48)'') AS client_ip_address,
+        xe_data.event_xml.value(''(event/action[@name=\"session_id\"]/value)[1]'', ''int'') AS session_id,
         COALESCE(
-            event_data.value(''(event/data[@name="batch_text"]/value)[1]'', ''nvarchar(max)''),
-            event_data.value(''(event/data[@name="statement"]/value)[1]'', ''nvarchar(max)'')
+            xe_data.event_xml.value(''(event/data[@name=\"batch_text\"]/value)[1]'', ''nvarchar(max)''),
+            xe_data.event_xml.value(''(event/data[@name=\"statement\"]/value)[1]'', ''nvarchar(max)'')
         ) AS statement_text,
-        event_data.value(''(event/data[@name="object_name"]/value)[1]'', ''sysname'') AS object_name,
+        xe_data.event_xml.value(''(event/data[@name=\"object_name\"]/value)[1]'', ''sysname'') AS object_name,
         CASE
-            WHEN event_data.value(''(event/@name)[1]'', ''varchar(60)'') = ''login'' THEN 1
-            WHEN event_data.value(''(event/@name)[1]'', ''varchar(60)'') = ''errorlog_written'' THEN 0
+            WHEN xe_data.event_xml.value(''(event/@name)[1]'', ''varchar(60)'') = ''login'' THEN 1
             ELSE NULL
-        END AS is_success,
-        event_data.value(''(@name)[1]'', ''nvarchar(260)'') AS xe_file_name
+        END AS is_success
     FROM
     (
-        SELECT CAST(event_data AS xml) AS event_data
+        SELECT file_name, CAST(event_data AS xml) AS event_xml
         FROM sys.fn_xe_file_target_read_file(@XEFilePath, NULL, NULL, NULL)
-    ) AS xml_data;
+    ) AS xe_data;
 
     SET @RowsInserted = @@ROWCOUNT;
 
     -- Insert only new rows (avoid duplicates based on time/user/event)
-    INSERT INTO DBA.dbo.UserActivityHistory
+    INSERT INTO DBA.dbo.useractivityhist
     (
         event_time_utc,
         event_name,
@@ -166,14 +169,14 @@ BEGIN TRY
     WHERE NOT EXISTS
     (
         SELECT 1
-        FROM DBA.dbo.UserActivityHistory h
+        FROM DBA.dbo.useractivityhist h
         WHERE h.event_time_utc = s.event_time_utc
           AND ISNULL(h.server_principal_name, '''') = ISNULL(s.server_principal_name, '''')
           AND h.event_name = s.event_name
           AND ISNULL(h.session_id, 0) = ISNULL(s.session_id, 0)
     );
 
-    PRINT ''Ingested '' + CAST(@RowsInserted AS varchar(10)) + '' new rows into UserActivityHistory.'';
+    PRINT ''Ingested '' + CAST(@RowsInserted AS varchar(10)) + '' new rows into useractivityhist.'';
 
 END TRY
 BEGIN CATCH
@@ -188,7 +191,11 @@ END CATCH;
     @database_name = N'master',
     @flags = 4; -- Include step output in job history
 
-IF (@@ERROR <> 0 OR @ReturnCode <> 0) GOTO QuitWithRollback;
+IF (@@ERROR <> 0 OR @ReturnCode <> 0)
+BEGIN
+    RAISERROR('Failed to add job step.', 16, 1);
+    RETURN;
+END
 
 -- Create schedule: Every 15 minutes
 EXEC @ReturnCode = msdb.dbo.sp_add_jobschedule
@@ -206,22 +213,20 @@ EXEC @ReturnCode = msdb.dbo.sp_add_jobschedule
     @active_start_time = 0,
     @active_end_time = 235959;
 
-IF (@@ERROR <> 0 OR @ReturnCode <> 0) GOTO QuitWithRollback;
+IF (@@ERROR <> 0 OR @ReturnCode <> 0)
+BEGIN
+    RAISERROR('Failed to add job schedule.', 16, 1);
+END
 
 -- Assign job to local server
 EXEC @ReturnCode = msdb.dbo.sp_add_jobserver
     @job_id = @jobId,
     @server_name = N'(local)';
 
-IF (@@ERROR <> 0 OR @ReturnCode <> 0) GOTO QuitWithRollback;
-
-COMMIT TRANSACTION;
-GOTO EndSave;
-
-QuitWithRollback:
-    IF (@@TRANCOUNT > 0) ROLLBACK TRANSACTION;
-
-EndSave:
+IF (@@ERROR <> 0 OR @ReturnCode <> 0)
+BEGIN
+    RAISERROR('Failed to assign job to server.', 16, 1);
+END
 
 PRINT 'SQL Agent job created successfully.';
 PRINT 'Job: DBA - Ingest User Activity Audit';

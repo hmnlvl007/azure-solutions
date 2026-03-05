@@ -3,7 +3,7 @@
 SQL Server User Activity Audit - Reporting Queries
 ==============================================================================
 Purpose:  Common queries for analyzing user activity captured in 
-          DBA.dbo.UserActivityHistory table.
+          DBA.dbo.useractivityhist table.
 
 Target:   SQL Server 2019 Enterprise Edition
 ==============================================================================
@@ -17,36 +17,28 @@ GO
 -- =============================================================================
 SELECT
     event_time_utc,
-  (event_time_utc AT TIME ZONE 'UTC' AT TIME ZONE 'Pacific Standard Time') AS event_time_pacific,
+    (event_time_utc AT TIME ZONE 'UTC' AT TIME ZONE 'Pacific Standard Time') AS event_time_pacific,
     server_principal_name,
     database_name,
     client_hostname,
     client_app_name,
     client_ip_address,
-    is_success,
     event_name
-FROM dbo.UserActivityHistory
-WHERE event_name IN ('login', 'errorlog_written')
+FROM dbo.useractivityhist
+WHERE event_name IN ('login', 'logout')
   AND event_time_utc >= DATEADD(HOUR, -24, GETUTCDATE())
 ORDER BY event_time_utc DESC;
 GO
 
 -- =============================================================================
 -- QUERY 2: Failed login attempts (security monitoring)
+-- NOTE: Failed logins are not captured by the Extended Events session.
+-- To monitor failed logins, query the SQL Server Error Log directly:
 -- =============================================================================
-SELECT
-    event_time_utc,
-  (event_time_utc AT TIME ZONE 'UTC' AT TIME ZONE 'Pacific Standard Time') AS event_time_pacific,
-    server_principal_name,
-    client_hostname,
-    client_ip_address,
-    client_app_name,
-    COUNT(*) OVER (PARTITION BY server_principal_name, client_ip_address) AS failed_attempts
-FROM dbo.UserActivityHistory
-WHERE event_name = 'errorlog_written'
-  AND is_success = 0
-  AND event_time_utc >= DATEADD(DAY, -7, GETUTCDATE())
-ORDER BY event_time_utc DESC;
+/*
+-- Alternative: Query error log for failed logins
+EXEC xp_readerrorlog 0, 1, N'Login failed';
+*/
 GO
 
 -- =============================================================================
@@ -59,7 +51,7 @@ SELECT
     COUNT(DISTINCT client_ip_address) AS distinct_ips,
     MIN(event_time_utc) AS first_login,
     MAX(event_time_utc) AS last_login
-FROM dbo.UserActivityHistory
+FROM dbo.useractivityhist
 WHERE event_name = 'login'
   AND event_time_utc >= DATEADD(DAY, -7, GETUTCDATE())
 GROUP BY server_principal_name
@@ -75,7 +67,7 @@ SELECT
     COUNT(DISTINCT server_principal_name) AS distinct_users,
     MIN(event_time_utc) AS first_activity,
     MAX(event_time_utc) AS last_activity
-FROM dbo.UserActivityHistory
+FROM dbo.useractivityhist
 WHERE database_name IS NOT NULL
   AND event_time_utc >= DATEADD(DAY, -7, GETUTCDATE())
 GROUP BY database_name
@@ -91,7 +83,7 @@ WITH HistoricalHosts AS
         server_principal_name,
         client_hostname,
         client_ip_address
-    FROM dbo.UserActivityHistory
+    FROM dbo.useractivityhist
     WHERE event_time_utc < DATEADD(DAY, -7, GETUTCDATE())
 )
 SELECT
@@ -102,7 +94,7 @@ SELECT
     h.client_ip_address,
     h.client_app_name,
     'NEW HOST/IP FOR USER' AS alert_reason
-FROM dbo.UserActivityHistory h
+FROM dbo.useractivityhist h
 WHERE h.event_name = 'login'
   AND h.event_time_utc >= DATEADD(DAY, -7, GETUTCDATE())
   AND NOT EXISTS
@@ -128,7 +120,7 @@ WITH LoginLogout AS
         event_time_utc,
         LEAD(event_time_utc) OVER (PARTITION BY session_id ORDER BY event_time_utc) AS next_event_time,
         LEAD(event_name) OVER (PARTITION BY session_id ORDER BY event_time_utc) AS next_event_name
-    FROM dbo.UserActivityHistory
+    FROM dbo.useractivityhist
     WHERE event_name IN ('login', 'logout')
       AND session_id IS NOT NULL
       AND event_time_utc >= DATEADD(DAY, -7, GETUTCDATE())
@@ -157,7 +149,7 @@ SELECT
     COUNT(DISTINCT server_principal_name) AS distinct_users,
     COUNT(DISTINCT database_name) AS distinct_databases,
     SUM(DATALENGTH(statement_text)) / 1024.0 / 1024.0 AS statement_text_mb
-FROM dbo.UserActivityHistory
+FROM dbo.useractivityhist
 GROUP BY CAST(event_time_utc AS date)
 ORDER BY audit_date DESC;
 GO
@@ -170,7 +162,7 @@ SELECT TOP 20
     event_name,
     COUNT(*) AS event_count,
     MAX(event_time_utc) AS last_event_time
-FROM dbo.UserActivityHistory
+FROM dbo.useractivityhist
 WHERE event_time_utc >= DATEADD(DAY, -7, GETUTCDATE())
 GROUP BY server_principal_name, event_name
 ORDER BY event_count DESC;
@@ -185,7 +177,7 @@ SELECT
     COUNT(DISTINCT server_principal_name) AS distinct_users,
     MIN(event_time_utc) AS first_seen,
     MAX(event_time_utc) AS last_seen
-FROM dbo.UserActivityHistory
+FROM dbo.useractivityhist
 WHERE event_name = 'login'
   AND event_time_utc >= DATEADD(DAY, -7, GETUTCDATE())
 GROUP BY client_app_name
@@ -200,7 +192,7 @@ GO
 DECLARE @RetentionDays int = 90;
 DECLARE @RowsDeleted int;
 
-DELETE FROM dbo.UserActivityHistory
+DELETE FROM dbo.useractivityhist
 WHERE event_time_utc < DATEADD(DAY, -@RetentionDays, GETUTCDATE());
 
 SET @RowsDeleted = @@ROWCOUNT;
