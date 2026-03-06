@@ -14,6 +14,18 @@
 
 .PARAMETER CMSServer
     The name of the Central Management Server instance.
+    Mutually exclusive with ExcelFilePath.
+
+.PARAMETER ExcelFilePath
+    Path to an Excel file (.xlsx) containing a list of server names.
+    The file must have a column named 'ServerName' (or specify via -ServerColumn).
+    Mutually exclusive with CMSServer.
+
+.PARAMETER SheetName
+    The worksheet name to read from the Excel file. Defaults to the first sheet.
+
+.PARAMETER ServerColumn
+    The column header in the Excel file that contains server names. Defaults to 'ServerName'.
 
 .PARAMETER OutputPath
     Path for the HTML report file. Defaults to current directory.
@@ -23,12 +35,28 @@
 
 .EXAMPLE
     .\Get-CMSServerReport.ps1 -CMSServer "MyCMSServer" -OutputPath "C:\Reports"
+
+.EXAMPLE
+    .\Get-CMSServerReport.ps1 -ExcelFilePath "C:\Servers\ServerList.xlsx" -OutputPath "C:\Reports"
+
+.EXAMPLE
+    .\Get-CMSServerReport.ps1 -ExcelFilePath "C:\Servers\ServerList.xlsx" -SheetName "Production" -ServerColumn "SQLInstance"
 #>
 
-[CmdletBinding()]
+[CmdletBinding(DefaultParameterSetName = 'CMS')]
 param(
-    [Parameter(Mandatory = $true)]
+    [Parameter(Mandatory = $true, ParameterSetName = 'CMS')]
     [string]$CMSServer,
+
+    [Parameter(Mandatory = $true, ParameterSetName = 'Excel')]
+    [ValidateScript({ Test-Path $_ -PathType Leaf })]
+    [string]$ExcelFilePath,
+
+    [Parameter(Mandatory = $false, ParameterSetName = 'Excel')]
+    [string]$SheetName,
+
+    [Parameter(Mandatory = $false, ParameterSetName = 'Excel')]
+    [string]$ServerColumn = 'ServerName',
 
     [Parameter(Mandatory = $false)]
     [string]$OutputPath = (Get-Location).Path,
@@ -64,35 +92,74 @@ function Invoke-SqlQuerySafe {
 # 1. Get all registered servers from CMS
 # ─────────────────────────────────────────────────────────────────────────────
 Write-Host "═══════════════════════════════════════════════════════════════" -ForegroundColor Cyan
-Write-Host "  SQL Server CMS – Availability Group & Replication Report    " -ForegroundColor Cyan
+Write-Host "  SQL Server – Availability Group & Replication Report         " -ForegroundColor Cyan
 Write-Host "═══════════════════════════════════════════════════════════════" -ForegroundColor Cyan
 Write-Host ""
-Write-Host "Connecting to CMS: $CMSServer ..." -ForegroundColor Yellow
 
-try {
-    $registeredServers = Get-DbaCmsRegServer -SqlInstance $CMSServer -ErrorAction Stop |
-                         Select-Object -ExpandProperty ServerName -Unique
-}
-catch {
-    # Fallback: use the SqlServer module approach
-    Write-Host "  dbatools not available, trying SqlServer module..." -ForegroundColor DarkYellow
-    try {
-        $provider = Get-ChildItem "SQLSERVER:\SQLRegistration\Central Management Server Group\$CMSServer" -Recurse -ErrorAction Stop |
-                    Where-Object { $_.GetType().Name -eq 'RegisteredServer' }
-        $registeredServers = $provider | ForEach-Object { $_.ServerName } | Sort-Object -Unique
-    }
-    catch {
-        Write-Error "Could not retrieve registered servers from CMS [$CMSServer]. Ensure dbatools or SqlServer module is installed. Error: $_"
+if ($PSCmdlet.ParameterSetName -eq 'Excel') {
+    # ── Load servers from Excel file ──────────────────────────────────
+    Write-Host "Reading server list from Excel: $ExcelFilePath ..." -ForegroundColor Yellow
+
+    # Ensure ImportExcel module is available
+    if (-not (Get-Module -ListAvailable -Name ImportExcel)) {
+        Write-Error "The ImportExcel module is required for Excel input. Install it with: Install-Module ImportExcel -Scope CurrentUser"
         exit 1
     }
+    Import-Module ImportExcel -ErrorAction Stop
+
+    $importParams = @{ Path = $ExcelFilePath }
+    if ($SheetName) { $importParams['WorksheetName'] = $SheetName }
+
+    try {
+        $excelData = Import-Excel @importParams -ErrorAction Stop
+    }
+    catch {
+        Write-Error "Failed to read Excel file [$ExcelFilePath]: $_"
+        exit 1
+    }
+
+    if ($ServerColumn -notin ($excelData[0].PSObject.Properties.Name)) {
+        Write-Error "Column '$ServerColumn' not found in the Excel file. Available columns: $($excelData[0].PSObject.Properties.Name -join ', ')"
+        exit 1
+    }
+
+    $registeredServers = $excelData | ForEach-Object { $_.$ServerColumn } |
+                         Where-Object { -not [string]::IsNullOrWhiteSpace($_) } |
+                         Sort-Object -Unique
+
+    $serverSource = "Excel file: $ExcelFilePath"
+}
+else {
+    # ── Load servers from CMS ───────────────────────────────────────
+    Write-Host "Connecting to CMS: $CMSServer ..." -ForegroundColor Yellow
+
+    try {
+        $registeredServers = Get-DbaCmsRegServer -SqlInstance $CMSServer -ErrorAction Stop |
+                             Select-Object -ExpandProperty ServerName -Unique
+    }
+    catch {
+        # Fallback: use the SqlServer module approach
+        Write-Host "  dbatools not available, trying SqlServer module..." -ForegroundColor DarkYellow
+        try {
+            $provider = Get-ChildItem "SQLSERVER:\SQLRegistration\Central Management Server Group\$CMSServer" -Recurse -ErrorAction Stop |
+                        Where-Object { $_.GetType().Name -eq 'RegisteredServer' }
+            $registeredServers = $provider | ForEach-Object { $_.ServerName } | Sort-Object -Unique
+        }
+        catch {
+            Write-Error "Could not retrieve registered servers from CMS [$CMSServer]. Ensure dbatools or SqlServer module is installed. Error: $_"
+            exit 1
+        }
+    }
+
+    $serverSource = "CMS: $CMSServer"
 }
 
 if (-not $registeredServers -or $registeredServers.Count -eq 0) {
-    Write-Error "No registered servers found on CMS [$CMSServer]."
+    Write-Error "No servers found from $serverSource."
     exit 1
 }
 
-Write-Host "  Found $($registeredServers.Count) registered server(s)." -ForegroundColor Green
+Write-Host "  Found $($registeredServers.Count) server(s) from $serverSource." -ForegroundColor Green
 Write-Host ""
 
 # ─────────────────────────────────────────────────────────────────────────────
