@@ -151,9 +151,9 @@ Compare this to the current 6-step process with snapshot reinit risk.
 | Pros | Cons |
 |---|---|
 | Eliminates trans repl + CDC-on-subscriber fragility | Requires AG setup (one-time effort) |
-| Consumer reads isolated from primary via secondary | CDC log reader runs on primary (comparable to existing trans repl log reader) |
+| Consumer reads isolated from primary via secondary | CDC capture runs continuously on primary — new cost during batch windows (see Impact section) |
 | CDC metadata survives AG failover | AG requires Enterprise Edition (you already have it) |
-| Trivial new table onboarding | |
+| Trivial new table onboarding | CDC change table writes add I/O to primary data disks |
 | Continuous CDC by design | |
 | Uses technology you already own and license | |
 
@@ -210,32 +210,31 @@ Drop transactional replication.
 
 **Rationale:**
 
-1. **You already pay the log reader cost on primary.** Transactional replication
-   runs a log reader on primary today. CDC's log reader is the same mechanism
-   (`sp_replcmds` vs. `sp_cdc_scan` — both read the transaction log). Net
-   overhead is comparable, possibly lower since you eliminate the Distribution DB
-   round-trip.
-
-2. **Eliminates the single biggest failure mode.** CDC-on-subscriber-after-
+1. **Eliminates the single biggest failure mode.** CDC-on-subscriber-after-
    snapshot-reinit is the root cause of most downstream breaks today.
 
-3. **Readable secondary isolates consumer workload from production OLTP.**
-   Management's concern about primary impact is fully addressed — Airbyte and
+2. **Readable secondary isolates consumer workload from production OLTP.**
+   Management's concern about query impact is fully addressed — Airbyte and
    CData never touch the primary.
 
-4. **Adding tables becomes trivial.** One stored procedure call replaces a
+3. **Adding tables becomes trivial.** One stored procedure call replaces a
    multi-step replication article/snapshot/CDC-enable/connector-configure workflow.
 
-5. **You already own the technology.** SQL Server Enterprise includes AG. No new
+4. **You already own the technology.** SQL Server Enterprise includes AG. No new
    licensing.
 
-6. **CDC metadata survives failover.** If the AG fails over, CDC is preserved on
+5. **CDC metadata survives failover.** If the AG fails over, CDC is preserved on
    the new primary. Today, if the replication subscriber goes down, you rebuild
    from scratch.
 
-7. **Path to continuous CDC.** CDC capture is always running on primary. Change
-   tables flow to the secondary in near-real-time via AG. Consumers read
-   continuously. No scheduled batch windows needed.
+6. **Delivers on the continuous replication requirement.** CDC capture runs
+   continuously on primary — no batch suspension windows, no data lag gaps.
+   Change tables flow to the secondary in near-real-time via AG.
+
+**Trade-off acknowledged:** This approach adds a continuous log reader and change
+table write I/O to the primary that does not exist today during batch windows
+(because transactional replication is currently suspended during batch). This new
+cost is analyzed in the CDC Impact section below.
 
 ---
 
@@ -245,10 +244,39 @@ Enabling CDC on a multi-TB primary with mixed OLTP and nightly batch workloads
 is not zero-cost. This section provides an honest breakdown of the real impact
 and the mitigations available.
 
-### 1. Transaction Log Retention
+### Important Context: Current Batch Window Behavior
+
+**Today, transactional replication is suspended during the nightly batch window.**
+This means the primary currently runs with NO log reader overhead during its
+heaviest write period. The log reader restarts after batch completes and catches
+up.
+
+**With continuous CDC, there is no suspension.** The capture job runs through the
+entire batch window. This is a real, new cost on primary that does not exist
+today. However, any continuous replication solution — whether CDC, Qlik, HVR, or
+even transactional replication left running — would impose this same continuous
+log reader cost. The question is not "is it free" (it is not), but "which
+continuous mechanism has the smallest footprint and fewest failure modes."
+
+---
+
+### 1. Transaction Log Retention (Different from Trans Repl)
 
 **What happens:** CDC prevents log truncation on VLFs that the capture job has
 not read yet. The transaction log cannot be truncated past the CDC scan LSN.
+
+**How this differs from transactional replication:**
+
+- With trans repl, once the log reader agent processes entries and writes them to
+  the Distribution DB, those VLFs are eligible for truncation. The change data
+  exits the source database entirely.
+- With CDC, the capture job reads the log and writes change rows into
+  `cdc.*_CT` change tables **inside the same database**. The log can truncate
+  once the capture job has read past those VLFs, but the change data remains in
+  the source database as change table rows until the cleanup job removes them.
+- **Today, trans repl is suspended during batch**, so the log is free to truncate
+  normally (based on backup schedule) during the heaviest write period. With
+  continuous CDC, the log will be held open by the capture job during batch.
 
 **Why this matters for Facets:**
 
@@ -258,12 +286,15 @@ not read yet. The transaction log cannot be truncated past the CDC scan LSN.
   grows unbounded until capture catches up.
 - On a multi-TB database with heavy batch writes, this can mean tens to hundreds
   of GB of additional log retention.
+- **This is new overhead** compared to today, where the log reader is off during
+  batch.
 
 **Real-world scenario:**
 
 ```
 10:00 PM  - Nightly batch starts, writes 50 GB of log in 2 hours
-          - CDC capture scanning at 500 transactions/poll × 10 polls/sec
+          - TODAY: trans repl suspended, log truncates normally per backup
+          - WITH CDC: capture job scanning continuously
           - Capture falls behind by 30 GB
           - Transaction log cannot truncate those 30 GB
           - Log file grows from 20 GB → 50+ GB
@@ -277,8 +308,9 @@ not read yet. The transaction log cannot be truncated past the CDC scan LSN.
   not rely on autogrow)
 - Tune `maxtrans` and `maxscans` parameters on the capture job (see Tuning
   section below)
-- Place the log file on fast storage
+- Place the log file on fast storage with headroom for batch-window growth
 - Monitor `sys.dm_cdc_log_scan_sessions` for latency
+- Consider separate filegroup for CDC change tables to isolate I/O
 
 ---
 
@@ -361,24 +393,38 @@ instances. The log reader is the bottleneck, not the metadata.
 
 ### 5. Comparison: What You Have Today vs. CDC on Primary
 
-| Factor | Current (Trans Repl Log Reader) | CDC Log Reader on Primary |
+| Factor | Current (Trans Repl — Suspended During Batch) | Continuous CDC on Primary |
 |---|---|---|
-| Log reading mechanism | `sp_replcmds` | `sp_replcmds` (same) |
-| Log retention | Log held until Distribution Agent delivers | Log held until CDC capture reads it |
-| Write destination | Distribution DB (separate database/server) | CDC change tables (same database) |
-| Batch window impact | Log reader can fall behind; log grows | Same behavior |
-| Recovery | Reinit subscriber from snapshot | No reinit — CDC is self-contained |
+| Log reading mechanism | `sp_replcmds` | `sp_replcmds` (same internal function) |
+| Runs during batch? | **No — suspended** | **Yes — continuous** |
+| Log retention during batch | Minimal — log truncates per backup schedule | CDC holds log until capture reads it |
+| Write destination | Distribution DB (separate server) | CDC change tables (same database on primary) |
+| I/O on primary during batch | Low (log reader is off) | Moderate (log reads + change table writes) |
+| Recovery from failure | Snapshot reinit (expensive, breaks downstream CDC) | CDC is self-contained, no reinit needed |
 | Article/capture count | 1K+ articles | 1K+ capture instances |
+| Data continuity during batch | Gap — no replication during suspension | No gap — continuous capture |
 
-**Key difference:** With transactional replication, the write destination is the
-Distribution DB (separate server). With CDC, the change tables are written into
-the same database on primary. This means:
+**Key differences:**
 
-- Slightly more I/O on the primary's data disks (change table writes)
-- But you eliminate the Distribution DB, Distribution Agent, and network I/O to
-  the subscriber
-- Net I/O on the primary is comparable — it shifts from network-bound to
-  local-disk-bound
+1. **Batch window overhead is new.** Today the log reader is off during batch.
+   With continuous CDC it is on. This adds log read I/O, change table write I/O,
+   and log retention pressure during the heaviest write period. This is the
+   primary trade-off for achieving continuous replication.
+
+2. **Change table writes are local, not remote.** With trans repl, change data
+   is written to the Distribution DB on a separate server — I/O is offloaded.
+   With CDC, change tables live inside the same database on primary. This adds
+   write I/O to the primary's data disks that does not exist today.
+
+3. **No data gaps, no reinit.** Today, the batch suspension window means
+   downstream consumers see a replication gap nightly. If trans repl breaks, a
+   snapshot reinit is required, which destroys downstream CDC. With continuous
+   CDC, the data stream never stops and recovery does not require reinit.
+
+**The trade-off is clear:** you accept higher primary overhead during batch
+windows in exchange for continuous data flow, no suspension gaps, and no
+snapshot-reinit risk. Any continuous solution would impose similar overhead —
+this is the cost of eliminating the suspension window.
 
 ---
 
@@ -464,32 +510,49 @@ ORDER BY total_rows DESC;
 
 ### Bottom Line
 
-**Is there impact?** Yes. CDC on a multi-TB primary with nightly batch is not
-free. The two real costs are:
+**Is there more overhead on primary than today?** Yes. Be honest about this with
+management. Two costs are genuinely new:
 
-1. **Transaction log retention during batch windows** — the log will grow
-   larger than it does today during heavy write periods. Pre-size it and
+1. **Continuous log reader during batch windows.** Today the log reader is
+   suspended during batch. With CDC it runs continuously. The transaction log
+   will grow larger during batch windows than it does today. Pre-size it and
    monitor it.
 
-2. **CDC change table writes** — 1K+ change tables receiving INSERTs on the
-   primary's data disks. This is new I/O that currently happens on the
-   subscriber.
+2. **CDC change table writes on primary's data disks.** Today, change data is
+   written to the Distribution DB on a separate server. With CDC, change tables
+   live in the same database. This adds write I/O to the primary that is
+   currently offloaded.
+
+**Is this the cost of continuous replication?** Yes — and it applies to any
+continuous solution, not just CDC. If transactional replication were left running
+during batch instead of suspended, it would also hold the log open and add I/O.
+Qlik Replicate, HVR, or Debezium reading the log continuously would have the
+same log retention impact.
 
 **Is it manageable?** Yes. Because:
 
-- You are already running a log reader on primary (trans repl). CDC replaces it,
-  not adds to it.
 - The AG secondary absorbs all consumer read workload. Primary only does capture
-  writes.
-- Tuning `maxtrans`/`maxscans`/`pollinginterval` lets you control how
-  aggressively capture runs.
+  writes — no Airbyte/CData queries.
+- Tuning `maxtrans`/`maxscans`/`pollinginterval` controls how aggressively
+  capture runs and how quickly it catches up after batch peaks.
 - Capture lag during batch windows is acceptable — downstream consumers are not
-  real-time.
+  real-time sensitive.
+- Pre-sizing the log file and placing change tables on fast storage addresses the
+  I/O cost.
 
-**Is it worse than what you have today?** No. Today you have trans repl log
-reader + Distribution DB + subscriber CDC + snapshot reinit risk. The failure
-surface is larger. The AG + CDC architecture has a simpler failure profile even
-though it moves capture write I/O to the primary.
+**Is the overall architecture better than today?** Yes. Today you have:
+- Trans repl with nightly suspension (data gap)
+- Distribution DB overhead
+- CDC on subscriber (fragile — snapshot reinit destroys it)
+- 3-hop pipeline with multiple failure surfaces
+
+With AG + CDC you have:
+- One continuous pipeline with no suspension gap
+- No Distribution DB to manage
+- No snapshot reinit risk
+- No CDC-on-subscriber fragility
+- Higher primary overhead during batch, but a dramatically simpler and more
+  resilient architecture overall
 
 ---
 
