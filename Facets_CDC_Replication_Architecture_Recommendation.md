@@ -2,7 +2,7 @@
 
 **Date:** March 9, 2026  
 **Status:** Draft — For Team Discussion  
-**Scope:** FacetsReporting replication pipeline redesign  
+**Scope:** Reporting replication pipeline redesign  
 
 ---
 
@@ -34,7 +34,7 @@
 ```
 Facets OLTP (Primary, multi-TB)
   │
-  ├── Transactional Replication (1K+ tables) ──► FacetsReporting DB (Subscriber)
+  ├── Transactional Replication (1K+ tables) ──► Reporting DB (Subscriber)
   │                                                    │
   │                                                    ├── CDC ──► Airbyte ──► Abacus
   │                                                    └── CDC ──► CData Sync ──► Snowflake
@@ -43,10 +43,10 @@ Other Source DBs ── Trans Repl ──► Same Reporting Server (other DBs)
 ```
 
 - Facets OLTP is a multi-terabyte database with 1,000+ tables replicated via
-  transactional replication to FacetsReporting on a separate server.
+  transactional replication to Reporting on a separate server.
 - The reporting server also hosts databases replicated from other source systems
   via transactional replication.
-- FacetsReporting has SQL Server CDC enabled. CDC change data feeds two
+- Reporting has SQL Server CDC enabled. CDC change data feeds two
   downstream consumers:
   - **Airbyte** delivers change data to **Abacus**.
   - **CData Sync** delivers change data to **Snowflake**.
@@ -72,7 +72,7 @@ Other Source DBs ── Trans Repl ──► Same Reporting Server (other DBs)
 
 ### Option 1: Harden Current Architecture
 
-**Approach:** Keep `OLTP → Trans Repl → FacetsReporting (CDC) → Consumers`.
+**Approach:** Keep `OLTP → Trans Repl → Reporting (CDC) → Consumers`.
 
 - Add monitoring and alerting for CDC capture latency and replication agent status
 - Script the "add table" workflow to reduce manual error
@@ -566,7 +566,7 @@ With AG + CDC you have:
 | 4 | Validate data parity between old path (trans repl → CDC) and new path (AG → CDC) | Medium — validation effort |
 | 5 | Cut over remaining tables in batches (100–200 at a time) | Medium — coordinate with downstream consumers |
 | 6 | Decommission transactional replication for Facets | Low — after validation |
-| 7 | Retire FacetsReporting DB (or repurpose as AG secondary) | Low |
+| 7 | Retire Reporting DB (or repurpose as AG secondary) | Low |
 
 ---
 
