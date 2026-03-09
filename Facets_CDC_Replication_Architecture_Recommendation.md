@@ -16,8 +16,16 @@
    - [Option 3: Direct Log-Based CDC Tool](#option-3-direct-log-based-cdc-tool)
    - [Option 4: CDC on Primary, No AG](#option-4-cdc-on-primary-no-ag)
 4. [Recommendation](#recommendation)
-5. [Migration Path](#migration-path)
-6. [Other Databases on the Reporting Server](#other-databases-on-the-reporting-server)
+5. [CDC Impact on Primary — Honest Assessment](#cdc-impact-on-primary--honest-assessment)
+   - [Transaction Log Retention](#1-transaction-log-retention)
+   - [Capture Job CPU and I/O](#2-cdc-capture-job-cpu-and-io)
+   - [Cleanup Job Impact](#3-cdc-cleanup-job-impact)
+   - [1K+ Tables Specifically](#4-impact-on-1k-tables-specifically)
+   - [Current State vs. CDC on Primary](#5-comparison-what-you-have-today-vs-cdc-on-primary)
+6. [Tuning CDC for a Heavy Workload](#tuning-cdc-for-a-heavy-workload)
+7. [Risk Matrix](#risk-matrix)
+8. [Migration Path](#migration-path)
+9. [Other Databases on the Reporting Server](#other-databases-on-the-reporting-server)
 
 ---
 
@@ -228,6 +236,260 @@ Drop transactional replication.
 7. **Path to continuous CDC.** CDC capture is always running on primary. Change
    tables flow to the secondary in near-real-time via AG. Consumers read
    continuously. No scheduled batch windows needed.
+
+---
+
+## CDC Impact on Primary — Honest Assessment
+
+Enabling CDC on a multi-TB primary with mixed OLTP and nightly batch workloads
+is not zero-cost. This section provides an honest breakdown of the real impact
+and the mitigations available.
+
+### 1. Transaction Log Retention
+
+**What happens:** CDC prevents log truncation on VLFs that the capture job has
+not read yet. The transaction log cannot be truncated past the CDC scan LSN.
+
+**Why this matters for Facets:**
+
+- Nightly batch jobs doing bulk INSERTs/UPDATEs/DELETEs across 1K+ tables
+  generate enormous log volume.
+- If the CDC capture job falls behind during a batch window, the transaction log
+  grows unbounded until capture catches up.
+- On a multi-TB database with heavy batch writes, this can mean tens to hundreds
+  of GB of additional log retention.
+
+**Real-world scenario:**
+
+```
+10:00 PM  - Nightly batch starts, writes 50 GB of log in 2 hours
+          - CDC capture scanning at 500 transactions/poll × 10 polls/sec
+          - Capture falls behind by 30 GB
+          - Transaction log cannot truncate those 30 GB
+          - Log file grows from 20 GB → 50+ GB
+12:00 AM  - Batch finishes, write volume drops
+12:45 AM  - CDC capture catches up, log finally truncates
+```
+
+**Mitigation:**
+
+- Pre-size the transaction log to accommodate the worst-case batch window (do
+  not rely on autogrow)
+- Tune `maxtrans` and `maxscans` parameters on the capture job (see Tuning
+  section below)
+- Place the log file on fast storage
+- Monitor `sys.dm_cdc_log_scan_sessions` for latency
+
+---
+
+### 2. CDC Capture Job CPU and I/O
+
+**What happens:** The CDC capture process (`sp_cdc_scan`) reads the transaction
+log using `sp_replcmds` (the same internal function as transactional
+replication's log reader). It writes change rows into `cdc.*_CT` tables.
+
+**Overhead profile for 1K+ tables:**
+
+| Resource | Impact | Notes |
+|---|---|---|
+| **CPU** | Low-moderate (2–5% steady state) | Log reading is sequential, not random. Batch windows spike higher |
+| **Log read I/O** | Moderate | Sequential reads on log file. Competes with log writer during batch |
+| **Data write I/O** | Moderate | Writes into 1K+ `cdc.*_CT` tables. Regular INSERT operations |
+| **tempdb** | Low-moderate | Internal versioning during capture |
+| **Memory** | Low | Capture process has a small memory footprint |
+
+**During nightly batch:**
+
+- CPU impact can spike to 8–15% as the capture job works through high-volume
+  log entries.
+- I/O contention increases because the capture job is both reading the log AND
+  writing to CDC change tables simultaneously with the batch workload.
+
+**Mitigation:**
+
+- The capture job is a SQL Agent job — its polling interval and batch size are
+  tunable.
+- During batch windows, capture will lag but catches up after batch completes.
+- This lag is acceptable because consumers (Airbyte/CData) are on the readable
+  secondary, not querying primary.
+
+---
+
+### 3. CDC Cleanup Job Impact
+
+**What happens:** The CDC cleanup job (`sp_cdc_cleanup_change_tables`) removes
+old rows from the 1K+ `cdc.*_CT` tables based on a retention period (default
+3 days / 4320 minutes).
+
+**Why this matters:**
+
+- With 1K+ CDC-enabled tables, cleanup iterates through all of them.
+- Each cleanup does DELETEs on change tables, generating more log and more I/O.
+- If cleanup runs during business hours, it competes with OLTP.
+
+**Mitigation:**
+
+- Schedule cleanup during low-activity windows (early morning, after batch
+  completes).
+- Tune retention period: shorter retention means less data to clean, but
+  Airbyte/CData need enough history to process.
+- Set the `@threshold` parameter to limit rows deleted per cleanup cycle.
+
+---
+
+### 4. Impact on 1K+ Tables Specifically
+
+**What happens:** Each `sp_cdc_enable_table` call creates:
+
+- A change table (`cdc.<schema>_<table>_CT`)
+- A capture instance entry in `cdc.change_tables`
+- Entries in `cdc.captured_columns` per captured column
+
+**With 1K+ tables:**
+
+- The capture job scans the log **once** and routes changes to the appropriate
+  change tables — it does NOT scan the log 1K+ times.
+- However, the metadata lookup for 1K+ capture instances adds overhead to each
+  scan cycle.
+- The change tables themselves add approximately 1K+ tables to the database,
+  increasing `sys.objects` catalog size.
+
+**This is manageable.** Microsoft has tested CDC with thousands of capture
+instances. The log reader is the bottleneck, not the metadata.
+
+---
+
+### 5. Comparison: What You Have Today vs. CDC on Primary
+
+| Factor | Current (Trans Repl Log Reader) | CDC Log Reader on Primary |
+|---|---|---|
+| Log reading mechanism | `sp_replcmds` | `sp_replcmds` (same) |
+| Log retention | Log held until Distribution Agent delivers | Log held until CDC capture reads it |
+| Write destination | Distribution DB (separate database/server) | CDC change tables (same database) |
+| Batch window impact | Log reader can fall behind; log grows | Same behavior |
+| Recovery | Reinit subscriber from snapshot | No reinit — CDC is self-contained |
+| Article/capture count | 1K+ articles | 1K+ capture instances |
+
+**Key difference:** With transactional replication, the write destination is the
+Distribution DB (separate server). With CDC, the change tables are written into
+the same database on primary. This means:
+
+- Slightly more I/O on the primary's data disks (change table writes)
+- But you eliminate the Distribution DB, Distribution Agent, and network I/O to
+  the subscriber
+- Net I/O on the primary is comparable — it shifts from network-bound to
+  local-disk-bound
+
+---
+
+## Tuning CDC for a Heavy Workload
+
+### Capture Job Parameters
+
+```sql
+-- View current settings
+EXEC sys.sp_cdc_change_job
+    @job_type = 'capture';
+
+-- Tune for high-volume workload
+EXEC sys.sp_cdc_change_job
+    @job_type        = 'capture',
+    @maxtrans        = 5000,    -- Max transactions per scan cycle (default 500)
+    @maxscans        = 20,      -- Max scan cycles per poll (default 10)
+    @pollinginterval = 2;       -- Seconds between polls (default 5)
+```
+
+**Recommendations for this workload:**
+
+| Parameter | Default | Recommended | Why |
+|---|---|---|---|
+| `maxtrans` | 500 | 5000–10000 | Process more transactions per cycle to keep up with batch volume |
+| `maxscans` | 10 | 20–50 | Allow more scan cycles before yielding to prevent falling too far behind |
+| `pollinginterval` | 5 sec | 1–2 sec | Poll more frequently during steady-state to minimize latency |
+| `continuous` | 1 | 1 | Keep capture running continuously (do not stop it) |
+
+### Cleanup Job Parameters
+
+```sql
+EXEC sys.sp_cdc_change_job
+    @job_type  = 'cleanup',
+    @retention = 2880,     -- Minutes to retain (2 days; default 4320 = 3 days)
+    @threshold = 10000;    -- Max rows deleted per cleanup cycle
+```
+
+### Monitoring Queries
+
+```sql
+-- Check capture latency (how far behind is the capture job?)
+SELECT
+    last_scan_time,
+    duration,
+    tran_count,
+    log_record_count,
+    DATEDIFF(SECOND, last_scan_time, GETDATE()) AS seconds_behind
+FROM sys.dm_cdc_log_scan_sessions
+ORDER BY start_time DESC;
+
+-- Check log reuse wait (is CDC holding the log?)
+SELECT
+    name,
+    log_reuse_wait_desc
+FROM sys.databases
+WHERE name = 'Facets';
+-- If this shows 'REPLICATION', CDC capture is holding the log
+
+-- Check change table sizes (are they growing too large?)
+SELECT
+    OBJECT_SCHEMA_NAME(object_id) AS schema_name,
+    OBJECT_NAME(object_id)        AS table_name,
+    SUM(row_count)                AS total_rows
+FROM sys.dm_db_partition_stats
+WHERE OBJECT_SCHEMA_NAME(object_id) = 'cdc'
+GROUP BY object_id
+ORDER BY total_rows DESC;
+```
+
+---
+
+## Risk Matrix
+
+| Risk | Likelihood | Impact | Mitigation |
+|---|---|---|---|
+| Log growth during batch window | **High** | Medium — log disk fills up | Pre-size log file; fast storage; tune `maxtrans`/`maxscans` |
+| Capture job falls behind during batch | **High** | Low — consumers are on secondary, lag is tolerable | Tune polling; capture catches up post-batch |
+| CDC change table I/O competes with OLTP | **Medium** | Low-medium — change table writes are small INSERTs | Place data files on fast storage; change tables use same filegroup |
+| Cleanup job impacts OLTP hours | **Low** | Low — if scheduled correctly | Schedule cleanup at 3–4 AM; tune `@threshold` |
+| CDC metadata overhead for 1K+ tables | **Low** | Low — single log scan regardless of table count | No action needed |
+| Log truncation delayed by CDC | **Medium** | Medium — affects backup chain timing | Monitor `log_reuse_wait_desc`; alert if stuck |
+
+### Bottom Line
+
+**Is there impact?** Yes. CDC on a multi-TB primary with nightly batch is not
+free. The two real costs are:
+
+1. **Transaction log retention during batch windows** — the log will grow
+   larger than it does today during heavy write periods. Pre-size it and
+   monitor it.
+
+2. **CDC change table writes** — 1K+ change tables receiving INSERTs on the
+   primary's data disks. This is new I/O that currently happens on the
+   subscriber.
+
+**Is it manageable?** Yes. Because:
+
+- You are already running a log reader on primary (trans repl). CDC replaces it,
+  not adds to it.
+- The AG secondary absorbs all consumer read workload. Primary only does capture
+  writes.
+- Tuning `maxtrans`/`maxscans`/`pollinginterval` lets you control how
+  aggressively capture runs.
+- Capture lag during batch windows is acceptable — downstream consumers are not
+  real-time.
+
+**Is it worse than what you have today?** No. Today you have trans repl log
+reader + Distribution DB + subscriber CDC + snapshot reinit risk. The failure
+surface is larger. The AG + CDC architecture has a simpler failure profile even
+though it moves capture write I/O to the primary.
 
 ---
 
