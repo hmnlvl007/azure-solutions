@@ -46,6 +46,26 @@ function Get-AuthHeaders {
     }
 }
 
+function New-ConfluenceSession {
+    <#
+        .SYNOPSIS
+        Creates an authenticated WebRequestSession by hitting a lightweight
+        REST endpoint. The returned session carries the cookies that
+        Confluence Cloud requires for legacy action URLs (e.g. PDF export).
+    #>
+    param(
+        [Parameter(Mandatory = $true)][string]$ApiBase,
+        [Parameter(Mandatory = $true)][hashtable]$Headers
+    )
+
+    $uri = "$ApiBase/user/current"
+    Write-Host 'Establishing Confluence session...'
+    $null = Invoke-WebRequest -Uri $uri -Method Get -Headers $Headers `
+                -SessionVariable 'session' -UseBasicParsing
+    Write-Host 'Session established.'
+    return $session
+}
+
 function Get-SafeFileName {
     param([Parameter(Mandatory = $true)][string]$Name)
 
@@ -129,18 +149,40 @@ function Save-PagePdf {
         [Parameter(Mandatory = $true)][hashtable]$Headers,
         [Parameter(Mandatory = $true)][string]$Destination,
         [Parameter(Mandatory = $true)][int]$Attempts,
-        [Parameter(Mandatory = $true)][int]$DelaySec
+        [Parameter(Mandatory = $true)][int]$DelaySec,
+        [Parameter(Mandatory = $false)][Microsoft.PowerShell.Commands.WebRequestSession]$Session
     )
 
-    $exportUrl = "{0}/spaces/flyingpdf/pdfpageexport.action?pageId={1}" -f $WikiBase, $PageId
+    # os_authType=basic tells Confluence Cloud to honour Basic auth on action URLs
+    $exportUrl = "{0}/spaces/flyingpdf/pdfpageexport.action?pageId={1}&os_authType=basic" -f $WikiBase, $PageId
     $tempPath = "$Destination.part"
+
+    # Build common splat; prefer the session (carries cookies) when available
+    $webParams = @{
+        Uri                = $exportUrl
+        Method             = 'Get'
+        Headers            = @{ Authorization = $Headers['Authorization'] }   # only auth, no Accept:json
+        MaximumRedirection = 10
+        OutFile            = $tempPath
+        UseBasicParsing    = $true
+    }
+    if ($null -ne $Session) {
+        $webParams['WebSession'] = $Session
+    }
 
     for ($attempt = 1; $attempt -le $Attempts; $attempt++) {
         if (Test-Path -LiteralPath $tempPath) {
             Remove-Item -LiteralPath $tempPath -Force
         }
 
-        Invoke-WebRequest -Uri $exportUrl -Method Get -Headers $Headers -MaximumRedirection 10 -OutFile $tempPath | Out-Null
+        try {
+            Invoke-WebRequest @webParams | Out-Null
+        }
+        catch {
+            Write-Verbose ("Attempt {0}/{1} failed: {2}" -f $attempt, $Attempts, $_.Exception.Message)
+            Start-Sleep -Seconds $DelaySec
+            continue
+        }
 
         if (Test-IsPdfFile -Path $tempPath) {
             Move-Item -LiteralPath $tempPath -Destination $Destination -Force
@@ -160,6 +202,9 @@ function Save-PagePdf {
 $wikiBaseUrl = Get-WikiBaseUrl -BaseUrl $ConfluenceBaseUrl
 $apiBaseUrl = "$wikiBaseUrl/rest/api"
 $headers = Get-AuthHeaders -UserEmail $Email -Token $ApiToken
+
+# Establish a cookie-based session so legacy action URLs (PDF export) accept our auth.
+$confluenceSession = New-ConfluenceSession -ApiBase $apiBaseUrl -Headers $headers
 
 $spaceOutput = Join-Path -Path $OutputPath -ChildPath $SpaceKey
 if (-not (Test-Path -LiteralPath $spaceOutput)) {
@@ -188,7 +233,7 @@ foreach ($page in $pages) {
 
     Write-Host ("[{0}/{1}] Exporting: {2}" -f $index, $pages.Count, $page.title)
 
-    $ok = Save-PagePdf -WikiBase $wikiBaseUrl -PageId $page.id -Headers $headers -Destination $targetPath -Attempts $MaxPdfAttempts -DelaySec $RetryDelaySeconds
+    $ok = Save-PagePdf -WikiBase $wikiBaseUrl -PageId $page.id -Headers $headers -Destination $targetPath -Attempts $MaxPdfAttempts -DelaySec $RetryDelaySeconds -Session $confluenceSession
 
     if (-not $ok) {
         $failed += [PSCustomObject]@{
