@@ -37,7 +37,7 @@ Restart terminal after setting this.
 
 ## Run manually
 
-From the workspace root (`c:\PHP_MCP`):
+From the workspace root (`c:\MCP`):
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File .\scripts\run-confluence-export.ps1
@@ -54,7 +54,7 @@ A JSON run summary is also written there (`export-summary-*.json`).
 Create a daily task at 1:00 AM:
 
 ```powershell
-$action = New-ScheduledTaskAction -Execute 'powershell.exe' -Argument '-NoProfile -ExecutionPolicy Bypass -File "c:\PHP_MCP\scripts\run-confluence-export.ps1"'
+$action = New-ScheduledTaskAction -Execute 'powershell.exe' -Argument '-NoProfile -ExecutionPolicy Bypass -File "c:\MCP\scripts\run-confluence-export.ps1"'
 $trigger = New-ScheduledTaskTrigger -Daily -At 1:00am
 Register-ScheduledTask -TaskName 'Confluence-DBA-PDF-Export' -Action $action -Trigger $trigger -Description 'Export Confluence DBA space to OneDrive PDFs'
 ```
