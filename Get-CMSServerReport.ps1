@@ -33,6 +33,10 @@
 .PARAMETER IncludeAllServers
     If set, includes servers with no AG or Replication in a separate section.
 
+.PARAMETER InventoryOnly
+    If set, collects and reports only server inventory/configuration details,
+    skipping Availability Groups, Replication, and CDC sections for faster execution.
+
 .EXAMPLE
     .\Get-CMSServerReport.ps1 -CMSServer "MyCMSServer" -OutputPath "C:\Reports"
 
@@ -41,6 +45,9 @@
 
 .EXAMPLE
     .\Get-CMSServerReport.ps1 -ExcelFilePath "C:\Servers\ServerList.xlsx" -SheetName "Production" -ServerColumn "SQLInstance"
+
+.EXAMPLE
+    .\Get-CMSServerReport.ps1 -CMSServer "MyCMSServer" -InventoryOnly -OutputPath "C:\Reports"
 #>
 
 [CmdletBinding(DefaultParameterSetName = 'CMS')]
@@ -62,7 +69,10 @@ param(
     [string]$OutputPath = (Get-Location).Path,
 
     [Parameter(Mandatory = $false)]
-    [switch]$IncludeAllServers
+    [switch]$IncludeAllServers,
+
+    [Parameter(Mandatory = $false)]
+    [switch]$InventoryOnly
 )
 
 #Requires -Modules SqlServer
@@ -92,9 +102,14 @@ function Invoke-SqlQuerySafe {
 # 1. Get all registered servers from CMS
 # ─────────────────────────────────────────────────────────────────────────────
 Write-Host "═══════════════════════════════════════════════════════════════" -ForegroundColor Cyan
-Write-Host "  SQL Server – Availability Group & Replication Report         " -ForegroundColor Cyan
+Write-Host "  SQL Server – Inventory / AG / Replication / CDC Report       " -ForegroundColor Cyan
 Write-Host "═══════════════════════════════════════════════════════════════" -ForegroundColor Cyan
 Write-Host ""
+
+if ($InventoryOnly) {
+    Write-Host "Inventory-only mode enabled: AG, Replication, and CDC collectors will be skipped." -ForegroundColor DarkYellow
+    Write-Host ""
+}
 
 if ($PSCmdlet.ParameterSetName -eq 'Excel') {
     # ── Load servers from Excel file ──────────────────────────────────
@@ -185,6 +200,10 @@ foreach ($server in $registeredServers) {
     $serverCount++
     Write-Host "[$serverCount/$($registeredServers.Count)] Querying $server ..." -ForegroundColor White
 
+    $hasAG = $false
+    $hasRepl = $false
+    $hasCDC = $false
+
     # ── Server version & edition ──────────────────────────────────────────
     $versionQuery = @"
 SELECT 
@@ -199,29 +218,99 @@ SELECT
     SERVERPROPERTY('MachineName')       AS MachineName,
     SERVERPROPERTY('IsClustered')       AS IsClustered,
     SERVERPROPERTY('IsHadrEnabled')     AS IsHadrEnabled,
+    SERVERPROPERTY('Collation')         AS Collation,
+    CASE 
+        WHEN CONVERT(nvarchar(128), SERVERPROPERTY('Collation')) LIKE '%[_]CS[_]%' THEN 'Case-Sensitive'
+        WHEN CONVERT(nvarchar(128), SERVERPROPERTY('Collation')) LIKE '%[_]CI[_]%' THEN 'Case-Insensitive'
+        ELSE 'Unknown'
+    END                                 AS CaseSensitivity,
+    ISNULL(CONVERT(int, FULLTEXTSERVICEPROPERTY('IsFullTextInstalled')), 0) AS IsFullTextInstalled,
+    (SELECT COUNT(*) FROM sys.databases) AS TotalDatabaseCount,
+    (SELECT COUNT(*) FROM sys.databases WHERE database_id > 4) AS UserDatabaseCount,
+    (SELECT COUNT(*) FROM sys.databases WHERE database_id <= 4) AS SystemDatabaseCount,
+    (SELECT CAST(value_in_use AS int) FROM sys.configurations WHERE name = 'Agent XPs') AS AgentXPsEnabled,
+    (SELECT CAST(value_in_use AS int) FROM sys.configurations WHERE name = 'Database Mail XPs') AS DatabaseMailEnabled,
+    (SELECT CAST(value_in_use AS int) FROM sys.configurations WHERE name = 'clr enabled') AS SqlClrEnabled,
+    (SELECT CAST(value_in_use AS int) FROM sys.configurations WHERE name = 'remote access') AS RemoteAccessAllowed,
+    (SELECT CAST(value_in_use AS int) FROM sys.configurations WHERE name = 'xp_cmdshell') AS XpCmdShellEnabled,
+    (SELECT CAST(value_in_use AS int) FROM sys.configurations WHERE name = 'min server memory (MB)') AS MinSqlServerMemoryMB,
+    (SELECT CAST(value_in_use AS int) FROM sys.configurations WHERE name = 'max server memory (MB)') AS MaxSqlServerMemoryMB,
+    CASE 
+        WHEN (SELECT CAST(value_in_use AS int) FROM sys.configurations WHERE name = 'min server memory (MB)') = 0
+         AND (SELECT CAST(value_in_use AS bigint) FROM sys.configurations WHERE name = 'max server memory (MB)') >= 2147483647
+            THEN 'Dynamic/Default'
+        ELSE 'Configured'
+    END                                 AS MemoryAllocationType,
+    (SELECT local_tcp_port FROM sys.dm_exec_connections WHERE session_id = @@SPID) AS SqlPort,
+    (SELECT cpu_count FROM sys.dm_os_sys_info) AS AllocatedCpuCount,
+    (SELECT socket_count FROM sys.dm_os_sys_info) AS PhysicalProcessorCount,
+    (SELECT TOP 1 windows_release FROM sys.dm_os_windows_info) AS OperatingSystem,
+    (SELECT TOP 1 windows_service_pack_level FROM sys.dm_os_windows_info) AS OperatingSystemVersion,
+    (SELECT CAST(total_physical_memory_kb / 1048576.0 AS decimal(18,2)) FROM sys.dm_os_sys_memory) AS TotalPhysicalMemoryGB,
+    (SELECT CAST(available_physical_memory_kb / 1048576.0 AS decimal(18,2)) FROM sys.dm_os_sys_memory) AS AvailablePhysicalMemoryGB,
+    (SELECT CAST(total_page_file_kb / 1048576.0 AS decimal(18,2)) FROM sys.dm_os_sys_memory) AS TotalVirtualMemoryGB,
+    (SELECT CAST(available_page_file_kb / 1048576.0 AS decimal(18,2)) FROM sys.dm_os_sys_memory) AS AvailableVirtualMemoryGB,
+    (
+        SELECT CAST(SUM(v.AvailableBytesGB) AS decimal(18,2))
+        FROM (
+            SELECT DISTINCT vs.volume_mount_point,
+                CAST(vs.available_bytes / 1073741824.0 AS decimal(18,2)) AS AvailableBytesGB
+            FROM sys.master_files mf
+            CROSS APPLY sys.dm_os_volume_stats(mf.database_id, mf.file_id) vs
+        ) v
+    )                                   AS FreeSpaceGB,
     @@VERSION                           AS FullVersion
 "@
     $verInfo = Invoke-SqlQuerySafe -ServerInstance $server -Query $versionQuery
     if (-not $verInfo) {
         Write-Warning "  Skipping $server (unreachable)."
         $allServerInfo += [PSCustomObject]@{
-            ServerName     = $server
-            ProductVersion = "UNREACHABLE"
-            Edition        = "N/A"
-            ProductLevel   = "N/A"
-            UpdateLevel    = "N/A"
-            IsClustered    = "N/A"
-            IsHadrEnabled  = "N/A"
-            HasAG          = $false
-            HasReplication = $false
-            HasCDC         = $false
+            ServerName                 = $server
+            ProductVersion             = "UNREACHABLE"
+            ProductLevel               = "N/A"
+            MajorVersion               = "N/A"
+            Edition                    = "N/A"
+            EngineEdition              = "N/A"
+            UpdateLevel                = "N/A"
+            KBArticle                  = "N/A"
+            MachineName                = "N/A"
+            IsClustered                = "N/A"
+            IsHadrEnabled              = "N/A"
+            Collation                  = "N/A"
+            CaseSensitivity            = "N/A"
+            IsFullTextInstalled        = "N/A"
+            TotalDatabaseCount         = "N/A"
+            UserDatabaseCount          = "N/A"
+            SystemDatabaseCount        = "N/A"
+            AgentXPsEnabled            = "N/A"
+            DatabaseMailEnabled        = "N/A"
+            SqlClrEnabled              = "N/A"
+            RemoteAccessAllowed        = "N/A"
+            XpCmdShellEnabled          = "N/A"
+            MinSqlServerMemoryMB       = "N/A"
+            MaxSqlServerMemoryMB       = "N/A"
+            MemoryAllocationType       = "N/A"
+            SqlPort                    = "N/A"
+            AllocatedCpuCount          = "N/A"
+            PhysicalProcessorCount     = "N/A"
+            OperatingSystem            = "N/A"
+            OperatingSystemVersion     = "N/A"
+            TotalPhysicalMemoryGB      = "N/A"
+            AvailablePhysicalMemoryGB  = "N/A"
+            TotalVirtualMemoryGB       = "N/A"
+            AvailableVirtualMemoryGB   = "N/A"
+            FreeSpaceGB                = "N/A"
+            FullVersion                = "N/A"
+            HasAG                      = $false
+            HasReplication             = $false
+            HasCDC                     = $false
         }
         continue
     }
 
-    # ── Availability Groups ───────────────────────────────────────────────
-    $hasAG = $false
-    if ($verInfo.IsHadrEnabled -eq 1) {
+    if (-not $InventoryOnly) {
+        # ── Availability Groups ───────────────────────────────────────────────
+        if ($verInfo.IsHadrEnabled -eq 1) {
         $agQuery = @"
 SELECT 
     ag.name                          AS AGName,
@@ -349,10 +438,9 @@ ORDER BY ag.name
                 }
             }
         }
-    }
+        }
 
-    # ── Replication ───────────────────────────────────────────────────────
-    $hasRepl = $false
+        # ── Replication ───────────────────────────────────────────────────────
 
     # Check if this server is a distributor
     $distQuery = @"
@@ -625,8 +713,7 @@ END
         }
     }
 
-    # ── Change Data Capture (CDC) ─────────────────────────────────────
-    $hasCDC = $false
+        # ── Change Data Capture (CDC) ─────────────────────────────────────
 
     # CDC-enabled databases
     $cdcDbQuery = @"
@@ -753,19 +840,49 @@ IF LEN(@sql) > 0
             }
         }
     }
+    }
 
     # Store server info
     $allServerInfo += [PSCustomObject]@{
-        ServerName     = $verInfo.ServerName
-        ProductVersion = $verInfo.ProductVersion
-        Edition        = $verInfo.Edition
-        ProductLevel   = $verInfo.ProductLevel
-        UpdateLevel    = $verInfo.UpdateLevel
-        IsClustered    = $verInfo.IsClustered
-        IsHadrEnabled  = $verInfo.IsHadrEnabled
-        HasAG          = $hasAG
-        HasReplication = $hasRepl
-        HasCDC         = $hasCDC
+        ServerName                 = $verInfo.ServerName
+        ProductVersion             = $verInfo.ProductVersion
+        ProductLevel               = $verInfo.ProductLevel
+        MajorVersion               = $verInfo.MajorVersion
+        Edition                    = $verInfo.Edition
+        EngineEdition              = $verInfo.EngineEdition
+        UpdateLevel                = $verInfo.UpdateLevel
+        KBArticle                  = $verInfo.KBArticle
+        MachineName                = $verInfo.MachineName
+        IsClustered                = $verInfo.IsClustered
+        IsHadrEnabled              = $verInfo.IsHadrEnabled
+        Collation                  = $verInfo.Collation
+        CaseSensitivity            = $verInfo.CaseSensitivity
+        IsFullTextInstalled        = $verInfo.IsFullTextInstalled
+        TotalDatabaseCount         = $verInfo.TotalDatabaseCount
+        UserDatabaseCount          = $verInfo.UserDatabaseCount
+        SystemDatabaseCount        = $verInfo.SystemDatabaseCount
+        AgentXPsEnabled            = $verInfo.AgentXPsEnabled
+        DatabaseMailEnabled        = $verInfo.DatabaseMailEnabled
+        SqlClrEnabled              = $verInfo.SqlClrEnabled
+        RemoteAccessAllowed        = $verInfo.RemoteAccessAllowed
+        XpCmdShellEnabled          = $verInfo.XpCmdShellEnabled
+        MinSqlServerMemoryMB       = $verInfo.MinSqlServerMemoryMB
+        MaxSqlServerMemoryMB       = $verInfo.MaxSqlServerMemoryMB
+        MemoryAllocationType       = $verInfo.MemoryAllocationType
+        SqlPort                    = $verInfo.SqlPort
+        AllocatedCpuCount          = $verInfo.AllocatedCpuCount
+        PhysicalProcessorCount     = $verInfo.PhysicalProcessorCount
+        OperatingSystem            = $verInfo.OperatingSystem
+        OperatingSystemVersion     = $verInfo.OperatingSystemVersion
+        TotalPhysicalMemoryGB      = $verInfo.TotalPhysicalMemoryGB
+        AvailablePhysicalMemoryGB  = $verInfo.AvailablePhysicalMemoryGB
+        TotalVirtualMemoryGB       = $verInfo.TotalVirtualMemoryGB
+        AvailableVirtualMemoryGB   = $verInfo.AvailableVirtualMemoryGB
+        FreeSpaceGB                = $verInfo.FreeSpaceGB
+        FullVersion                = $verInfo.FullVersion
+        HasAG                      = $hasAG
+        HasReplication             = $hasRepl
+        HasCDC                     = $hasCDC
     }
 }
 
@@ -777,7 +894,13 @@ Write-Host ""
 Write-Host "Generating report..." -ForegroundColor Yellow
 
 $reportDate = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
-$reportFile = Join-Path $OutputPath "CMS_AG_Replication_Report_$(Get-Date -Format 'yyyyMMdd_HHmmss').html"
+$reportSuffix = Get-Date -Format 'yyyyMMdd_HHmmss'
+$reportFile = if ($InventoryOnly) {
+    Join-Path $OutputPath "CMS_Inventory_Report_$reportSuffix.html"
+}
+else {
+    Join-Path $OutputPath "CMS_AG_Replication_Report_$reportSuffix.html"
+}
 
 function ConvertTo-HtmlTable {
     param(
@@ -813,70 +936,37 @@ $agServers   = ($allServerInfo | Where-Object { $_.HasAG }).Count
 $replServers = ($allServerInfo | Where-Object { $_.HasReplication }).Count
 $cdcServers  = ($allServerInfo | Where-Object { $_.HasCDC }).Count
 
-$htmlContent = @"
-<!DOCTYPE html>
-<html lang="en">
-<head>
-<meta charset="UTF-8">
-<title>CMS Server Report – AG, Replication & CDC</title>
-<style>
-    :root { --bg: #1e1e2e; --fg: #cdd6f4; --accent: #89b4fa; --green: #a6e3a1; 
-             --red: #f38ba8; --yellow: #f9e2af; --surface: #313244; --border: #45475a; }
-    * { box-sizing: border-box; margin: 0; padding: 0; }
-    body { font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; 
-           background: var(--bg); color: var(--fg); padding: 20px; line-height: 1.6; }
-    h1 { color: var(--accent); border-bottom: 2px solid var(--accent); padding-bottom: 10px; 
-         margin-bottom: 20px; font-size: 1.8em; }
-    h2 { color: var(--accent); margin: 30px 0 15px 0; font-size: 1.4em; 
-         border-left: 4px solid var(--accent); padding-left: 12px; }
-    h3 { color: var(--yellow); margin: 20px 0 10px 0; font-size: 1.1em; }
-    .summary { display: flex; gap: 20px; flex-wrap: wrap; margin-bottom: 30px; }
-    .summary-card { background: var(--surface); border: 1px solid var(--border); 
-                    border-radius: 8px; padding: 20px; min-width: 200px; flex: 1; }
-    .summary-card .number { font-size: 2em; font-weight: bold; color: var(--accent); }
-    .summary-card .label  { font-size: 0.9em; color: var(--fg); opacity: 0.8; }
-    table { width: 100%; border-collapse: collapse; margin: 10px 0 25px 0; 
-            background: var(--surface); border-radius: 8px; overflow: hidden; font-size: 0.85em; }
-    thead { background: #45475a; }
-    th { padding: 10px 12px; text-align: left; color: var(--accent); font-weight: 600; 
-         border-bottom: 2px solid var(--border); white-space: nowrap; }
-    td { padding: 8px 12px; border-bottom: 1px solid var(--border); }
-    tr:hover { background: rgba(137, 180, 250, 0.05); }
-    .warn { color: var(--red); font-weight: bold; }
-    .good { color: var(--green); }
-    .empty { color: var(--yellow); font-style: italic; padding: 10px; }
-    .section { background: var(--surface); border: 1px solid var(--border); 
-               border-radius: 10px; padding: 20px; margin-bottom: 25px; }
-    .meta { font-size: 0.85em; color: var(--fg); opacity: 0.6; margin-bottom: 25px; }
-    .toc { background: var(--surface); border: 1px solid var(--border); border-radius: 8px; 
-           padding: 15px 25px; margin-bottom: 30px; }
-    .toc a { color: var(--accent); text-decoration: none; }
-    .toc a:hover { text-decoration: underline; }
-    .toc ul { list-style: none; padding-left: 0; }
-    .toc li { padding: 4px 0; }
-    .toc li::before { content: '▸ '; color: var(--accent); }
-    @media print { body { background: white; color: black; } 
-                   table { font-size: 0.75em; } 
-                   .summary-card { border: 1px solid #ccc; } }
-</style>
-</head>
-<body>
+$reportTitle = if ($InventoryOnly) {
+    "CMS Server Report – Inventory"
+}
+else {
+    "CMS Server Report – Inventory, AG, Replication & CDC"
+}
 
-<h1>SQL Server CMS – Availability Group, Replication & CDC Report</h1>
-<p class="meta">CMS Server: <strong>$CMSServer</strong> &nbsp;|&nbsp; Generated: <strong>$reportDate</strong> &nbsp;|&nbsp; Servers scanned: <strong>$($registeredServers.Count)</strong></p>
+$reportHeader = if ($InventoryOnly) {
+    "SQL Server CMS – Inventory Report"
+}
+else {
+    "SQL Server CMS – Inventory, Availability Group, Replication & CDC Report"
+}
 
-<div class="summary">
-    <div class="summary-card"><div class="number">$($registeredServers.Count)</div><div class="label">Total Registered Servers</div></div>
+$summaryExtraCards = if ($InventoryOnly) {
+    ""
+}
+else {
+@"
     <div class="summary-card"><div class="number">$agServers</div><div class="label">Servers with Availability Groups</div></div>
     <div class="summary-card"><div class="number">$replServers</div><div class="label">Servers with Replication</div></div>
     <div class="summary-card"><div class="number">$($allDistributors.Count)</div><div class="label">Distributor Databases</div></div>
     <div class="summary-card"><div class="number">$cdcServers</div><div class="label">Servers with CDC</div></div>
-</div>
+"@
+}
 
-<div class="toc">
-<strong>Table of Contents</strong>
-<ul>
-    <li><a href="#versions">1. SQL Server Versions & Editions</a></li>
+$tocExtraItems = if ($InventoryOnly) {
+    ""
+}
+else {
+@"
     <li><a href="#ag-replicas">2. Availability Group – Replicas</a></li>
     <li><a href="#ag-databases">3. Availability Group – Databases</a></li>
     <li><a href="#ag-listeners">4. Availability Group – Listeners</a></li>
@@ -888,15 +978,14 @@ $htmlContent = @"
     <li><a href="#cdc-databases">10. CDC – Enabled Databases</a></li>
     <li><a href="#cdc-tables">11. CDC – Tracked Tables</a></li>
     <li><a href="#cdc-jobs">12. CDC – Capture & Cleanup Jobs</a></li>
-</ul>
-</div>
+"@
+}
 
-<!-- ═══════════════════════════════════════════════════════════════════ -->
-<div class="section" id="versions">
-<h2>1. SQL Server Versions & Editions</h2>
-$(ConvertTo-HtmlTable -Data $allServerInfo -EmptyMessage "No server data collected.")
-</div>
-
+$detailSections = if ($InventoryOnly) {
+    ""
+}
+else {
+@"
 <!-- ═══════════════════════════════════════════════════════════════════ -->
 <div class="section" id="ag-replicas">
 <h2>2. Availability Group – Replicas</h2>
@@ -954,6 +1043,81 @@ $(ConvertTo-HtmlTable -Data $allCDCTables -EmptyMessage "No CDC-tracked tables f
 <h2>12. CDC – Capture & Cleanup Jobs</h2>
 $(ConvertTo-HtmlTable -Data $allCDCJobs -EmptyMessage "No CDC jobs found.")
 </div>
+"@
+}
+
+$htmlContent = @"
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>$reportTitle</title>
+<style>
+    :root { --bg: #1e1e2e; --fg: #cdd6f4; --accent: #89b4fa; --green: #a6e3a1; 
+             --red: #f38ba8; --yellow: #f9e2af; --surface: #313244; --border: #45475a; }
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body { font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; 
+           background: var(--bg); color: var(--fg); padding: 20px; line-height: 1.6; }
+    h1 { color: var(--accent); border-bottom: 2px solid var(--accent); padding-bottom: 10px; 
+         margin-bottom: 20px; font-size: 1.8em; }
+    h2 { color: var(--accent); margin: 30px 0 15px 0; font-size: 1.4em; 
+         border-left: 4px solid var(--accent); padding-left: 12px; }
+    h3 { color: var(--yellow); margin: 20px 0 10px 0; font-size: 1.1em; }
+    .summary { display: flex; gap: 20px; flex-wrap: wrap; margin-bottom: 30px; }
+    .summary-card { background: var(--surface); border: 1px solid var(--border); 
+                    border-radius: 8px; padding: 20px; min-width: 200px; flex: 1; }
+    .summary-card .number { font-size: 2em; font-weight: bold; color: var(--accent); }
+    .summary-card .label  { font-size: 0.9em; color: var(--fg); opacity: 0.8; }
+    table { width: 100%; border-collapse: collapse; margin: 10px 0 25px 0; 
+            background: var(--surface); border-radius: 8px; overflow: hidden; font-size: 0.85em; }
+    thead { background: #45475a; }
+    th { padding: 10px 12px; text-align: left; color: var(--accent); font-weight: 600; 
+         border-bottom: 2px solid var(--border); white-space: nowrap; }
+    td { padding: 8px 12px; border-bottom: 1px solid var(--border); }
+    tr:hover { background: rgba(137, 180, 250, 0.05); }
+    .warn { color: var(--red); font-weight: bold; }
+    .good { color: var(--green); }
+    .empty { color: var(--yellow); font-style: italic; padding: 10px; }
+    .section { background: var(--surface); border: 1px solid var(--border); 
+               border-radius: 10px; padding: 20px; margin-bottom: 25px; }
+    .meta { font-size: 0.85em; color: var(--fg); opacity: 0.6; margin-bottom: 25px; }
+    .toc { background: var(--surface); border: 1px solid var(--border); border-radius: 8px; 
+           padding: 15px 25px; margin-bottom: 30px; }
+    .toc a { color: var(--accent); text-decoration: none; }
+    .toc a:hover { text-decoration: underline; }
+    .toc ul { list-style: none; padding-left: 0; }
+    .toc li { padding: 4px 0; }
+    .toc li::before { content: '▸ '; color: var(--accent); }
+    @media print { body { background: white; color: black; } 
+                   table { font-size: 0.75em; } 
+                   .summary-card { border: 1px solid #ccc; } }
+</style>
+</head>
+<body>
+
+<h1>$reportHeader</h1>
+<p class="meta">Server Source: <strong>$serverSource</strong> &nbsp;|&nbsp; Generated: <strong>$reportDate</strong> &nbsp;|&nbsp; Servers scanned: <strong>$($registeredServers.Count)</strong></p>
+
+<div class="summary">
+    <div class="summary-card"><div class="number">$($registeredServers.Count)</div><div class="label">Total Registered Servers</div></div>
+$summaryExtraCards
+</div>
+
+<div class="toc">
+<strong>Table of Contents</strong>
+<ul>
+    <li><a href="#versions">1. SQL Server Inventory & Configuration</a></li>
+$tocExtraItems
+</ul>
+</div>
+
+<!-- ═══════════════════════════════════════════════════════════════════ -->
+<div class="section" id="versions">
+<h2>1. SQL Server Inventory & Configuration</h2>
+$(ConvertTo-HtmlTable -Data $allServerInfo -EmptyMessage "No server data collected.")
+</div>
+
+$detailSections
 
 </body>
 </html>
@@ -968,18 +1132,20 @@ Write-Host ""
 
 # Also export CSVs for each section
 $csvBase = Join-Path $OutputPath "CMS_Report_$(Get-Date -Format 'yyyyMMdd_HHmmss')"
-if ($allServerInfo.Count -gt 0)     { $allServerInfo    | Export-Csv "$($csvBase)_ServerVersions.csv"  -NoTypeInformation }
-if ($allAGDetails.Count -gt 0)      { $allAGDetails     | Export-Csv "$($csvBase)_AG_Replicas.csv"     -NoTypeInformation }
-if ($allAGDatabases.Count -gt 0)    { $allAGDatabases   | Export-Csv "$($csvBase)_AG_Databases.csv"    -NoTypeInformation }
-if ($allAGListeners.Count -gt 0)    { $allAGListeners   | Export-Csv "$($csvBase)_AG_Listeners.csv"    -NoTypeInformation }
-if ($allPublications.Count -gt 0)   { $allPublications  | Export-Csv "$($csvBase)_Publications.csv"    -NoTypeInformation }
-if ($allArticles.Count -gt 0)       { $allArticles      | Export-Csv "$($csvBase)_Articles.csv"        -NoTypeInformation }
-if ($allSubscriptions.Count -gt 0)  { $allSubscriptions | Export-Csv "$($csvBase)_Subscriptions.csv"   -NoTypeInformation }
-if ($allReplSchedules.Count -gt 0)  { $allReplSchedules | Export-Csv "$($csvBase)_ReplSchedules.csv"   -NoTypeInformation }
-if ($allDistributors.Count -gt 0)   { $allDistributors  | Export-Csv "$($csvBase)_Distributors.csv"    -NoTypeInformation }
-if ($allCDCDatabases.Count -gt 0)   { $allCDCDatabases   | Export-Csv "$($csvBase)_CDC_Databases.csv"   -NoTypeInformation }
-if ($allCDCTables.Count -gt 0)      { $allCDCTables      | Export-Csv "$($csvBase)_CDC_Tables.csv"      -NoTypeInformation }
-if ($allCDCJobs.Count -gt 0)        { $allCDCJobs        | Export-Csv "$($csvBase)_CDC_Jobs.csv"        -NoTypeInformation }
+if ($allServerInfo.Count -gt 0)     { $allServerInfo    | Export-Csv "$($csvBase)_ServerInventory.csv" -NoTypeInformation }
+if (-not $InventoryOnly) {
+    if ($allAGDetails.Count -gt 0)      { $allAGDetails     | Export-Csv "$($csvBase)_AG_Replicas.csv"     -NoTypeInformation }
+    if ($allAGDatabases.Count -gt 0)    { $allAGDatabases   | Export-Csv "$($csvBase)_AG_Databases.csv"    -NoTypeInformation }
+    if ($allAGListeners.Count -gt 0)    { $allAGListeners   | Export-Csv "$($csvBase)_AG_Listeners.csv"    -NoTypeInformation }
+    if ($allPublications.Count -gt 0)   { $allPublications  | Export-Csv "$($csvBase)_Publications.csv"    -NoTypeInformation }
+    if ($allArticles.Count -gt 0)       { $allArticles      | Export-Csv "$($csvBase)_Articles.csv"        -NoTypeInformation }
+    if ($allSubscriptions.Count -gt 0)  { $allSubscriptions | Export-Csv "$($csvBase)_Subscriptions.csv"   -NoTypeInformation }
+    if ($allReplSchedules.Count -gt 0)  { $allReplSchedules | Export-Csv "$($csvBase)_ReplSchedules.csv"   -NoTypeInformation }
+    if ($allDistributors.Count -gt 0)   { $allDistributors  | Export-Csv "$($csvBase)_Distributors.csv"    -NoTypeInformation }
+    if ($allCDCDatabases.Count -gt 0)   { $allCDCDatabases  | Export-Csv "$($csvBase)_CDC_Databases.csv"   -NoTypeInformation }
+    if ($allCDCTables.Count -gt 0)      { $allCDCTables     | Export-Csv "$($csvBase)_CDC_Tables.csv"      -NoTypeInformation }
+    if ($allCDCJobs.Count -gt 0)        { $allCDCJobs       | Export-Csv "$($csvBase)_CDC_Jobs.csv"        -NoTypeInformation }
+}
 
 Write-Host "  CSV files exported to: $csvBase*.csv" -ForegroundColor Green
 Write-Host ""
