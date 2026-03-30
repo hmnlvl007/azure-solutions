@@ -1,4 +1,4 @@
-USE [FacetsReport];
+USE [db];
 GO
 SET NOCOUNT ON;
 SET XACT_ABORT ON;
@@ -61,7 +61,7 @@ BEGIN
 
     BEGIN TRAN;
 
-        INSERT INTO dbo.ER_TB_SYST_PDAT_PROCESS_DATA
+        INSERT INTO dbo.TBL1
         (
             PITM_TICKET_NO,
             PDAT_IO_TYPE,
@@ -78,7 +78,7 @@ BEGIN
             s.PDAT_IO_TYPE,
             s.PDAT_SEQ,
             s.PDAT_VALUE
-        FROM [MountedDB].dbo.ER_TB_SYST_PDAT_PROCESS_DATA AS s
+        FROM [MountedDB].dbo.TBL1 AS s
         WHERE
             (s.PITM_TICKET_NO = @LastTicket AND s.PDAT_IO_TYPE = @LastIO AND s.PDAT_SEQ > @LastSeq)
          OR (s.PITM_TICKET_NO = @LastTicket AND s.PDAT_IO_TYPE > @LastIO)
