@@ -37,6 +37,10 @@
     If set, collects and reports only server inventory/configuration details,
     skipping Availability Groups, Replication, and CDC sections for faster execution.
 
+.PARAMETER SkipCertValidation
+    If set, uses dbatools insecure/trust-certificate connection options to bypass
+    SQL certificate chain validation checks.
+
 .EXAMPLE
     .\Get-CMSServerReport.ps1 -CMSServer "MyCMSServer" -OutputPath "C:\Reports"
 
@@ -48,6 +52,10 @@
 
 .EXAMPLE
     .\Get-CMSServerReport.ps1 -CMSServer "MyCMSServer" -InventoryOnly -OutputPath "C:\Reports"
+
+.EXAMPLE
+    .\Get-CMSServerReport.ps1 -CMSServer "MyCMSServer" -SkipCertValidation -OutputPath "C:\Reports"
+    Bypasses SQL Server certificate chain validation.
 #>
 
 [CmdletBinding(DefaultParameterSetName = 'CMS')]
@@ -72,10 +80,44 @@ param(
     [switch]$IncludeAllServers,
 
     [Parameter(Mandatory = $false)]
-    [switch]$InventoryOnly
+    [switch]$InventoryOnly,
+
+    [Parameter(Mandatory = $false)]
+    [switch]$SkipCertValidation
 )
 
-#Requires -Modules SqlServer
+# Ensure dbatools module is available (required)
+if (-not (Get-Module -ListAvailable -Name dbatools)) {
+    Write-Error "The dbatools module is required. Install it with: Install-Module dbatools -Scope CurrentUser"
+    exit 1
+}
+
+Import-Module dbatools -ErrorAction Stop
+
+# Optionally configure dbatools to trust SQL Server certificates for this session
+if ($SkipCertValidation) {
+    try {
+        if (Get-Command -Name Set-DbatoolsInsecureConnection -ErrorAction SilentlyContinue) {
+            Set-DbatoolsInsecureConnection -SessionOnly | Out-Null
+        }
+        else {
+            Set-DbatoolsConfig -FullName 'sql.connection.trustcert' -Value $true | Out-Null
+            Set-DbatoolsConfig -FullName 'sql.connection.encrypt' -Value $false | Out-Null
+        }
+    }
+    catch {
+        Write-Warning "Could not set dbatools certificate settings automatically. Proceeding with best effort. Error: $_"
+    }
+}
+
+$invokeDbaQueryCommand = Get-Command -Name Invoke-DbaQuery -ErrorAction SilentlyContinue
+if (-not $invokeDbaQueryCommand) {
+    Write-Error "Invoke-DbaQuery was not found in dbatools. Please update/reinstall dbatools."
+    exit 1
+}
+
+$script:InvokeDbaQuerySupportsTrustServerCertificate = $invokeDbaQueryCommand.Parameters.ContainsKey('TrustServerCertificate')
+$script:InvokeDbaQuerySupportsEncryptConnection = $invokeDbaQueryCommand.Parameters.ContainsKey('EncryptConnection')
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Helper: Execute a query against a server with error handling
@@ -88,9 +130,22 @@ function Invoke-SqlQuerySafe {
         [int]$QueryTimeout = 30
     )
     try {
-        Invoke-Sqlcmd -ServerInstance $ServerInstance -Database $Database `
-                      -Query $Query -QueryTimeout $QueryTimeout `
-                      -TrustServerCertificate -ErrorAction Stop
+        $queryParams = @{
+            SqlInstance   = $ServerInstance
+            Database      = $Database
+            Query         = $Query
+            QueryTimeout  = $QueryTimeout
+            EnableException = $true
+        }
+
+        if ($SkipCertValidation -and $script:InvokeDbaQuerySupportsTrustServerCertificate) {
+            $queryParams['TrustServerCertificate'] = $true
+        }
+        if ($SkipCertValidation -and $script:InvokeDbaQuerySupportsEncryptConnection) {
+            $queryParams['EncryptConnection'] = $false
+        }
+
+        Invoke-DbaQuery @queryParams
     }
     catch {
         Write-Warning "Failed to query [$ServerInstance]: $_"
@@ -149,21 +204,32 @@ else {
     Write-Host "Connecting to CMS: $CMSServer ..." -ForegroundColor Yellow
 
     try {
-        $registeredServers = Get-DbaCmsRegServer -SqlInstance $CMSServer -ErrorAction Stop |
+        $registeredServerCommandName = @('Get-DbaRegisteredServer', 'Get-DbaRegServer', 'Get-DbaCmsRegServer') |
+            Where-Object { Get-Command -Name $_ -ErrorAction SilentlyContinue } |
+            Select-Object -First 1
+
+        if (-not $registeredServerCommandName) {
+            throw "No dbatools CMS command found (Get-DbaRegisteredServer/Get-DbaRegServer/Get-DbaCmsRegServer)."
+        }
+
+        $registeredServerCommand = Get-Command -Name $registeredServerCommandName -ErrorAction Stop
+        $cmsParams = @{ SqlInstance = $CMSServer; ErrorAction = 'Stop' }
+        if ($registeredServerCommand.Parameters.ContainsKey('EnableException')) {
+            $cmsParams['EnableException'] = $true
+        }
+        if ($SkipCertValidation -and $registeredServerCommand.Parameters.ContainsKey('TrustServerCertificate')) {
+            $cmsParams['TrustServerCertificate'] = $true
+        }
+        if ($SkipCertValidation -and $registeredServerCommand.Parameters.ContainsKey('EncryptConnection')) {
+            $cmsParams['EncryptConnection'] = $false
+        }
+
+        $registeredServers = & $registeredServerCommandName @cmsParams |
                              Select-Object -ExpandProperty ServerName -Unique
     }
     catch {
-        # Fallback: use the SqlServer module approach
-        Write-Host "  dbatools not available, trying SqlServer module..." -ForegroundColor DarkYellow
-        try {
-            $provider = Get-ChildItem "SQLSERVER:\SQLRegistration\Central Management Server Group\$CMSServer" -Recurse -ErrorAction Stop |
-                        Where-Object { $_.GetType().Name -eq 'RegisteredServer' }
-            $registeredServers = $provider | ForEach-Object { $_.ServerName } | Sort-Object -Unique
-        }
-        catch {
-            Write-Error "Could not retrieve registered servers from CMS [$CMSServer]. Ensure dbatools or SqlServer module is installed. Error: $_"
-            exit 1
-        }
+        Write-Error "Could not retrieve registered servers from CMS [$CMSServer] using dbatools. Error: $_"
+        exit 1
     }
 
     $serverSource = "CMS: $CMSServer"
