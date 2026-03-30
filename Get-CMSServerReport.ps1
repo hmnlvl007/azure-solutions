@@ -977,25 +977,26 @@ function ConvertTo-HtmlTable {
         return "<p class='empty'>$EmptyMessage</p>"
     }
     $props = $Data[0].PSObject.Properties.Name
-    $html = "<table><thead><tr>"
+    $sb = [System.Text.StringBuilder]::new(4096)
+    [void]$sb.Append("<table><thead><tr>")
     foreach ($p in $props) {
-        $html += "<th>$p</th>"
+        [void]$sb.Append("<th>$p</th>")
     }
-    $html += "</tr></thead><tbody>"
+    [void]$sb.Append("</tr></thead><tbody>")
     foreach ($row in $Data) {
-        $html += "<tr>"
+        [void]$sb.Append("<tr>")
         foreach ($p in $props) {
             $val = $row.$p
             $class = ""
             # Conditional highlighting
             if ($val -match "UNREACHABLE|Error|Inactive|NOT_HEALTHY|SUSPENDED") { $class = " class='warn'" }
             elseif ($val -match "HEALTHY|Active|SYNCHRONIZED|ONLINE|CONNECTED") { $class = " class='good'" }
-            $html += "<td$class>$val</td>"
+            [void]$sb.Append("<td$class>$val</td>")
         }
-        $html += "</tr>"
+        [void]$sb.Append("</tr>")
     }
-    $html += "</tbody></table>"
-    return $html
+    [void]$sb.Append("</tbody></table>")
+    return $sb.ToString()
 }
 
 $agServers   = ($allServerInfo | Where-Object { $_.HasAG }).Count
@@ -1047,70 +1048,38 @@ else {
 "@
 }
 
-$detailSections = if ($InventoryOnly) {
-    ""
+$detailSections = ""
+if (-not $InventoryOnly) {
+    $sectionDefs = @(
+        @{ Id='ag-replicas';      Num=2;  Title='Availability Group – Replicas';    Data=$allAGDetails;      Empty="No Availability Groups found across registered servers." },
+        @{ Id='ag-databases';     Num=3;  Title='Availability Group – Databases';   Data=$allAGDatabases;    Empty="No AG databases found." },
+        @{ Id='ag-listeners';     Num=4;  Title='Availability Group – Listeners';   Data=$allAGListeners;    Empty="No AG listeners found." },
+        @{ Id='repl-publications'; Num=5;  Title='Replication – Publications';       Data=$allPublications;   Empty="No publications found." },
+        @{ Id='repl-articles';    Num=6;  Title='Replication – Articles';           Data=$allArticles;       Empty="No articles found." },
+        @{ Id='repl-subscriptions'; Num=7; Title='Replication – Subscriptions';     Data=$allSubscriptions;  Empty="No subscriptions found." },
+        @{ Id='repl-schedules';   Num=8;  Title='Replication – Agent Schedules';    Data=$allReplSchedules;  Empty="No replication schedules found. (Schedule data is only available from distributor servers.)" },
+        @{ Id='repl-distributors'; Num=9; Title='Replication – Distributors';       Data=$allDistributors;   Empty="No distributor databases found." },
+        @{ Id='cdc-databases';    Num=10; Title='CDC – Enabled Databases';          Data=$allCDCDatabases;   Empty="No CDC-enabled databases found across registered servers." },
+        @{ Id='cdc-tables';       Num=11; Title='CDC – Tracked Tables';             Data=$allCDCTables;      Empty="No CDC-tracked tables found." },
+        @{ Id='cdc-jobs';         Num=12; Title='CDC – Capture & Cleanup Jobs';     Data=$allCDCJobs;        Empty="No CDC jobs found." }
+    )
+
+    $sbSections = [System.Text.StringBuilder]::new(32768)
+    foreach ($sec in $sectionDefs) {
+        $rowCount = if ($sec.Data) { $sec.Data.Count } else { 0 }
+        Write-Host "  Building section $($sec.Num). $($sec.Title) ($rowCount rows)..." -ForegroundColor DarkGray
+        $tableHtml = ConvertTo-HtmlTable -Data $sec.Data -EmptyMessage $sec.Empty
+        [void]$sbSections.AppendLine("<div class=`"section`" id=`"$($sec.Id)`">")
+        [void]$sbSections.AppendLine("<h2>$($sec.Num). $($sec.Title)</h2>")
+        [void]$sbSections.AppendLine($tableHtml)
+        [void]$sbSections.AppendLine("</div>")
+        [void]$sbSections.AppendLine()
+    }
+    $detailSections = $sbSections.ToString()
 }
-else {
-@"
-<!-- ═══════════════════════════════════════════════════════════════════ -->
-<div class="section" id="ag-replicas">
-<h2>2. Availability Group – Replicas</h2>
-$(ConvertTo-HtmlTable -Data $allAGDetails -EmptyMessage "No Availability Groups found across registered servers.")
-</div>
 
-<div class="section" id="ag-databases">
-<h2>3. Availability Group – Databases</h2>
-$(ConvertTo-HtmlTable -Data $allAGDatabases -EmptyMessage "No AG databases found.")
-</div>
-
-<div class="section" id="ag-listeners">
-<h2>4. Availability Group – Listeners</h2>
-$(ConvertTo-HtmlTable -Data $allAGListeners -EmptyMessage "No AG listeners found.")
-</div>
-
-<!-- ═══════════════════════════════════════════════════════════════════ -->
-<div class="section" id="repl-publications">
-<h2>5. Replication – Publications</h2>
-$(ConvertTo-HtmlTable -Data $allPublications -EmptyMessage "No publications found.")
-</div>
-
-<div class="section" id="repl-articles">
-<h2>6. Replication – Articles</h2>
-$(ConvertTo-HtmlTable -Data $allArticles -EmptyMessage "No articles found.")
-</div>
-
-<div class="section" id="repl-subscriptions">
-<h2>7. Replication – Subscriptions</h2>
-$(ConvertTo-HtmlTable -Data $allSubscriptions -EmptyMessage "No subscriptions found.")
-</div>
-
-<div class="section" id="repl-schedules">
-<h2>8. Replication – Agent Schedules</h2>
-$(ConvertTo-HtmlTable -Data $allReplSchedules -EmptyMessage "No replication schedules found. (Schedule data is only available from distributor servers.)")
-</div>
-
-<div class="section" id="repl-distributors">
-<h2>9. Replication – Distributors</h2>
-$(ConvertTo-HtmlTable -Data $allDistributors -EmptyMessage "No distributor databases found.")
-</div>
-
-<!-- ═══════════════════════════════════════════════════════════════════ -->
-<div class="section" id="cdc-databases">
-<h2>10. CDC – Enabled Databases</h2>
-$(ConvertTo-HtmlTable -Data $allCDCDatabases -EmptyMessage "No CDC-enabled databases found across registered servers.")
-</div>
-
-<div class="section" id="cdc-tables">
-<h2>11. CDC – Tracked Tables</h2>
-$(ConvertTo-HtmlTable -Data $allCDCTables -EmptyMessage "No CDC-tracked tables found.")
-</div>
-
-<div class="section" id="cdc-jobs">
-<h2>12. CDC – Capture & Cleanup Jobs</h2>
-$(ConvertTo-HtmlTable -Data $allCDCJobs -EmptyMessage "No CDC jobs found.")
-</div>
-"@
-}
+Write-Host "  Building section 1. Server Inventory ($($allServerInfo.Count) rows)..." -ForegroundColor DarkGray
+$inventoryTableHtml = ConvertTo-HtmlTable -Data $allServerInfo -EmptyMessage "No server data collected."
 
 $htmlContent = @"
 <!DOCTYPE html>
@@ -1180,7 +1149,7 @@ $tocExtraItems
 <!-- ═══════════════════════════════════════════════════════════════════ -->
 <div class="section" id="versions">
 <h2>1. SQL Server Inventory & Configuration</h2>
-$(ConvertTo-HtmlTable -Data $allServerInfo -EmptyMessage "No server data collected.")
+$inventoryTableHtml
 </div>
 
 $detailSections
