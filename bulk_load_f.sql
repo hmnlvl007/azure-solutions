@@ -1,4 +1,4 @@
-USE [db];
+USE [db1];
 GO
 SET NOCOUNT ON;
 SET XACT_ABORT ON;
@@ -36,13 +36,6 @@ DECLARE
     @tb          datetime,
     @msg         nvarchar(4000);
 
-DECLARE @Keys TABLE
-(
-    PITM_TICKET_NO char(36) NOT NULL,
-    PDAT_IO_TYPE   char(1)  NOT NULL,
-    PDAT_SEQ       int      NOT NULL
-);
-
 SELECT TOP (1)
     @LastTicket = LastTicket,
     @LastIO     = LastIO,
@@ -51,13 +44,20 @@ SELECT TOP (1)
     @TotalRows  = TotalRows
 FROM dbo.BulkCopy_Progress;
 
-SET @msg = CONCAT('Start: batch=', @BatchNo, '; rows=', @TotalRows);
+IF @LastTicket IS NULL
+BEGIN
+    SET @LastTicket = '';
+    SET @LastIO     = '';
+    SET @LastSeq    = -2147483648;
+END;
+
+SET @msg = CONCAT('Start: batch=', @BatchNo, '; rows=', @TotalRows,
+                  '; key=', RTRIM(@LastTicket), '/', @LastIO, '/', @LastSeq);
 RAISERROR('%s', 0, 1, @msg) WITH NOWAIT;
 
 WHILE @Rows > 0
 BEGIN
     SET @tb = GETDATE();
-    DELETE FROM @Keys;
 
     BEGIN TRAN;
 
@@ -68,11 +68,6 @@ BEGIN
             PDAT_SEQ,
             PDAT_VALUE
         )
-        OUTPUT
-            inserted.PITM_TICKET_NO,
-            inserted.PDAT_IO_TYPE,
-            inserted.PDAT_SEQ
-        INTO @Keys
         SELECT TOP (@BatchSize)
             s.PITM_TICKET_NO,
             s.PDAT_IO_TYPE,
@@ -100,16 +95,23 @@ BEGIN
         SET @BatchNo   = @BatchNo + 1;
         SET @TotalRows = @TotalRows + @Rows;
 
-        /* Max key from in-memory table variable — no second source read */
-        SELECT TOP (1)
-            @LastTicket = PITM_TICKET_NO,
-            @LastIO     = PDAT_IO_TYPE,
-            @LastSeq    = PDAT_SEQ
-        FROM @Keys
+        /* Get last key: OFFSET actual @Rows - 1 (not @BatchSize - 1).
+           Pages are in buffer pool from the INSERT — near instant. */
+        SELECT
+            @LastTicket = s.PITM_TICKET_NO,
+            @LastIO     = s.PDAT_IO_TYPE,
+            @LastSeq    = s.PDAT_SEQ
+        FROM [MountedDB].dbo.TBL1 AS s
+        WHERE
+            (s.PITM_TICKET_NO = @LastTicket AND s.PDAT_IO_TYPE = @LastIO AND s.PDAT_SEQ > @LastSeq)
+         OR (s.PITM_TICKET_NO = @LastTicket AND s.PDAT_IO_TYPE > @LastIO)
+         OR (s.PITM_TICKET_NO > @LastTicket)
         ORDER BY
-            PITM_TICKET_NO DESC,
-            PDAT_IO_TYPE DESC,
-            PDAT_SEQ DESC;
+            s.PITM_TICKET_NO,
+            s.PDAT_IO_TYPE,
+            s.PDAT_SEQ
+        OFFSET @Rows - 1 ROWS FETCH NEXT 1 ROW ONLY
+        OPTION (RECOMPILE);
 
         UPDATE dbo.BulkCopy_Progress
         SET LastTicket = @LastTicket,
