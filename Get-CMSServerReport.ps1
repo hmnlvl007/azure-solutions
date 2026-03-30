@@ -383,7 +383,6 @@ SELECT
     ag.group_id                      AS AGGroupId,
     ags.primary_replica              AS PrimaryReplica,
     ags.synchronization_health_desc  AS AGSyncHealth,
-    ags.operational_state_desc       AS AGOperationalState,
     ar.replica_server_name           AS ReplicaServer,
     ar.availability_mode_desc        AS AvailabilityMode,
     ar.failover_mode_desc            AS FailoverMode,
@@ -413,7 +412,6 @@ ORDER BY ag.name, ar.replica_server_name
                     AGName              = $row.AGName
                     PrimaryReplica      = $row.PrimaryReplica
                     AGSyncHealth        = $row.AGSyncHealth
-                    AGOperationalState  = $row.AGOperationalState
                     ReplicaServer       = $row.ReplicaServer
                     AvailabilityMode    = $row.AvailabilityMode
                     FailoverMode        = $row.FailoverMode
@@ -863,9 +861,9 @@ SELECT
     SERVERPROPERTY(''ServerName'')     AS ServerName,
     DB_NAME()                          AS DatabaseName,
     j.job_id                           AS JobId,
-    CASE j.job_type 
-        WHEN 1 THEN ''Capture'' 
-        WHEN 2 THEN ''Cleanup'' 
+    CASE LOWER(j.job_type) 
+        WHEN ''capture'' THEN ''Capture'' 
+        WHEN ''cleanup'' THEN ''Cleanup'' 
         ELSE ''Unknown'' 
     END                                AS JobType,
     sj.name                            AS JobName,
