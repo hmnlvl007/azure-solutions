@@ -127,7 +127,7 @@ function Save-PageWord {
         [Microsoft.PowerShell.Commands.WebRequestSession]$Session
     )
 
-    $wordUrl  = "{0}/exportword?pageId={1}" -f $WikiBase, $PageId
+    $wordUrl  = "{0}/exportword?pageId={1}&os_authType=basic" -f $WikiBase, $PageId
     $tmpPath  = "$DestPath.part"
 
     $webParams = @{
@@ -179,7 +179,7 @@ function Save-PageHtml {
     $body = $resp.body.export_view.value
 
     if ([string]::IsNullOrWhiteSpace($body)) {
-        return [PSCustomObject]@{ Success = $false; Format = $null; Path = $null }
+        return [PSCustomObject]@{ Success = $false; Format = 'empty'; Path = $null }
     }
 
     $safeTitle     = [System.Net.WebUtility]::HtmlEncode($PageTitle)
@@ -200,14 +200,23 @@ function Save-PageHtml {
   h1     { border-bottom: 2px solid #0052CC; padding-bottom: .3em; }
   h2,h3  { color: #0052CC; }
   a      { color: #0052CC; text-decoration: underline; }
-  table  { border-collapse: collapse; width: 100%; margin: 1em 0; }
-  th, td { border: 1px solid #C1C7D0; padding: .5em .75em; text-align: left; }
-  th     { background: #F4F5F7; font-weight: 600; }
+  .table-wrap { overflow-x: auto; margin: 1em 0; }
+  table  { border-collapse: collapse; min-width: 50%; max-width: 100%; margin: 1em 0; }
+  table[data-layout="wide"], table[data-layout="full-width"] { width: 100%; }
+  th, td { border: 1px solid #C1C7D0; padding: .5em .75em; text-align: left;
+           word-wrap: break-word; overflow-wrap: break-word; }
+  td:has(> pre), td:has(> code) { max-width: 40em; }
+  th     { background: #F4F5F7; font-weight: 600; white-space: nowrap; }
   tr:nth-child(even) { background: #FAFBFC; }
+  col    { min-width: 6em; }
   code, pre { background: #F4F5F7; border-radius: 3px; font-size: 0.9em; }
-  pre    { padding: 1em; overflow-x: auto; }
+  pre    { padding: 1em; overflow-x: auto; white-space: pre-wrap; word-break: break-word; }
   code   { padding: .15em .3em; }
   img    { max-width: 100%; height: auto; }
+  .attachment-link { display: inline-block; padding: .2em .5em; background: #F4F5F7;
+                     border-radius: 3px; margin: .2em 0; font-size: 0.9em; }
+  .embedded-placeholder { padding: .75em; background: #FFFAE6; border: 1px solid #FFE380;
+                          border-radius: 3px; margin: .5em 0; font-size: 0.9em; color: #6B778C; }
   .source-link { font-size: 0.85em; color: #6B778C; margin-bottom: 1.5em; }
   .source-link a { color: #6B778C; }
   @media print { body { margin: 0; } .source-link { display: none; } }
@@ -223,6 +232,90 @@ $body
 
     [IO.File]::WriteAllText($DestPath, $html, [Text.Encoding]::UTF8)
     return [PSCustomObject]@{ Success = $true; Format = 'html'; Path = $DestPath }
+}
+
+# ── Attachments ──────────────────────────────────────────────────────────────
+
+function Save-PageAttachments {
+    <#
+        Downloads all attachments for a Confluence page.
+        Embedded documents (Excel, PDF, images) are saved to an _attachments
+        subfolder next to the exported page document.
+        Returns count and total bytes of downloaded attachments.
+    #>
+    param(
+        [Parameter(Mandatory)][string]$ApiBase,
+        [Parameter(Mandatory)][string]$WikiBase,
+        [Parameter(Mandatory)][string]$PageId,
+        [Parameter(Mandatory)][hashtable]$Headers,
+        [Parameter(Mandatory)][string]$PageFolder,
+        [Parameter(Mandatory)][string]$FileBaseName
+    )
+
+    # List attachments via REST API
+    $uri = "{0}/content/{1}/child/attachment?limit=100" -f $ApiBase, $PageId
+    try {
+        $resp = Invoke-RestMethod -Uri $uri -Headers $Headers -ErrorAction Stop
+    }
+    catch {
+        return [PSCustomObject]@{ Count = 0; Bytes = [long]0; Files = @() }
+    }
+
+    if ($null -eq $resp.results -or $resp.results.Count -eq 0) {
+        return [PSCustomObject]@{ Count = 0; Bytes = [long]0; Files = @() }
+    }
+
+    # Create _attachments subfolder named after the page
+    $attachDir = Join-Path $PageFolder "$FileBaseName-attachments"
+    if (-not (Test-Path -LiteralPath $attachDir)) {
+        New-Item -Path $attachDir -ItemType Directory -Force | Out-Null
+    }
+
+    $dlCount = 0
+    $dlBytes = [long]0
+    $dlFiles = @()
+
+    foreach ($att in $resp.results) {
+        $attTitle = $att.title
+        $safeName = Get-SafeFileName -Name $attTitle
+        $dlPath   = Join-Path $attachDir $safeName
+
+        # Build download URL from the attachment's _links.download
+        $downloadPath = $null
+        try { $downloadPath = $att._links.download } catch {}
+        if ([string]::IsNullOrWhiteSpace($downloadPath)) { continue }
+
+        $downloadUrl = "{0}{1}" -f $WikiBase, $downloadPath
+
+        try {
+            $webParams = @{
+                Uri             = $downloadUrl
+                Method          = 'Get'
+                Headers         = @{ Authorization = $Headers['Authorization'] }
+                OutFile         = $dlPath
+                UseBasicParsing = $true
+                ErrorAction     = 'Stop'
+            }
+            Invoke-WebRequest @webParams | Out-Null
+
+            if (Test-Path -LiteralPath $dlPath) {
+                $fileLen = (Get-Item -LiteralPath $dlPath).Length
+                $dlCount++
+                $dlBytes += $fileLen
+                $dlFiles += [PSCustomObject]@{ Name = $attTitle; Size = $fileLen }
+            }
+        }
+        catch {
+            # Skip individual attachment failures silently
+        }
+    }
+
+    # Clean up empty attachment folder
+    if ($dlCount -eq 0 -and (Test-Path -LiteralPath $attachDir)) {
+        Remove-Item -LiteralPath $attachDir -Force -Recurse -ErrorAction SilentlyContinue
+    }
+
+    return [PSCustomObject]@{ Count = $dlCount; Bytes = $dlBytes; Files = $dlFiles }
 }
 
 # ── Main ─────────────────────────────────────────────────────────────────────
@@ -263,15 +356,19 @@ if ($pages.Count -eq 0) {
 }
 
 Write-Host "Found $($pages.Count) pages. Exporting to: $spaceOutput" -ForegroundColor Green
-Write-Host 'Strategy: Word (.doc) primary, HTML fallback' -ForegroundColor Green
+Write-Host 'Strategy: Word (.doc) primary, HTML fallback + attachments' -ForegroundColor Green
 Write-Host ''
 
 $index      = 0
 $failed     = @()
 $formats    = @{ doc = 0; html = 0 }
 $totalBytes = [long]0
+$totalAttachments   = 0
+$totalAttachBytes   = [long]0
 $runStart   = [DateTime]::UtcNow
-$wordBlocked = $false   # flip to $true if Word export gets 403
+$wordBlocked       = $false   # flip to $true after consecutive Word failures
+$wordFailStreak    = 0       # consecutive Word export failures
+$wordFailThreshold = 3       # switch to HTML-only after this many consecutive failures
 
 foreach ($page in $pages) {
     $index++
@@ -303,7 +400,8 @@ foreach ($page in $pages) {
 
     Write-Host ("[{0}/{1} {2}%{3}] {4}" -f $index, $pages.Count, $pct, $etaStr, $page.title) -ForegroundColor Cyan
 
-    $result = $null
+    $result    = $null
+    $failReason = ''
 
     # ── Try Word first ───────────────────────────────────────────────────
     if (-not $wordBlocked) {
@@ -315,17 +413,34 @@ foreach ($page in $pages) {
                           -Headers   $headers `
                           -DestPath  $docPath `
                           -Session   $session
+
+            if ($result.Success) {
+                $wordFailStreak = 0   # reset on success
+            } else {
+                $wordFailStreak++
+                $failReason = 'Word returned empty/tiny file'
+            }
         }
         catch {
+            $wordFailStreak++
+            $failReason = $_.Exception.Message
+
             $status = 0
             if ($_.Exception.Response) {
                 try { $status = [int]$_.Exception.Response.StatusCode } catch {}
             }
-            if ($status -eq 403) {
+
+            if ($status -in @(401, 403)) {
                 $wordBlocked = $true
-                Write-Host "  Word export returned 403 - switching to HTML for all pages" -ForegroundColor Yellow
+                Write-Host "  Word export returned $status - switching to HTML for all remaining pages" -ForegroundColor Yellow
             }
             $result = $null
+        }
+
+        # Auto-switch after N consecutive failures (non-auth errors: timeouts, redirects, etc.)
+        if (-not $wordBlocked -and $wordFailStreak -ge $wordFailThreshold) {
+            $wordBlocked = $true
+            Write-Host "  Word failed $wordFailStreak times in a row - switching to HTML for all remaining pages" -ForegroundColor Yellow
         }
     }
 
@@ -340,9 +455,18 @@ foreach ($page in $pages) {
                           -PageTitle $page.title `
                           -Headers   $headers `
                           -DestPath  $htmlPath
+
+            if (-not $result.Success -and $result.Format -eq 'empty') {
+                # Page body is empty (container page) - treat as SKIP, not FAIL
+                $failReason = 'empty page (container/parent)'
+            }
+            elseif (-not $result.Success) {
+                $failReason = 'HTML body empty'
+            }
         }
         catch {
             $result = [PSCustomObject]@{ Success = $false; Format = $null; Path = $null }
+            $failReason = "HTML fallback: $($_.Exception.Message)"
         }
     }
 
@@ -357,10 +481,34 @@ foreach ($page in $pages) {
                    else { "$fileSize B" }
         Write-Host ("  OK  {0} | {1} | {2:N1}s | {3}" -f `
             $result.Format.ToUpper().PadRight(4), $sizeStr, $dur, $relFolder) -ForegroundColor Green
+
+        # Download attachments (Excel, PDF, images, etc.)
+        $attResult = Save-PageAttachments `
+                         -ApiBase      $apiBaseUrl `
+                         -WikiBase     $wikiBaseUrl `
+                         -PageId       $page.id `
+                         -Headers      $headers `
+                         -PageFolder   $pageFolder `
+                         -FileBaseName $fileBaseName
+
+        if ($attResult.Count -gt 0) {
+            $totalAttachments += $attResult.Count
+            $totalAttachBytes += $attResult.Bytes
+            $totalBytes       += $attResult.Bytes
+            $attSizeStr = if ($attResult.Bytes -ge 1MB) { "{0:N1} MB" -f ($attResult.Bytes / 1MB) }
+                          elseif ($attResult.Bytes -ge 1KB) { "{0:N0} KB" -f ($attResult.Bytes / 1KB) }
+                          else { "$($attResult.Bytes) B" }
+            Write-Host ("        + {0} attachment(s) | {1}" -f $attResult.Count, $attSizeStr) -ForegroundColor DarkCyan
+        }
     }
     else {
-        $failed += [PSCustomObject]@{ Id = $page.id; Title = $page.title }
-        Write-Host ("  FAIL  ({0}) | {1:N1}s" -f $page.id, $dur) -ForegroundColor Red
+        $reasonStr = if ($failReason) { $failReason } else { 'unknown' }
+        $failed += [PSCustomObject]@{ Id = $page.id; Title = $page.title; Reason = $reasonStr }
+        if ($failReason -match 'empty page') {
+            Write-Host ("  SKIP  empty page ({0}) | {1:N1}s" -f $page.id, $dur) -ForegroundColor DarkYellow
+        } else {
+            Write-Host ("  FAIL  ({0}) | {1:N1}s | {2}" -f $page.id, $dur, $reasonStr) -ForegroundColor Red
+        }
     }
 
     # Compact running totals every 10 pages
@@ -393,6 +541,7 @@ $summary = [PSCustomObject]@{
     exported       = [PSCustomObject]@{ doc = $formats.doc; html = $formats.html }
     exportedCount  = $totalExported
     totalSizeBytes = $totalBytes
+    attachments    = [PSCustomObject]@{ count = $totalAttachments; bytes = $totalAttachBytes }
     failedCount    = $failed.Count
     failures       = $failed
     outputFolder   = $spaceOutput
@@ -405,6 +554,12 @@ Write-Host '--- EXPORT COMPLETE ---' -ForegroundColor Cyan
 Write-Host "  Space    : $SpaceKey"
 Write-Host "  Pages    : $($pages.Count)"
 Write-Host "  Exported : $totalExported  (DOC: $($formats.doc) | HTML: $($formats.html))" -ForegroundColor Green
+if ($totalAttachments -gt 0) {
+    $attTotalStr = if ($totalAttachBytes -ge 1MB) { "{0:N1} MB" -f ($totalAttachBytes / 1MB) }
+                   elseif ($totalAttachBytes -ge 1KB) { "{0:N0} KB" -f ($totalAttachBytes / 1KB) }
+                   else { "$totalAttachBytes bytes" }
+    Write-Host "  Attach.  : $totalAttachments files ($attTotalStr)" -ForegroundColor DarkCyan
+}
 Write-Host "  Failed   : $($failed.Count)" -ForegroundColor $(if ($failed.Count -gt 0) { 'Red' } else { 'Green' })
 Write-Host "  Size     : $totalSizeStr"
 Write-Host "  Duration : $("{0:hh\:mm\:ss}" -f $totalElapsed)"

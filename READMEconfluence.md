@@ -22,9 +22,11 @@ Confluence Cloud REST API
 2. Establishes a cookie-based session (required by the `/exportword` action URL).
 3. Fetches all pages in the target space, including their ancestor chains.
 4. Mirrors the Confluence page tree as a local folder hierarchy.
-5. For each page: tries **Word export** first; if that fails (e.g. 403), falls back to **styled HTML**.
-6. If Word returns 403 on any page, it flips to HTML-only mode for the rest of the run.
-7. Writes a JSON summary file (`export-summary-<timestamp>.json`) with run stats.
+5. For each page: tries **Word export** first; if that fails, falls back to **styled HTML**.
+6. If Word returns 401/403, or fails 3 times in a row, the script switches to HTML-only for all remaining pages.
+7. Empty container pages (no body content) are logged as `SKIP` rather than `FAIL`.
+8. Only **one file per page** is ever written — never both `.doc` and `.html` for the same page.
+9. Writes a JSON summary file (`export-summary-<timestamp>.json`) with run stats.
 
 ## Why Word (.doc) as the primary format
 
@@ -111,8 +113,10 @@ Strategy: Word (.doc) primary, HTML fallback
   OK  DOC  | 45 KB | 1.2s | Documentation
 [2/42 5% | ETA 00:02:58] SQL Server Monitoring
   OK  DOC  | 38 KB | 0.9s | Documentation\Monitoring
+[3/42 7% | ETA 00:02:50] How-to articles
+  SKIP  empty page (124256289) | 0.8s
 ...
-  --- 10 exported (DOC:10 HTML:0) | 0 failed | 412 KB | 00:00:14 ---
+  --- 10 exported (DOC:9 HTML:0) | 1 failed | 412 KB | 00:00:14 ---
 ...
 
 --- EXPORT COMPLETE ---
@@ -202,10 +206,11 @@ Register-ScheduledTask `
 
 ### Word export (primary)
 
-- Uses Confluence's `/exportword?pageId=<id>` action URL.
+- Uses Confluence's `/exportword?pageId=<id>&os_authType=basic` action URL.
+- The `os_authType=basic` parameter is required so the legacy web endpoint accepts Basic auth from API tokens.
 - Requires a cookie-based session established via `Invoke-WebRequest -SessionVariable`.
 - Produces a `.doc` file (HTML-in-Word wrapper) that Word, Word Online, and SharePoint handle natively.
-- All hyperlinks (internal Confluence links, external URLs) are preserved as clickable links.
+- Internal Confluence links and external URLs are preserved as clickable hyperlinks.
 - Atomic writes: downloads to a `.part` temp file, then renames on success.
 
 ### HTML export (fallback)
@@ -216,8 +221,20 @@ Register-ScheduledTask `
   - `<meta>` tags for source page ID and URL
   - "View in Confluence" source link
   - Responsive layout, print-friendly styles
-- Falls back automatically if Word export fails for a page.
-- If Word returns HTTP 403, the script switches to HTML-only for all remaining pages in the run.
+- Falls back automatically if Word export fails for a specific page.
+- If Word returns HTTP 401 or 403, the script immediately switches to HTML-only for all remaining pages.
+- If Word fails 3 times in a row for any reason (timeouts, redirects, etc.), the script also switches to HTML-only.
+
+### Empty / container pages
+
+- Some Confluence pages (e.g. "How-to articles") are just parent containers with no body content.
+- These are logged as `SKIP` (dark yellow) rather than `FAIL` (red) in the progress output.
+- They still appear in the `failures` array in the summary JSON for visibility.
+
+### One file per page
+
+- The script writes exactly **one** file per page — `.doc` if Word succeeds, `.html` if it falls back.
+- You will never see both formats for the same page, so M365 Copilot won't index duplicate content.
 
 ## Troubleshooting
 
@@ -226,6 +243,8 @@ Register-ScheduledTask `
 | `Authentication failed` | Wrong email or API token | Verify at https://id.atlassian.com/manage-profile/security/api-tokens |
 | `CONFLUENCE_API_TOKEN is empty` | Env var not set | Run the `SetEnvironmentVariable` command above and restart terminal |
 | `Cannot locate a synced OneDrive folder` | OneDrive not signed in | Sign into OneDrive for Business; or set `$env:OneDriveCommercial` manually |
-| All pages export as HTML (0 DOC) | `/exportword` blocked (403) | This is expected on some Confluence Cloud tenants — HTML is the automatic fallback |
+| All pages export as HTML (0 DOC) | `/exportword` blocked (401/403) | This is expected on some Confluence Cloud tenants — HTML is the automatic fallback |
+| Word fails after first 3 pages then stops | Consecutive failure detection | After 3 Word failures in a row, script auto-switches to HTML — check summary JSON for the reason |
+| Many pages show `SKIP` | Empty body (container pages) | Normal — these are parent pages with no content, just used for hierarchy |
 | `No pages found` | Wrong space key | Check the space key in Confluence URL (`/wiki/spaces/KEY/...`) |
-| Exit code 2 | Some pages failed | Check the `failures` array in the summary JSON for page IDs |
+| Exit code 2 | Some pages failed | Check the `failures` array in the summary JSON for page IDs and reasons |
