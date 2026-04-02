@@ -79,7 +79,7 @@ function Get-ConfluencePages {
     $start = 0
 
     while ($true) {
-        $uri = "{0}/content?spaceKey={1}&type=page&limit={2}&start={3}&expand=ancestors,version" `
+        $uri = "{0}/content?spaceKey={1}&type=page&limit={2}&start={3}&expand=ancestors,version,body.export_view" `
                -f $ApiBase, [uri]::EscapeDataString($TargetSpace), $Limit, $start
 
         $resp = Invoke-RestMethod -Uri $uri -Method Get -Headers $Headers
@@ -152,7 +152,21 @@ function Save-PageWord {
     }
 
     if ((Test-Path -LiteralPath $localTmp) -and (Get-Item -LiteralPath $localTmp).Length -gt 100) {
-        Copy-Item -LiteralPath $localTmp -Destination $DestPath -Force
+        # Copy with retry (handles transient I/O errors on network/redirected paths)
+        $maxRetries = 3
+        for ($attempt = 1; $attempt -le $maxRetries; $attempt++) {
+            try {
+                Copy-Item -LiteralPath $localTmp -Destination $DestPath -Force
+                break
+            }
+            catch {
+                if ($attempt -eq $maxRetries) {
+                    Remove-Item -LiteralPath $localTmp -Force -ErrorAction SilentlyContinue
+                    throw
+                }
+                Start-Sleep -Milliseconds 500
+            }
+        }
         Remove-Item -LiteralPath $localTmp -Force -ErrorAction SilentlyContinue
         return [PSCustomObject]@{ Success = $true; Format = 'doc'; Path = $DestPath }
     }
@@ -174,12 +188,17 @@ function Save-PageHtml {
         [Parameter(Mandatory)][string]$PageId,
         [Parameter(Mandatory)][string]$PageTitle,
         [Parameter(Mandatory)][hashtable]$Headers,
-        [Parameter(Mandatory)][string]$DestPath
+        [Parameter(Mandatory)][string]$DestPath,
+        [string]$BodyHtml
     )
 
-    $uri  = "{0}/content/{1}?expand=body.export_view" -f $ApiBase, $PageId
-    $resp = Invoke-RestMethod -Uri $uri -Headers $Headers
-    $body = $resp.body.export_view.value
+    # Use pre-fetched body if available; otherwise fetch it
+    $body = $BodyHtml
+    if ([string]::IsNullOrWhiteSpace($body)) {
+        $uri  = "{0}/content/{1}?expand=body.export_view" -f $ApiBase, $PageId
+        $resp = Invoke-RestMethod -Uri $uri -Headers $Headers
+        $body = $resp.body.export_view.value
+    }
 
     if ([string]::IsNullOrWhiteSpace($body)) {
         return [PSCustomObject]@{ Success = $false; Format = 'empty'; Path = $null }
@@ -233,7 +252,18 @@ $body
 </html>
 "@
 
-    $html | Set-Content -LiteralPath $DestPath -Encoding UTF8 -Force
+    # Write with retry (handles transient I/O errors on network/redirected paths)
+    $maxRetries = 3
+    for ($attempt = 1; $attempt -le $maxRetries; $attempt++) {
+        try {
+            Set-Content -LiteralPath $DestPath -Value $html -Encoding UTF8 -Force
+            break
+        }
+        catch {
+            if ($attempt -eq $maxRetries) { throw }
+            Start-Sleep -Milliseconds 500
+        }
+    }
     return [PSCustomObject]@{ Success = $true; Format = 'html'; Path = $DestPath }
 }
 
@@ -455,6 +485,11 @@ foreach ($page in $pages) {
     # ── Fall back to HTML ────────────────────────────────────────────────
     if ($null -eq $result -or -not $result.Success) {
         $htmlPath = Join-Path $pageFolder "$fileBaseName.html"
+
+        # Use pre-fetched body from the listing call (avoids extra API round-trip)
+        $prefetchedBody = $null
+        try { $prefetchedBody = $page.body.export_view.value } catch {}
+
         try {
             $result = Save-PageHtml `
                           -ApiBase   $apiBaseUrl `
@@ -462,7 +497,8 @@ foreach ($page in $pages) {
                           -PageId    $page.id `
                           -PageTitle $page.title `
                           -Headers   $headers `
-                          -DestPath  $htmlPath
+                          -DestPath  $htmlPath `
+                          -BodyHtml  $prefetchedBody
 
             if (-not $result.Success -and $result.Format -eq 'empty') {
                 # Page body is empty (container page) - treat as SKIP, not FAIL
