@@ -127,15 +127,17 @@ function Save-PageWord {
         [Microsoft.PowerShell.Commands.WebRequestSession]$Session
     )
 
-    $wordUrl  = "{0}/exportword?pageId={1}&os_authType=basic" -f $WikiBase, $PageId
-    $tmpPath  = "$DestPath.part"
+    $wordUrl = "{0}/exportword?pageId={1}&os_authType=basic" -f $WikiBase, $PageId
+
+    # Download to local temp first, then copy to destination
+    $localTmp = Join-Path ([IO.Path]::GetTempPath()) "confluence-export-$PageId.doc"
 
     $webParams = @{
         Uri                = $wordUrl
         Method             = 'Get'
         Headers            = @{ Authorization = $Headers['Authorization'] }
         MaximumRedirection = 10
-        OutFile            = $tmpPath
+        OutFile            = $localTmp
         UseBasicParsing    = $true
         ErrorAction        = 'Stop'
     }
@@ -143,18 +145,19 @@ function Save-PageWord {
 
     try {
         Invoke-WebRequest @webParams | Out-Null
-        if ((Test-Path -LiteralPath $tmpPath) -and (Get-Item -LiteralPath $tmpPath).Length -gt 100) {
-            Move-Item -LiteralPath $tmpPath -Destination $DestPath -Force
-            return [PSCustomObject]@{ Success = $true; Format = 'doc'; Path = $DestPath }
-        }
     }
     catch {
-        # Propagate the exception so the caller can detect 403 etc.
-        if (Test-Path -LiteralPath $tmpPath) { Remove-Item -LiteralPath $tmpPath -Force }
-        throw
+        if (Test-Path -LiteralPath $localTmp) { Remove-Item -LiteralPath $localTmp -Force }
+        throw   # propagate so caller can detect 403 etc.
     }
 
-    if (Test-Path -LiteralPath $tmpPath) { Remove-Item -LiteralPath $tmpPath -Force }
+    if ((Test-Path -LiteralPath $localTmp) -and (Get-Item -LiteralPath $localTmp).Length -gt 100) {
+        Copy-Item -LiteralPath $localTmp -Destination $DestPath -Force
+        Remove-Item -LiteralPath $localTmp -Force -ErrorAction SilentlyContinue
+        return [PSCustomObject]@{ Success = $true; Format = 'doc'; Path = $DestPath }
+    }
+
+    if (Test-Path -LiteralPath $localTmp) { Remove-Item -LiteralPath $localTmp -Force }
     return [PSCustomObject]@{ Success = $false; Format = $null; Path = $null }
 }
 
@@ -230,7 +233,7 @@ $body
 </html>
 "@
 
-    [IO.File]::WriteAllText($DestPath, $html, [Text.Encoding]::UTF8)
+    $html | Set-Content -LiteralPath $DestPath -Encoding UTF8 -Force
     return [PSCustomObject]@{ Success = $true; Format = 'html'; Path = $DestPath }
 }
 
@@ -415,16 +418,16 @@ foreach ($page in $pages) {
                           -Session   $session
 
             if ($result.Success) {
-                $wordFailStreak = 0   # reset on success
+                $wordFailStreak = 0
             } else {
                 $wordFailStreak++
                 $failReason = 'Word returned empty/tiny file'
             }
         }
         catch {
-            $wordFailStreak++
             $failReason = $_.Exception.Message
 
+            # Only count HTTP errors toward word-blocked; ignore file I/O errors
             $status = 0
             if ($_.Exception.Response) {
                 try { $status = [int]$_.Exception.Response.StatusCode } catch {}
@@ -434,13 +437,18 @@ foreach ($page in $pages) {
                 $wordBlocked = $true
                 Write-Host "  Word export returned $status - switching to HTML for all remaining pages" -ForegroundColor Yellow
             }
+            elseif ($status -gt 0) {
+                # Real HTTP error (500, 404, etc.) - count toward streak
+                $wordFailStreak++
+            }
+            # else: I/O error or other non-HTTP issue - do NOT count toward streak
             $result = $null
         }
 
-        # Auto-switch after N consecutive failures (non-auth errors: timeouts, redirects, etc.)
+        # Only auto-switch after consecutive HTTP failures, not I/O glitches
         if (-not $wordBlocked -and $wordFailStreak -ge $wordFailThreshold) {
             $wordBlocked = $true
-            Write-Host "  Word failed $wordFailStreak times in a row - switching to HTML for all remaining pages" -ForegroundColor Yellow
+            Write-Host "  Word failed $wordFailStreak consecutive HTTP errors - switching to HTML" -ForegroundColor Yellow
         }
     }
 
