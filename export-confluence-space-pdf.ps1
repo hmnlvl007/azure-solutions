@@ -51,11 +51,33 @@ function Get-SafeFileName {
 }
 
 function Write-FileSafe {
-    # Writes text to a file atomically with up to 3 retries for transient I/O errors.
+    # Writes text via local temp file, then copies to destination with retries.
+    # This avoids direct WriteAllText calls against flaky network/redirected paths.
     param([string]$Path, [string]$Text)
+    $tmp = [IO.Path]::Combine([IO.Path]::GetTempPath(), ([IO.Path]::GetRandomFileName() + '.txt'))
     for ($try = 1; $try -le 3; $try++) {
         try {
-            [IO.File]::WriteAllText($Path, $Text, [Text.Encoding]::UTF8)
+            [IO.File]::WriteAllText($tmp, $Text, [Text.Encoding]::UTF8)
+            Copy-FileSafe -Source $tmp -Dest $Path
+            return
+        }
+        catch {
+            if ($try -eq 3) { throw }
+            Start-Sleep -Milliseconds (500 * $try)
+        }
+        finally {
+            if (Test-Path $tmp) { Remove-Item $tmp -Force -ErrorAction SilentlyContinue }
+        }
+    }
+}
+
+function Ensure-DirectorySafe {
+    param([string]$Path)
+    for ($try = 1; $try -le 3; $try++) {
+        try {
+            if (-not (Test-Path -LiteralPath $Path)) {
+                New-Item -Path $Path -ItemType Directory -Force | Out-Null
+            }
             return
         }
         catch {
@@ -242,7 +264,7 @@ function Save-PageAttachments {
     }
 
     $dir = Join-Path $PageFolder "$FileBaseName-attachments"
-    if (-not (Test-Path $dir)) { New-Item $dir -ItemType Directory -Force | Out-Null }
+    Ensure-DirectorySafe -Path $dir
 
     $n = 0
     $b = [long]0
@@ -311,7 +333,7 @@ $homeId = Get-SpaceHomePageId -ApiBase $api -Space $SpaceKey -Headers $headers
 
 # Output root directory
 $outDir = Join-Path $OutputPath $SpaceKey
-if (-not (Test-Path $outDir)) { New-Item $outDir -ItemType Directory -Force | Out-Null }
+Ensure-DirectorySafe -Path $outDir
 
 # Fetch all pages (body.export_view pre-fetched - avoids extra API calls later)
 Write-Host ''
@@ -347,7 +369,7 @@ foreach ($pg in $pages) {
 
     # Determine folder from page hierarchy
     $folder = Get-PageFolderPath -Ancestors $pg.ancestors -SpaceHomeId $homeId -RootFolder $outDir
-    if (-not (Test-Path $folder)) { New-Item $folder -ItemType Directory -Force | Out-Null }
+    Ensure-DirectorySafe -Path $folder
 
     $rel = $folder.Substring($outDir.Length).TrimStart([IO.Path]::DirectorySeparatorChar)
     if ([string]::IsNullOrEmpty($rel)) { $rel = '.' }
