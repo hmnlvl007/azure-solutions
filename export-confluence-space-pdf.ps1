@@ -50,6 +50,54 @@ function Get-SafeFileName {
     return $s
 }
 
+function Get-CompactSafeName {
+    param(
+        [string]$Name,
+        [int]$MaxLength = 60
+    )
+
+    $safe = Get-SafeFileName -Name $Name
+    if ($safe.Length -le $MaxLength) { return $safe }
+
+    $md5 = [Security.Cryptography.MD5]::Create()
+    try {
+        $bytes = [Text.Encoding]::UTF8.GetBytes($safe)
+        $hashBytes = $md5.ComputeHash($bytes)
+    }
+    finally {
+        $md5.Dispose()
+    }
+
+    $hash = ([BitConverter]::ToString($hashBytes)).Replace('-', '').ToLowerInvariant().Substring(0, 8)
+    $headLen = [Math]::Max(8, $MaxLength - 9)
+    return ($safe.Substring(0, $headLen).TrimEnd() + '-' + $hash)
+}
+
+function Get-SafeOutputFilePath {
+    param(
+        [string]$Folder,
+        [string]$BaseName,
+        [string]$Extension,
+        [int]$MaxPathLength = 235
+    )
+
+    $ext = if ([string]::IsNullOrWhiteSpace($Extension)) { '' }
+           elseif ($Extension.StartsWith('.')) { $Extension }
+           else { ".{0}" -f $Extension }
+
+    $dest = Join-Path $Folder ($BaseName + $ext)
+    if ($dest.Length -le $MaxPathLength) { return $dest }
+
+    $excess = $dest.Length - $MaxPathLength
+    $newLen = [Math]::Max(12, $BaseName.Length - $excess - 2)
+    $shortBase = Get-CompactSafeName -Name $BaseName -MaxLength $newLen
+    $dest = Join-Path $Folder ($shortBase + $ext)
+
+    if ($dest.Length -le $MaxPathLength) { return $dest }
+    $fallbackBase = Get-CompactSafeName -Name $BaseName -MaxLength 20
+    return (Join-Path $Folder ($fallbackBase + $ext))
+}
+
 function Write-FileSafe {
     # Writes text via local temp file, then copies to destination with retries.
     # This avoids direct WriteAllText calls against flaky network/redirected paths.
@@ -134,7 +182,13 @@ function Get-PageFolderPath {
     if ($null -ne $Ancestors) {
         foreach ($a in $Ancestors) {
             if ([string]$a.id -eq $SpaceHomeId) { continue }
-            $folder = Join-Path $folder (Get-SafeFileName -Name $a.title)
+            $part = Get-CompactSafeName -Name $a.title -MaxLength 50
+            $candidate = Join-Path $folder $part
+            if ($candidate.Length -gt 220) {
+                $part = Get-CompactSafeName -Name ("{0}-{1}" -f $a.title, $a.id) -MaxLength 24
+                $candidate = Join-Path $folder $part
+            }
+            $folder = $candidate
         }
     }
     return $folder
@@ -275,8 +329,12 @@ function Save-PageAttachments {
         if ([string]::IsNullOrWhiteSpace($dlPath)) { continue }
 
         $name = Get-SafeFileName -Name $att.title
-        $dest = Join-Path $dir $name
-        $tmp  = [IO.Path]::Combine([IO.Path]::GetTempPath(), "conf-att-$($att.id)-$name")
+        $ext = [IO.Path]::GetExtension($name)
+        $base = [IO.Path]::GetFileNameWithoutExtension($name)
+        if ([string]::IsNullOrWhiteSpace($base)) { $base = 'attachment' }
+        $base = Get-CompactSafeName -Name $base -MaxLength 48
+        $dest = Get-SafeOutputFilePath -Folder $dir -BaseName $base -Extension $ext
+        $tmp  = [IO.Path]::Combine([IO.Path]::GetTempPath(), "conf-att-$($att.id).tmp")
         $url  = "{0}{1}" -f $WikiBase, $dlPath
 
         try {
@@ -364,7 +422,7 @@ foreach ($pg in $pages) {
     $idx++
     $ps = [DateTime]::UtcNow
 
-    $safeName = Get-SafeFileName -Name $pg.title
+    $safeName = Get-CompactSafeName -Name $pg.title -MaxLength 60
     $baseName = '{0:D4}-{1}' -f $idx, $safeName
 
     # Determine folder from page hierarchy
@@ -389,7 +447,7 @@ foreach ($pg in $pages) {
 
     # --- WORD (primary) ---
     if (-not $wordOff) {
-        $docDest = Join-Path $folder "$baseName.doc"
+        $docDest = Get-SafeOutputFilePath -Folder $folder -BaseName $baseName -Extension '.doc'
         try {
             $result = Save-PageWord -WikiBase $wiki -PageId $pg.id `
                           -Headers $headers -DestPath $docDest -Session $session
@@ -426,7 +484,7 @@ foreach ($pg in $pages) {
 
     # --- HTML (fallback) ---
     if ($null -eq $result -or -not $result.OK) {
-        $htmlDest = Join-Path $folder "$baseName.html"
+        $htmlDest = Get-SafeOutputFilePath -Folder $folder -BaseName $baseName -Extension '.html'
 
         # Use body already fetched during page listing - no extra API call needed
         $body = $null
@@ -441,7 +499,9 @@ foreach ($pg in $pages) {
         }
         catch {
             $result = [PSCustomObject]@{ OK = $false; Fmt = $null; Path = $null }
-            $reason = "HTML write failed: $($_.Exception.Message)"
+            $pathLen = 0
+            try { $pathLen = $htmlDest.Length } catch {}
+            $reason = "HTML write failed (len=$pathLen): $($_.Exception.Message)"
         }
     }
 
