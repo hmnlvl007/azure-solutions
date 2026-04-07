@@ -539,13 +539,16 @@ IF @distDb IS NOT NULL AND EXISTS (SELECT 1 FROM sys.databases WHERE name = @dis
     $distData = Invoke-SqlQuerySafe -ServerInstance $server -Query $distQuery
     $distDbName = $null
     if ($distData) {
-        $distDbName = $distData[0].DistributionDB
+        # Cast to [string] to convert any DBNull to ""; prevents [$distDbName] → [] SQL error
+        $distDbName = [string]$distData[0].DistributionDB
         foreach ($row in $distData) {
             [void]$allDistributors.Add([PSCustomObject]@{
                 ServerName     = $server
                 DistributionDB = $row.DistributionDB
             })
         }
+
+        if (-not [string]::IsNullOrWhiteSpace($distDbName)) {
 
         # ── Distributor-side: publications from distribution DB ────────────
         $distPubQuery = @"
@@ -732,6 +735,8 @@ WHERE s.subscriber_db IS NOT NULL
                 })
             }
         }
+
+        } # end if ($distDbName)
     }
 
     # Get publications (if this server is a publisher)
