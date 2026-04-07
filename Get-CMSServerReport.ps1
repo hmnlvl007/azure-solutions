@@ -506,20 +506,32 @@ ORDER BY ag.name
 
         # ── Replication ───────────────────────────────────────────────────────
 
-    # Check if this server is a distributor
+    # Check if this server is a distributor and find the distribution DB name
     $distQuery = @"
-IF EXISTS (SELECT 1 FROM sys.databases WHERE name = 'distribution')
-BEGIN
+DECLARE @distDb NVARCHAR(256);
+BEGIN TRY
+    IF EXISTS (SELECT 1 FROM msdb.dbo.MSdistributiondbs)
+        SELECT @distDb = name FROM msdb.dbo.MSdistributiondbs;
+END TRY
+BEGIN CATCH
+    SET @distDb = NULL;
+END CATCH
+
+IF @distDb IS NULL AND EXISTS (SELECT 1 FROM sys.databases WHERE name = 'distribution' AND state = 0)
+    SET @distDb = 'distribution';
+
+IF @distDb IS NOT NULL AND EXISTS (SELECT 1 FROM sys.databases WHERE name = @distDb AND state = 0)
     SELECT 
         SERVERPROPERTY('ServerName') AS DistributorServer,
-        d.name AS DistributionDB,
-        d.state_desc AS DBState
+        @distDb                      AS DistributionDB,
+        d.state_desc                 AS DBState
     FROM sys.databases d
-    WHERE d.name LIKE 'distribution%'
-END
+    WHERE d.name = @distDb;
 "@
     $distData = Invoke-SqlQuerySafe -ServerInstance $server -Query $distQuery
+    $distDbName = $null
     if ($distData) {
+        $distDbName = $distData[0].DistributionDB
         foreach ($row in $distData) {
             $allDistributors += [PSCustomObject]@{
                 ServerName      = $server
@@ -530,25 +542,29 @@ END
 
         # ── Distributor-side: publications from distribution DB ────────────
         $distPubQuery = @"
+DECLARE @sql NVARCHAR(MAX);
+SET @sql = '
 SELECT DISTINCT
     ISNULL(srv.name, CAST(pub.publisher_id AS VARCHAR(20))) AS PublisherServer,
     pub.publisher_db                  AS PublisherDB,
     pub.publication                   AS PublicationName,
     pub.description                   AS PublicationDesc,
     CASE pub.publication_type
-        WHEN 0 THEN 'Transactional'
-        WHEN 1 THEN 'Snapshot'
-        WHEN 2 THEN 'Merge'
-        ELSE 'Unknown'
+        WHEN 0 THEN ''Transactional''
+        WHEN 1 THEN ''Snapshot''
+        WHEN 2 THEN ''Merge''
+        ELSE ''Unknown''
     END                               AS ReplicationType,
-    'Active'                          AS PublicationStatus,
+    ''Active''                        AS PublicationStatus,
     pub.immediate_sync                AS ImmediateSync,
     pub.allow_push                    AS AllowPush,
     pub.allow_pull                    AS AllowPull,
     pub.independent_agent             AS IndependentAgent,
     pub.retention                     AS RetentionPeriod
-FROM distribution.dbo.MSpublications pub
+FROM [$($distDbName)].dbo.MSpublications pub
 LEFT JOIN master.sys.servers srv ON pub.publisher_id = srv.server_id
+';
+EXEC sp_executesql @sql;
 "@
         $distPubData = Invoke-SqlQuerySafe -ServerInstance $server -Query $distPubQuery
         if ($distPubData) {
@@ -571,6 +587,8 @@ LEFT JOIN master.sys.servers srv ON pub.publisher_id = srv.server_id
 
         # ── Distributor-side: articles from distribution DB ───────────────
         $distArtQuery = @"
+DECLARE @sql NVARCHAR(MAX);
+SET @sql = '
 SELECT
     ISNULL(srv.name, CAST(a.publisher_id AS VARCHAR(20))) AS PublisherServer,
     a.publisher_db                    AS PublisherDB,
@@ -578,13 +596,15 @@ SELECT
     a.article                         AS ArticleName,
     a.destination_object              AS DestinationTable,
     a.source_owner                    AS DestinationOwner,
-    'N/A'                             AS ArticleType
-FROM distribution.dbo.MSarticles a
-JOIN distribution.dbo.MSpublications pub
+    ''N/A''                           AS ArticleType
+FROM [$($distDbName)].dbo.MSarticles a
+JOIN [$($distDbName)].dbo.MSpublications pub
     ON a.publisher_id = pub.publisher_id
     AND a.publisher_db = pub.publisher_db
     AND a.publication_id = pub.publication_id
 LEFT JOIN master.sys.servers srv ON a.publisher_id = srv.server_id
+';
+EXEC sp_executesql @sql;
 "@
         $distArtData = Invoke-SqlQuerySafe -ServerInstance $server -Query $distArtQuery
         if ($distArtData) {
@@ -604,6 +624,8 @@ LEFT JOIN master.sys.servers srv ON a.publisher_id = srv.server_id
 
         # ── Distributor-side: subscriptions from distribution DB ──────────
         $distSubQuery = @"
+DECLARE @sql NVARCHAR(MAX);
+SET @sql = '
 SELECT DISTINCT
     ISNULL(srv_pub.name, CAST(da.publisher_id AS VARCHAR(20))) AS PublisherServer,
     da.publisher_db                   AS PublisherDB,
@@ -611,21 +633,23 @@ SELECT DISTINCT
     ISNULL(srv_sub.name, CAST(s.subscriber_id AS VARCHAR(20))) AS SubscriberServer,
     s.subscriber_db                   AS SubscriberDB,
     CASE s.subscription_type
-        WHEN 0 THEN 'Push'
-        WHEN 1 THEN 'Pull'
-        ELSE 'Unknown'
+        WHEN 0 THEN ''Push''
+        WHEN 1 THEN ''Pull''
+        ELSE ''Unknown''
     END                               AS SubscriptionType,
     CASE s.status
-        WHEN 0 THEN 'Inactive'
-        WHEN 1 THEN 'Subscribed'
-        WHEN 2 THEN 'Active'
-        ELSE 'Unknown'
+        WHEN 0 THEN ''Inactive''
+        WHEN 1 THEN ''Subscribed''
+        WHEN 2 THEN ''Active''
+        ELSE ''Unknown''
     END                               AS SubscriptionStatus
-FROM distribution.dbo.MSdistribution_agents da
-JOIN distribution.dbo.MSsubscriptions s ON da.id = s.agent_id
+FROM [$($distDbName)].dbo.MSdistribution_agents da
+JOIN [$($distDbName)].dbo.MSsubscriptions s ON da.id = s.agent_id
 LEFT JOIN master.sys.servers srv_pub ON da.publisher_id = srv_pub.server_id
 LEFT JOIN master.sys.servers srv_sub ON s.subscriber_id = srv_sub.server_id
 WHERE s.subscriber_db IS NOT NULL
+';
+EXEC sp_executesql @sql;
 "@
         $distSubData = Invoke-SqlQuerySafe -ServerInstance $server -Query $distSubQuery
         if ($distSubData) {
@@ -642,6 +666,83 @@ WHERE s.subscriber_db IS NOT NULL
                 }
             }
         }
+
+        # ── Distributor-side: replication agent schedules ─────────────────
+        $schedQuery = @"
+DECLARE @sql NVARCHAR(MAX);
+SET @sql = '
+SELECT 
+    da.publisher_db                  AS PublisherDB,
+    pub.publication                  AS PublicationName,
+    s.subscriber_db                  AS SubscriberDB,
+    ss.name                          AS SubscriberServer,
+    da.name                          AS AgentName,
+    CASE 
+        WHEN sjs.freq_type = 1    THEN ''Once''
+        WHEN sjs.freq_type = 4    THEN ''Daily''
+        WHEN sjs.freq_type = 8    THEN ''Weekly''
+        WHEN sjs.freq_type = 16   THEN ''Monthly''
+        WHEN sjs.freq_type = 32   THEN ''Monthly relative''
+        WHEN sjs.freq_type = 64   THEN ''SQL Agent start''
+        WHEN sjs.freq_type = 128  THEN ''When idle''
+        ELSE ''Every '' + CAST(sjs.freq_subday_interval AS VARCHAR(10)) + 
+             CASE sjs.freq_subday_type 
+                 WHEN 1 THEN '' (once)''
+                 WHEN 2 THEN '' seconds''
+                 WHEN 4 THEN '' minutes''
+                 WHEN 8 THEN '' hours''
+                 ELSE '''' 
+             END
+    END                              AS ScheduleFrequency,
+    sjs.freq_subday_interval         AS FreqInterval,
+    CASE sjs.freq_subday_type 
+        WHEN 1 THEN ''At specified time''
+        WHEN 2 THEN ''Seconds''
+        WHEN 4 THEN ''Minutes''
+        WHEN 8 THEN ''Hours''
+        ELSE ''Unknown''
+    END                              AS FreqSubdayType,
+    sjs.active_start_time            AS ActiveStartTime,
+    sjs.active_end_time              AS ActiveEndTime,
+    sj.enabled                       AS JobEnabled
+FROM [$($distDbName)].dbo.MSdistribution_agents da
+JOIN [$($distDbName)].dbo.MSpublications pub 
+    ON da.publisher_id = pub.publisher_id
+    AND da.publisher_db = pub.publisher_db
+    AND da.publication = pub.publication
+LEFT JOIN [$($distDbName)].dbo.MSsubscriptions s 
+    ON da.id = s.agent_id
+LEFT JOIN master.sys.servers ss 
+    ON s.subscriber_id = ss.server_id
+LEFT JOIN msdb.dbo.sysjobs sj 
+    ON da.job_id = sj.job_id
+LEFT JOIN msdb.dbo.sysjobschedules sjsch 
+    ON sj.job_id = sjsch.job_id
+LEFT JOIN msdb.dbo.sysschedules sjs 
+    ON sjsch.schedule_id = sjs.schedule_id
+WHERE s.subscriber_db IS NOT NULL
+';
+EXEC sp_executesql @sql;
+"@
+        $schedData = Invoke-SqlQuerySafe -ServerInstance $server -Query $schedQuery
+        if ($schedData) {
+            foreach ($row in $schedData) {
+                $allReplSchedules += [PSCustomObject]@{
+                    DistributorServer  = $server
+                    PublisherDB        = $row.PublisherDB
+                    PublicationName    = $row.PublicationName
+                    SubscriberServer   = $row.SubscriberServer
+                    SubscriberDB       = $row.SubscriberDB
+                    AgentName          = $row.AgentName
+                    ScheduleFrequency  = $row.ScheduleFrequency
+                    FreqInterval       = $row.FreqInterval
+                    FreqSubdayType     = $row.FreqSubdayType
+                    ActiveStartTime    = $row.ActiveStartTime
+                    ActiveEndTime      = $row.ActiveEndTime
+                    JobEnabled         = $row.JobEnabled
+                }
+            }
+        }
     }
 
     # Get publications (if this server is a publisher)
@@ -649,48 +750,61 @@ WHERE s.subscriber_db IS NOT NULL
 DECLARE @hasRepl INT = 0;
 IF EXISTS (
     SELECT 1 FROM sys.databases 
-    WHERE is_published = 1 OR is_merge_published = 1 OR is_distributor = 1
+    WHERE is_published = 1 OR is_distributor = 1
 )
 SET @hasRepl = 1;
 
 IF @hasRepl = 1
 BEGIN
-    -- Gather publications from each published database
+    CREATE TABLE #pubs (
+        PublisherServer NVARCHAR(256), PublisherDB NVARCHAR(256),
+        PublicationName NVARCHAR(256), PublicationDesc NVARCHAR(MAX),
+        ReplicationType NVARCHAR(50), PublicationStatus NVARCHAR(50),
+        ImmediateSync INT, AllowPush INT, AllowPull INT,
+        IndependentAgent INT, RetentionPeriod INT
+    );
+
     DECLARE @sql NVARCHAR(MAX) = '';
     SELECT @sql = @sql + '
     USE [' + name + '];
     IF EXISTS (SELECT 1 FROM sys.tables WHERE name = ''syspublications'')
-    BEGIN
+        INSERT INTO #pubs
         SELECT 
-            SERVERPROPERTY(''ServerName'')    AS PublisherServer,
-            DB_NAME()                         AS PublisherDB,
-            p.name                            AS PublicationName,
-            p.description                     AS PublicationDesc,
+            SERVERPROPERTY(''ServerName''),
+            DB_NAME(),
+            p.name,
+            p.description,
             CASE p.repl_freq 
                 WHEN 0 THEN ''Transactional'' 
                 WHEN 1 THEN ''Snapshot'' 
                 ELSE ''Unknown'' 
-            END                               AS ReplicationType,
+            END,
             CASE p.status 
                 WHEN 0 THEN ''Inactive'' 
                 WHEN 1 THEN ''Active'' 
                 ELSE ''Unknown'' 
-            END                               AS PublicationStatus,
-            p.immediate_sync                  AS ImmediateSync,
-            p.allow_push                      AS AllowPush,
-            p.allow_pull                      AS AllowPull,
-            p.independent_agent               AS IndependentAgent,
-            p.retention                       AS RetentionPeriod
+            END,
+            p.immediate_sync,
+            p.allow_push,
+            p.allow_pull,
+            p.independent_agent,
+            p.retention
         FROM dbo.syspublications p;
-    END
     '
     FROM sys.databases
-    WHERE is_published = 1 OR is_merge_published = 1;
+    WHERE is_published = 1;
 
     IF LEN(@sql) > 0
         EXEC sp_executesql @sql;
+
+    SELECT PublisherServer, PublisherDB, PublicationName, PublicationDesc,
+           ReplicationType, PublicationStatus, ImmediateSync, AllowPush,
+           AllowPull, IndependentAgent, RetentionPeriod
+    FROM #pubs;
+
+    DROP TABLE #pubs;
 END
-"@
+"
     $pubData = Invoke-SqlQuerySafe -ServerInstance $server -Query $pubQuery
     if ($pubData) {
         $hasRepl = $true
@@ -712,18 +826,25 @@ END
 
     # Get articles for each published database
     $articleQuery = @"
+CREATE TABLE #arts (
+    PublisherServer NVARCHAR(256), PublisherDB NVARCHAR(256),
+    PublicationName NVARCHAR(256), ArticleName NVARCHAR(256),
+    DestinationTable NVARCHAR(256), DestinationOwner NVARCHAR(256),
+    ArticleType NVARCHAR(100)
+);
+
 DECLARE @sql NVARCHAR(MAX) = '';
 SELECT @sql = @sql + '
 USE [' + name + '];
 IF EXISTS (SELECT 1 FROM sys.tables WHERE name = ''sysarticles'')
-BEGIN
+    INSERT INTO #arts
     SELECT 
-        SERVERPROPERTY(''ServerName'')    AS PublisherServer,
-        DB_NAME()                         AS PublisherDB,
-        p.name                            AS PublicationName,
-        a.name                            AS ArticleName,
-        a.dest_table                      AS DestinationTable,
-        a.dest_owner                      AS DestinationOwner,
+        SERVERPROPERTY(''ServerName''),
+        DB_NAME(),
+        p.name,
+        a.name,
+        a.dest_table,
+        a.dest_owner,
         CASE a.type 
             WHEN 1  THEN ''Log-based''
             WHEN 3  THEN ''Log-based with manual filter''
@@ -735,17 +856,22 @@ BEGIN
             WHEN 64 THEN ''View (schema only)''
             WHEN 128 THEN ''Function (schema only)''
             ELSE ''Type '' + CAST(a.type AS VARCHAR(10))
-        END                               AS ArticleType
+        END
     FROM dbo.sysarticles a
     JOIN dbo.syspublications p ON a.pubid = p.pubid;
-END
 '
 FROM sys.databases
-WHERE is_published = 1 OR is_merge_published = 1;
+WHERE is_published = 1;
 
 IF LEN(@sql) > 0
     EXEC sp_executesql @sql;
-"@
+
+SELECT PublisherServer, PublisherDB, PublicationName, ArticleName,
+       DestinationTable, DestinationOwner, ArticleType
+FROM #arts;
+
+DROP TABLE #arts;
+"
     $artData = Invoke-SqlQuerySafe -ServerInstance $server -Query $articleQuery
     if ($artData) {
         foreach ($row in $artData) {
@@ -763,42 +889,54 @@ IF LEN(@sql) > 0
 
     # Get subscriptions
     $subQuery = @"
+CREATE TABLE #subs (
+    PublisherServer NVARCHAR(256), PublisherDB NVARCHAR(256),
+    PublicationName NVARCHAR(256), SubscriberServer NVARCHAR(256),
+    SubscriberDB NVARCHAR(256), SubscriptionType NVARCHAR(50),
+    SubscriptionStatus NVARCHAR(50), SyncType INT
+);
+
 DECLARE @sql NVARCHAR(MAX) = '';
 SELECT @sql = @sql + '
 USE [' + name + '];
 IF EXISTS (SELECT 1 FROM sys.tables WHERE name = ''syssubscriptions'') 
    AND EXISTS (SELECT 1 FROM sys.tables WHERE name = ''sysarticles'')
-BEGIN
+    INSERT INTO #subs
     SELECT DISTINCT
-        SERVERPROPERTY(''ServerName'')    AS PublisherServer,
-        DB_NAME()                         AS PublisherDB,
-        p.name                            AS PublicationName,
-        s.srvname                         AS SubscriberServer,
-        s.dest_db                         AS SubscriberDB,
+        SERVERPROPERTY(''ServerName''),
+        DB_NAME(),
+        p.name,
+        s.srvname,
+        s.dest_db,
         CASE s.subscription_type 
             WHEN 0 THEN ''Push'' 
             WHEN 1 THEN ''Pull'' 
             ELSE ''Unknown'' 
-        END                               AS SubscriptionType,
+        END,
         CASE s.status 
             WHEN 0 THEN ''Inactive'' 
             WHEN 1 THEN ''Subscribed'' 
             WHEN 2 THEN ''Active'' 
             ELSE ''Unknown'' 
-        END                               AS SubscriptionStatus,
-        s.sync_type                       AS SyncType
+        END,
+        s.sync_type
     FROM dbo.syssubscriptions s
     JOIN dbo.sysarticles a ON s.artid = a.artid
     JOIN dbo.syspublications p ON a.pubid = p.pubid
     WHERE s.srvname NOT IN (''virtual'', ''(unknown)'');
-END
 '
 FROM sys.databases
-WHERE is_published = 1 OR is_merge_published = 1;
+WHERE is_published = 1;
 
 IF LEN(@sql) > 0
     EXEC sp_executesql @sql;
-"@
+
+SELECT PublisherServer, PublisherDB, PublicationName, SubscriberServer,
+       SubscriberDB, SubscriptionType, SubscriptionStatus, SyncType
+FROM #subs;
+
+DROP TABLE #subs;
+"
     $subData = Invoke-SqlQuerySafe -ServerInstance $server -Query $subQuery
     if ($subData) {
         $hasRepl = $true
@@ -811,83 +949,6 @@ IF LEN(@sql) > 0
                 SubscriberDB       = $row.SubscriberDB
                 SubscriptionType   = $row.SubscriptionType
                 SubscriptionStatus = $row.SubscriptionStatus
-            }
-        }
-    }
-
-    # Get replication agent schedules (from distribution DB if this is the distributor)
-    $schedQuery = @"
-IF EXISTS (SELECT 1 FROM sys.databases WHERE name = 'distribution')
-BEGIN
-    USE distribution;
-    SELECT 
-        da.publisher_db                  AS PublisherDB,
-        pub.publication                  AS PublicationName,
-        s.subscriber_db                  AS SubscriberDB,
-        ss.name                          AS SubscriberServer,
-        da.name                          AS AgentName,
-        CASE 
-            WHEN sjs.freq_type = 1    THEN 'Once'
-            WHEN sjs.freq_type = 4    THEN 'Daily'
-            WHEN sjs.freq_type = 8    THEN 'Weekly'
-            WHEN sjs.freq_type = 16   THEN 'Monthly'
-            WHEN sjs.freq_type = 32   THEN 'Monthly relative'
-            WHEN sjs.freq_type = 64   THEN 'SQL Agent start'
-            WHEN sjs.freq_type = 128  THEN 'When idle'
-            ELSE 'Every ' + CAST(sjs.freq_subday_interval AS VARCHAR(10)) + 
-                 CASE sjs.freq_subday_type 
-                     WHEN 1 THEN ' (once)'
-                     WHEN 2 THEN ' seconds'
-                     WHEN 4 THEN ' minutes'
-                     WHEN 8 THEN ' hours'
-                     ELSE '' 
-                 END
-        END                              AS ScheduleFrequency,
-        sjs.freq_subday_interval         AS FreqInterval,
-        CASE sjs.freq_subday_type 
-            WHEN 1 THEN 'At specified time'
-            WHEN 2 THEN 'Seconds'
-            WHEN 4 THEN 'Minutes'
-            WHEN 8 THEN 'Hours'
-            ELSE 'Unknown'
-        END                              AS FreqSubdayType,
-        sjs.active_start_time            AS ActiveStartTime,
-        sjs.active_end_time              AS ActiveEndTime,
-        sj.enabled                       AS JobEnabled
-    FROM distribution.dbo.MSdistribution_agents da
-    JOIN distribution.dbo.MSpublications pub 
-        ON da.publisher_id = pub.publisher_id
-        AND da.publisher_db = pub.publisher_db
-        AND da.publication = pub.publication
-    LEFT JOIN distribution.dbo.MSsubscriptions s 
-        ON da.id = s.agent_id
-    LEFT JOIN master.sys.servers ss 
-        ON s.subscriber_id = ss.server_id
-    LEFT JOIN msdb.dbo.sysjobs sj 
-        ON da.job_id = sj.job_id
-    LEFT JOIN msdb.dbo.sysjobschedules sjsch 
-        ON sj.job_id = sjsch.job_id
-    LEFT JOIN msdb.dbo.sysschedules sjs 
-        ON sjsch.schedule_id = sjs.schedule_id
-    WHERE s.subscriber_db IS NOT NULL;
-END
-"@
-    $schedData = Invoke-SqlQuerySafe -ServerInstance $server -Query $schedQuery
-    if ($schedData) {
-        foreach ($row in $schedData) {
-            $allReplSchedules += [PSCustomObject]@{
-                DistributorServer  = $server
-                PublisherDB        = $row.PublisherDB
-                PublicationName    = $row.PublicationName
-                SubscriberServer   = $row.SubscriberServer
-                SubscriberDB       = $row.SubscriberDB
-                AgentName          = $row.AgentName
-                ScheduleFrequency  = $row.ScheduleFrequency
-                FreqInterval       = $row.FreqInterval
-                FreqSubdayType     = $row.FreqSubdayType
-                ActiveStartTime    = $row.ActiveStartTime
-                ActiveEndTime      = $row.ActiveEndTime
-                JobEnabled         = $row.JobEnabled
             }
         }
     }
@@ -921,23 +982,33 @@ ORDER BY d.name
 
     # CDC tracked tables and capture instances
     $cdcTableQuery = @"
+CREATE TABLE #cdctables (
+    ServerName NVARCHAR(256), DatabaseName NVARCHAR(256),
+    CaptureInstance NVARCHAR(256), SourceTable NVARCHAR(512),
+    StartLSN BINARY(10), CaptureCreateDate DATETIME,
+    SupportsNetChanges INT, HasDropPending INT,
+    RoleName NVARCHAR(256), IndexName NVARCHAR(256),
+    FilegroupName NVARCHAR(256), COL_COUNT INT
+);
+
 DECLARE @sql NVARCHAR(MAX) = '';
 SELECT @sql = @sql + '
 USE [' + name + '];
+INSERT INTO #cdctables
 SELECT 
-    SERVERPROPERTY(''ServerName'')     AS ServerName,
-    DB_NAME()                          AS DatabaseName,
-    ct.capture_instance               AS CaptureInstance,
-    SCHEMA_NAME(st.schema_id) + ''.'' + st.name AS SourceTable,
-    ct.start_lsn                      AS StartLSN,
-    ct.create_date                    AS CaptureCreateDate,
-    ct.supports_net_changes           AS SupportsNetChanges,
-    ct.has_drop_pending               AS HasDropPending,
-    ct.role_name                      AS RoleName,
-    ct.index_name                     AS IndexName,
-    ct.filegroup_name                 AS FilegroupName,
-    COL_COUNT = (SELECT COUNT(*) FROM cdc.captured_columns cc 
-                 WHERE cc.object_id = ct.object_id)
+    SERVERPROPERTY(''ServerName''),
+    DB_NAME(),
+    ct.capture_instance,
+    SCHEMA_NAME(st.schema_id) + ''.'' + st.name,
+    ct.start_lsn,
+    ct.create_date,
+    ct.supports_net_changes,
+    ct.has_drop_pending,
+    ct.role_name,
+    ct.index_name,
+    ct.filegroup_name,
+    (SELECT COUNT(*) FROM cdc.captured_columns cc 
+     WHERE cc.object_id = ct.object_id)
 FROM cdc.change_tables ct
 JOIN sys.tables st ON ct.source_object_id = st.object_id;
 '
@@ -946,7 +1017,14 @@ WHERE is_cdc_enabled = 1;
 
 IF LEN(@sql) > 0
     EXEC sp_executesql @sql;
-"@
+
+SELECT ServerName, DatabaseName, CaptureInstance, SourceTable,
+       StartLSN, CaptureCreateDate, SupportsNetChanges, HasDropPending,
+       RoleName, IndexName, FilegroupName, COL_COUNT
+FROM #cdctables;
+
+DROP TABLE #cdctables;
+"
     $cdcTableData = Invoke-SqlQuerySafe -ServerInstance $server -Query $cdcTableQuery
     if ($cdcTableData) {
         $hasCDC = $true
@@ -969,29 +1047,39 @@ IF LEN(@sql) > 0
 
     # CDC capture & cleanup jobs
     $cdcJobQuery = @"
+CREATE TABLE #cdcjobs (
+    ServerName NVARCHAR(256), DatabaseName NVARCHAR(256),
+    JobId UNIQUEIDENTIFIER, JobType NVARCHAR(50),
+    JobName NVARCHAR(256), JobStatus NVARCHAR(50),
+    MaxTrans INT, MaxScans INT, IsContinuous INT,
+    PollingIntervalSec INT, RetentionMinutes BIGINT,
+    CleanupThreshold BIGINT
+);
+
 DECLARE @sql NVARCHAR(MAX) = '';
 SELECT @sql = @sql + '
 USE [' + name + '];
+INSERT INTO #cdcjobs
 SELECT 
-    SERVERPROPERTY(''ServerName'')     AS ServerName,
-    DB_NAME()                          AS DatabaseName,
-    j.job_id                           AS JobId,
+    SERVERPROPERTY(''ServerName''),
+    DB_NAME(),
+    j.job_id,
     CASE LOWER(j.job_type) 
         WHEN ''capture'' THEN ''Capture'' 
         WHEN ''cleanup'' THEN ''Cleanup'' 
         ELSE ''Unknown'' 
-    END                                AS JobType,
-    sj.name                            AS JobName,
+    END,
+    sj.name,
     CASE sj.enabled 
         WHEN 1 THEN ''Enabled'' 
         WHEN 0 THEN ''Disabled'' 
-    END                                AS JobStatus,
-    j.maxtrans                         AS MaxTrans,
-    j.maxscans                         AS MaxScans,
-    j.continuous                       AS IsContinuous,
-    j.pollinginterval                  AS PollingIntervalSec,
-    j.retention                        AS RetentionMinutes,
-    j.threshold                        AS CleanupThreshold
+    END,
+    j.maxtrans,
+    j.maxscans,
+    j.continuous,
+    j.pollinginterval,
+    j.retention,
+    j.threshold
 FROM msdb.dbo.cdc_jobs j
 LEFT JOIN msdb.dbo.sysjobs sj ON j.job_id = sj.job_id
 WHERE j.database_id = DB_ID();
@@ -1001,7 +1089,14 @@ WHERE is_cdc_enabled = 1;
 
 IF LEN(@sql) > 0
     EXEC sp_executesql @sql;
-"@
+
+SELECT ServerName, DatabaseName, JobId, JobType, JobName, JobStatus,
+       MaxTrans, MaxScans, IsContinuous, PollingIntervalSec,
+       RetentionMinutes, CleanupThreshold
+FROM #cdcjobs;
+
+DROP TABLE #cdcjobs;
+"
     $cdcJobData = Invoke-SqlQuerySafe -ServerInstance $server -Query $cdcJobQuery
     if ($cdcJobData) {
         foreach ($row in $cdcJobData) {
