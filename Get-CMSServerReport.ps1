@@ -687,7 +687,8 @@ BEGIN
     FROM sys.databases
     WHERE is_published = 1 OR is_merge_published = 1;
 
-    EXEC sp_executesql @sql;
+    IF LEN(@sql) > 0
+        EXEC sp_executesql @sql;
 END
 "@
     $pubData = Invoke-SqlQuerySafe -ServerInstance $server -Query $pubQuery
@@ -768,7 +769,7 @@ USE [' + name + '];
 IF EXISTS (SELECT 1 FROM sys.tables WHERE name = ''syssubscriptions'') 
    AND EXISTS (SELECT 1 FROM sys.tables WHERE name = ''sysarticles'')
 BEGIN
-    SELECT 
+    SELECT DISTINCT
         SERVERPROPERTY(''ServerName'')    AS PublisherServer,
         DB_NAME()                         AS PublisherDB,
         p.name                            AS PublicationName,
@@ -789,8 +790,7 @@ BEGIN
     FROM dbo.syssubscriptions s
     JOIN dbo.sysarticles a ON s.artid = a.artid
     JOIN dbo.syspublications p ON a.pubid = p.pubid
-    WHERE s.srvname NOT IN (''virtual'', ''(unknown)'')
-    GROUP BY SERVERPROPERTY(''ServerName''), DB_NAME(), p.name, s.srvname, s.dest_db, s.subscription_type, s.status, s.sync_type;
+    WHERE s.srvname NOT IN (''virtual'', ''(unknown)'');
 END
 '
 FROM sys.databases
@@ -821,7 +821,7 @@ IF EXISTS (SELECT 1 FROM sys.databases WHERE name = 'distribution')
 BEGIN
     USE distribution;
     SELECT 
-        p.publisher_db                   AS PublisherDB,
+        da.publisher_db                  AS PublisherDB,
         pub.publication                  AS PublicationName,
         s.subscriber_db                  AS SubscriberDB,
         ss.name                          AS SubscriberServer,
@@ -856,13 +856,13 @@ BEGIN
         sj.enabled                       AS JobEnabled
     FROM distribution.dbo.MSdistribution_agents da
     JOIN distribution.dbo.MSpublications pub 
-        ON da.publication = pub.publication AND da.publisher_db = pub.publisher_db
+        ON da.publisher_id = pub.publisher_id
+        AND da.publisher_db = pub.publisher_db
+        AND da.publication = pub.publication
     LEFT JOIN distribution.dbo.MSsubscriptions s 
         ON da.id = s.agent_id
     LEFT JOIN master.sys.servers ss 
         ON s.subscriber_id = ss.server_id
-    LEFT JOIN distribution.dbo.MSdistribution_agents p 
-        ON da.id = p.id
     LEFT JOIN msdb.dbo.sysjobs sj 
         ON da.job_id = sj.job_id
     LEFT JOIN msdb.dbo.sysjobschedules sjsch 
@@ -993,7 +993,8 @@ SELECT
     j.retention                        AS RetentionMinutes,
     j.threshold                        AS CleanupThreshold
 FROM msdb.dbo.cdc_jobs j
-LEFT JOIN msdb.dbo.sysjobs sj ON j.job_id = sj.job_id;
+LEFT JOIN msdb.dbo.sysjobs sj ON j.job_id = sj.job_id
+WHERE j.database_id = DB_ID();
 '
 FROM sys.databases
 WHERE is_cdc_enabled = 1;
