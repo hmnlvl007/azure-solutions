@@ -527,6 +527,121 @@ END
                 DBState         = $row.DBState
             }
         }
+
+        # ── Distributor-side: publications from distribution DB ────────────
+        $distPubQuery = @"
+SELECT DISTINCT
+    ISNULL(srv.name, CAST(pub.publisher_id AS VARCHAR(20))) AS PublisherServer,
+    pub.publisher_db                  AS PublisherDB,
+    pub.publication                   AS PublicationName,
+    pub.description                   AS PublicationDesc,
+    CASE pub.publication_type
+        WHEN 0 THEN 'Transactional'
+        WHEN 1 THEN 'Snapshot'
+        WHEN 2 THEN 'Merge'
+        ELSE 'Unknown'
+    END                               AS ReplicationType,
+    'Active'                          AS PublicationStatus,
+    pub.immediate_sync                AS ImmediateSync,
+    pub.allow_push                    AS AllowPush,
+    pub.allow_pull                    AS AllowPull,
+    pub.independent_agent             AS IndependentAgent,
+    pub.retention                     AS RetentionPeriod
+FROM distribution.dbo.MSpublications pub
+LEFT JOIN master.sys.servers srv ON pub.publisher_id = srv.server_id
+"@
+        $distPubData = Invoke-SqlQuerySafe -ServerInstance $server -Query $distPubQuery
+        if ($distPubData) {
+            $hasRepl = $true
+            foreach ($row in $distPubData) {
+                $allPublications += [PSCustomObject]@{
+                    PublisherServer   = $row.PublisherServer
+                    PublisherDB       = $row.PublisherDB
+                    PublicationName   = $row.PublicationName
+                    PublicationDesc   = $row.PublicationDesc
+                    ReplicationType   = $row.ReplicationType
+                    PublicationStatus = $row.PublicationStatus
+                    ImmediateSync     = $row.ImmediateSync
+                    AllowPush         = $row.AllowPush
+                    AllowPull         = $row.AllowPull
+                    RetentionPeriod   = $row.RetentionPeriod
+                }
+            }
+        }
+
+        # ── Distributor-side: articles from distribution DB ───────────────
+        $distArtQuery = @"
+SELECT
+    ISNULL(srv.name, CAST(a.publisher_id AS VARCHAR(20))) AS PublisherServer,
+    a.publisher_db                    AS PublisherDB,
+    pub.publication                   AS PublicationName,
+    a.article                         AS ArticleName,
+    a.destination_object              AS DestinationTable,
+    a.source_owner                    AS DestinationOwner,
+    'N/A'                             AS ArticleType
+FROM distribution.dbo.MSarticles a
+JOIN distribution.dbo.MSpublications pub
+    ON a.publisher_id = pub.publisher_id
+    AND a.publisher_db = pub.publisher_db
+    AND a.publication_id = pub.publication_id
+LEFT JOIN master.sys.servers srv ON a.publisher_id = srv.server_id
+"@
+        $distArtData = Invoke-SqlQuerySafe -ServerInstance $server -Query $distArtQuery
+        if ($distArtData) {
+            $hasRepl = $true
+            foreach ($row in $distArtData) {
+                $allArticles += [PSCustomObject]@{
+                    PublisherServer   = $row.PublisherServer
+                    PublisherDB       = $row.PublisherDB
+                    PublicationName   = $row.PublicationName
+                    ArticleName       = $row.ArticleName
+                    DestinationTable  = $row.DestinationTable
+                    DestinationOwner  = $row.DestinationOwner
+                    ArticleType       = $row.ArticleType
+                }
+            }
+        }
+
+        # ── Distributor-side: subscriptions from distribution DB ──────────
+        $distSubQuery = @"
+SELECT DISTINCT
+    ISNULL(srv_pub.name, CAST(da.publisher_id AS VARCHAR(20))) AS PublisherServer,
+    da.publisher_db                   AS PublisherDB,
+    da.publication                    AS PublicationName,
+    ISNULL(srv_sub.name, CAST(s.subscriber_id AS VARCHAR(20))) AS SubscriberServer,
+    s.subscriber_db                   AS SubscriberDB,
+    CASE s.subscription_type
+        WHEN 0 THEN 'Push'
+        WHEN 1 THEN 'Pull'
+        ELSE 'Unknown'
+    END                               AS SubscriptionType,
+    CASE s.status
+        WHEN 0 THEN 'Inactive'
+        WHEN 1 THEN 'Subscribed'
+        WHEN 2 THEN 'Active'
+        ELSE 'Unknown'
+    END                               AS SubscriptionStatus
+FROM distribution.dbo.MSdistribution_agents da
+JOIN distribution.dbo.MSsubscriptions s ON da.id = s.agent_id
+LEFT JOIN master.sys.servers srv_pub ON da.publisher_id = srv_pub.server_id
+LEFT JOIN master.sys.servers srv_sub ON s.subscriber_id = srv_sub.server_id
+WHERE s.subscriber_db IS NOT NULL
+"@
+        $distSubData = Invoke-SqlQuerySafe -ServerInstance $server -Query $distSubQuery
+        if ($distSubData) {
+            $hasRepl = $true
+            foreach ($row in $distSubData) {
+                $allSubscriptions += [PSCustomObject]@{
+                    PublisherServer    = $row.PublisherServer
+                    PublisherDB        = $row.PublisherDB
+                    PublicationName    = $row.PublicationName
+                    SubscriberServer   = $row.SubscriberServer
+                    SubscriberDB       = $row.SubscriberDB
+                    SubscriptionType   = $row.SubscriptionType
+                    SubscriptionStatus = $row.SubscriptionStatus
+                }
+            }
+        }
     }
 
     # Get publications (if this server is a publisher)
@@ -675,7 +790,7 @@ BEGIN
     JOIN dbo.sysarticles a ON s.artid = a.artid
     JOIN dbo.syspublications p ON a.pubid = p.pubid
     WHERE s.srvname NOT IN (''virtual'', ''(unknown)'')
-    GROUP BY p.name, s.srvname, s.dest_db, s.subscription_type, s.status, s.sync_type;
+    GROUP BY SERVERPROPERTY(''ServerName''), DB_NAME(), p.name, s.srvname, s.dest_db, s.subscription_type, s.status, s.sync_type;
 END
 '
 FROM sys.databases
@@ -951,6 +1066,89 @@ IF LEN(@sql) > 0
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
+# 2b. Deduplicate replication data (publisher-side + distributor-side overlap)
+# ─────────────────────────────────────────────────────────────────────────────
+if (-not $InventoryOnly) {
+    Write-Host "Deduplicating replication data..." -ForegroundColor DarkGray
+
+    if ($allPublications.Count -gt 0) {
+        $allPublications = $allPublications |
+            Sort-Object PublisherServer, PublisherDB, PublicationName -Unique
+        Write-Host "  Publications: $($allPublications.Count) unique" -ForegroundColor DarkGray
+    }
+    if ($allArticles.Count -gt 0) {
+        $allArticles = $allArticles |
+            Sort-Object PublisherServer, PublisherDB, PublicationName, ArticleName -Unique
+        Write-Host "  Articles: $($allArticles.Count) unique" -ForegroundColor DarkGray
+    }
+    if ($allSubscriptions.Count -gt 0) {
+        $allSubscriptions = $allSubscriptions |
+            Sort-Object PublisherServer, PublisherDB, PublicationName, SubscriberServer, SubscriberDB -Unique
+        Write-Host "  Subscriptions: $($allSubscriptions.Count) unique" -ForegroundColor DarkGray
+    }
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 2c. Build combined replication topology (joined view)
+# ─────────────────────────────────────────────────────────────────────────────
+$allReplTopology = @()
+if (-not $InventoryOnly -and $allSubscriptions.Count -gt 0) {
+    Write-Host "Building combined replication topology..." -ForegroundColor DarkGray
+
+    # Build lookup hashtables for fast matching
+    $pubLookup = @{}
+    foreach ($p in $allPublications) {
+        $key = "$($p.PublisherServer)|$($p.PublisherDB)|$($p.PublicationName)"
+        if (-not $pubLookup.ContainsKey($key)) { $pubLookup[$key] = $p }
+    }
+
+    $artCountLookup = @{}
+    foreach ($a in $allArticles) {
+        $key = "$($a.PublisherServer)|$($a.PublisherDB)|$($a.PublicationName)"
+        if ($artCountLookup.ContainsKey($key)) { $artCountLookup[$key]++ } else { $artCountLookup[$key] = 1 }
+    }
+
+    $schedLookup = @{}
+    foreach ($s in $allReplSchedules) {
+        $key = "$($s.PublisherDB)|$($s.PublicationName)|$($s.SubscriberServer)|$($s.SubscriberDB)"
+        if (-not $schedLookup.ContainsKey($key)) { $schedLookup[$key] = $s }
+    }
+
+    foreach ($sub in $allSubscriptions) {
+        $pubKey   = "$($sub.PublisherServer)|$($sub.PublisherDB)|$($sub.PublicationName)"
+        $schedKey = "$($sub.PublisherDB)|$($sub.PublicationName)|$($sub.SubscriberServer)|$($sub.SubscriberDB)"
+
+        $pub   = $pubLookup[$pubKey]
+        $artCt = if ($artCountLookup.ContainsKey($pubKey)) { $artCountLookup[$pubKey] } else { 0 }
+        $sched = $schedLookup[$schedKey]
+
+        # Find distributor for this publisher (from schedule data or distributor list)
+        $distServer = if ($sched) { $sched.DistributorServer } else {
+            $match = $allDistributors | Select-Object -First 1
+            if ($match) { $match.ServerName } else { 'Unknown' }
+        }
+
+        $allReplTopology += [PSCustomObject]@{
+            DistributorServer  = $distServer
+            PublisherServer    = $sub.PublisherServer
+            PublisherDB        = $sub.PublisherDB
+            PublicationName    = $sub.PublicationName
+            ReplicationType    = if ($pub) { $pub.ReplicationType } else { 'Unknown' }
+            PublicationStatus  = if ($pub) { $pub.PublicationStatus } else { 'Unknown' }
+            ArticleCount       = $artCt
+            SubscriberServer   = $sub.SubscriberServer
+            SubscriberDB       = $sub.SubscriberDB
+            SubscriptionType   = $sub.SubscriptionType
+            SubscriptionStatus = $sub.SubscriptionStatus
+            AgentName          = if ($sched) { $sched.AgentName } else { 'N/A' }
+            ScheduleFrequency  = if ($sched) { $sched.ScheduleFrequency } else { 'N/A' }
+            JobEnabled         = if ($sched) { $sched.JobEnabled } else { 'N/A' }
+        }
+    }
+    Write-Host "  Topology rows: $($allReplTopology.Count)" -ForegroundColor DarkGray
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
 # 3. Generate HTML Report
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -1040,9 +1238,10 @@ else {
     <li><a href="#repl-subscriptions">7. Replication – Subscriptions</a></li>
     <li><a href="#repl-schedules">8. Replication – Agent Schedules</a></li>
     <li><a href="#repl-distributors">9. Replication – Distributors</a></li>
-    <li><a href="#cdc-databases">10. CDC – Enabled Databases</a></li>
-    <li><a href="#cdc-tables">11. CDC – Tracked Tables</a></li>
-    <li><a href="#cdc-jobs">12. CDC – Capture & Cleanup Jobs</a></li>
+    <li><a href="#repl-topology">10. Replication – Combined Topology</a></li>
+    <li><a href="#cdc-databases">11. CDC – Enabled Databases</a></li>
+    <li><a href="#cdc-tables">12. CDC – Tracked Tables</a></li>
+    <li><a href="#cdc-jobs">13. CDC – Capture & Cleanup Jobs</a></li>
 "@
 }
 
@@ -1057,9 +1256,10 @@ if (-not $InventoryOnly) {
         @{ Id='repl-subscriptions'; Num=7; Title='Replication – Subscriptions';     Data=$allSubscriptions;  Empty="No subscriptions found." },
         @{ Id='repl-schedules';   Num=8;  Title='Replication – Agent Schedules';    Data=$allReplSchedules;  Empty="No replication schedules found. (Schedule data is only available from distributor servers.)" },
         @{ Id='repl-distributors'; Num=9; Title='Replication – Distributors';       Data=$allDistributors;   Empty="No distributor databases found." },
-        @{ Id='cdc-databases';    Num=10; Title='CDC – Enabled Databases';          Data=$allCDCDatabases;   Empty="No CDC-enabled databases found across registered servers." },
-        @{ Id='cdc-tables';       Num=11; Title='CDC – Tracked Tables';             Data=$allCDCTables;      Empty="No CDC-tracked tables found." },
-        @{ Id='cdc-jobs';         Num=12; Title='CDC – Capture & Cleanup Jobs';     Data=$allCDCJobs;        Empty="No CDC jobs found." }
+        @{ Id='repl-topology';    Num=10; Title='Replication – Combined Topology';  Data=$allReplTopology;   Empty="No combined replication topology data. Ensure distributor servers are included in the scan." },
+        @{ Id='cdc-databases';    Num=11; Title='CDC – Enabled Databases';          Data=$allCDCDatabases;   Empty="No CDC-enabled databases found across registered servers." },
+        @{ Id='cdc-tables';       Num=12; Title='CDC – Tracked Tables';             Data=$allCDCTables;      Empty="No CDC-tracked tables found." },
+        @{ Id='cdc-jobs';         Num=13; Title='CDC – Capture & Cleanup Jobs';     Data=$allCDCJobs;        Empty="No CDC jobs found." }
     )
 
     $sbSections = [System.Text.StringBuilder]::new(32768)
@@ -1175,6 +1375,9 @@ if (-not $InventoryOnly) {
     if ($allSubscriptions.Count -gt 0)  { $allSubscriptions | Export-Csv "$($csvBase)_Subscriptions.csv"   -NoTypeInformation }
     if ($allReplSchedules.Count -gt 0)  { $allReplSchedules | Export-Csv "$($csvBase)_ReplSchedules.csv"   -NoTypeInformation }
     if ($allDistributors.Count -gt 0)   { $allDistributors  | Export-Csv "$($csvBase)_Distributors.csv"    -NoTypeInformation }
+    if ($allReplTopology.Count -gt 0)   { $allReplTopology  | Export-Csv "$($csvBase)_ReplicationTopology.csv" -NoTypeInformation
+        Write-Host "  Combined replication topology: $($csvBase)_ReplicationTopology.csv" -ForegroundColor Green
+    }
     if ($allCDCDatabases.Count -gt 0)   { $allCDCDatabases  | Export-Csv "$($csvBase)_CDC_Databases.csv"   -NoTypeInformation }
     if ($allCDCTables.Count -gt 0)      { $allCDCTables     | Export-Csv "$($csvBase)_CDC_Tables.csv"      -NoTypeInformation }
     if ($allCDCJobs.Count -gt 0)        { $allCDCJobs       | Export-Csv "$($csvBase)_CDC_Jobs.csv"        -NoTypeInformation }
