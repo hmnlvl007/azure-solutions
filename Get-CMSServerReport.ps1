@@ -1,4 +1,4 @@
-<#
+﻿<#
 .SYNOPSIS
     Queries all SQL Server CMS registered servers to discover Availability Groups 
     and Replication configurations, then generates a detailed HTML report.
@@ -153,6 +153,11 @@ function Invoke-SqlQuerySafe {
     }
 }
 
+# Validate OutputPath exists (fail early before any collection work)
+if (-not (Test-Path $OutputPath -PathType Container)) {
+    New-Item -ItemType Directory -Force -Path $OutputPath -ErrorAction Stop | Out-Null
+}
+
 # ─────────────────────────────────────────────────────────────────────────────
 # 1. Get all registered servers from CMS
 # ─────────────────────────────────────────────────────────────────────────────
@@ -185,6 +190,11 @@ if ($PSCmdlet.ParameterSetName -eq 'Excel') {
     }
     catch {
         Write-Error "Failed to read Excel file [$ExcelFilePath]: $_"
+        exit 1
+    }
+
+    if (-not $excelData -or $excelData.Count -eq 0) {
+        Write-Error "Excel file [$ExcelFilePath] contains no data rows."
         exit 1
     }
 
@@ -247,18 +257,18 @@ Write-Host ""
 # 2. Collect data from each server
 # ─────────────────────────────────────────────────────────────────────────────
 
-$allServerInfo       = @()
-$allAGDetails        = @()
-$allAGDatabases      = @()
-$allAGListeners      = @()
-$allPublications     = @()
-$allArticles         = @()
-$allSubscriptions    = @()
-$allDistributors     = @()
-$allReplSchedules    = @()
-$allCDCDatabases     = @()
-$allCDCTables        = @()
-$allCDCJobs          = @()
+$allServerInfo       = [System.Collections.Generic.List[PSObject]]::new()
+$allAGDetails        = [System.Collections.Generic.List[PSObject]]::new()
+$allAGDatabases      = [System.Collections.Generic.List[PSObject]]::new()
+$allAGListeners      = [System.Collections.Generic.List[PSObject]]::new()
+$allPublications     = [System.Collections.Generic.List[PSObject]]::new()
+$allArticles         = [System.Collections.Generic.List[PSObject]]::new()
+$allSubscriptions    = [System.Collections.Generic.List[PSObject]]::new()
+$allDistributors     = [System.Collections.Generic.List[PSObject]]::new()
+$allReplSchedules    = [System.Collections.Generic.List[PSObject]]::new()
+$allCDCDatabases     = [System.Collections.Generic.List[PSObject]]::new()
+$allCDCTables        = [System.Collections.Generic.List[PSObject]]::new()
+$allCDCJobs          = [System.Collections.Generic.List[PSObject]]::new()
 
 $serverCount = 0
 
@@ -330,7 +340,7 @@ SELECT
     $verInfo = Invoke-SqlQuerySafe -ServerInstance $server -Query $versionQuery
     if (-not $verInfo) {
         Write-Warning "  Skipping $server (unreachable)."
-        $allServerInfo += [PSCustomObject]@{
+        [void]$allServerInfo.Add([PSCustomObject]@{
             ServerName                 = $server
             ProductVersion             = "UNREACHABLE"
             ProductLevel               = "N/A"
@@ -370,7 +380,7 @@ SELECT
             HasAG                      = $false
             HasReplication             = $false
             HasCDC                     = $false
-        }
+        })
         continue
     }
 
@@ -380,7 +390,6 @@ SELECT
         $agQuery = @"
 SELECT 
     ag.name                          AS AGName,
-    ag.group_id                      AS AGGroupId,
     ags.primary_replica              AS PrimaryReplica,
     ags.synchronization_health_desc  AS AGSyncHealth,
     ar.replica_server_name           AS ReplicaServer,
@@ -407,7 +416,7 @@ ORDER BY ag.name, ar.replica_server_name
         if ($agData) {
             $hasAG = $true
             foreach ($row in $agData) {
-                $allAGDetails += [PSCustomObject]@{
+                [void]$allAGDetails.Add([PSCustomObject]@{
                     SourceServer        = $server
                     AGName              = $row.AGName
                     PrimaryReplica      = $row.PrimaryReplica
@@ -423,7 +432,7 @@ ORDER BY ag.name, ar.replica_server_name
                     ReplicaSyncHealth   = $row.ReplicaSyncHealth
                     ReplicaOpState      = $row.ReplicaOperationalState
                     LastConnectError    = $row.LastConnectError
-                }
+                })
             }
         }
 
@@ -438,7 +447,6 @@ SELECT
     drs.suspend_reason_desc          AS SuspendReason,
     drs.log_send_queue_size          AS LogSendQueueKB,
     drs.redo_queue_size              AS RedoQueueKB,
-    drs.last_hardened_lsn            AS LastHardenedLSN,
     drs.last_redone_time             AS LastRedoneTime,
     drs.last_sent_time               AS LastSentTime,
     ar.replica_server_name           AS ReplicaServer
@@ -454,7 +462,7 @@ ORDER BY ag.name, d.name
         $agDbData = Invoke-SqlQuerySafe -ServerInstance $server -Query $agDbQuery
         if ($agDbData) {
             foreach ($row in $agDbData) {
-                $allAGDatabases += [PSCustomObject]@{
+                [void]$allAGDatabases.Add([PSCustomObject]@{
                     SourceServer    = $server
                     AGName          = $row.AGName
                     DatabaseName    = $row.DatabaseName
@@ -467,7 +475,7 @@ ORDER BY ag.name, d.name
                     RedoQueueKB     = $row.RedoQueueKB
                     LastSentTime    = $row.LastSentTime
                     LastRedoneTime  = $row.LastRedoneTime
-                }
+                })
             }
         }
 
@@ -477,7 +485,6 @@ SELECT
     ag.name                          AS AGName,
     agl.dns_name                     AS ListenerDNS,
     agl.port                         AS ListenerPort,
-    agl.ip_configuration_string_from_cluster AS IPConfig,
     lip.ip_address                   AS IPAddress,
     lip.ip_subnet_mask               AS SubnetMask,
     lip.state_desc                   AS IPState
@@ -491,7 +498,7 @@ ORDER BY ag.name
         $listenerData = Invoke-SqlQuerySafe -ServerInstance $server -Query $listenerQuery
         if ($listenerData) {
             foreach ($row in $listenerData) {
-                $allAGListeners += [PSCustomObject]@{
+                [void]$allAGListeners.Add([PSCustomObject]@{
                     SourceServer  = $server
                     AGName        = $row.AGName
                     ListenerDNS   = $row.ListenerDNS
@@ -499,7 +506,7 @@ ORDER BY ag.name
                     IPAddress     = $row.IPAddress
                     SubnetMask    = $row.SubnetMask
                     IPState       = $row.IPState
-                }
+                })
             }
         }
         }
@@ -511,7 +518,7 @@ ORDER BY ag.name
 DECLARE @distDb NVARCHAR(256);
 BEGIN TRY
     IF EXISTS (SELECT 1 FROM msdb.dbo.MSdistributiondbs)
-        SELECT @distDb = name FROM msdb.dbo.MSdistributiondbs;
+        SELECT TOP 1 @distDb = name FROM msdb.dbo.MSdistributiondbs ORDER BY name;
 END TRY
 BEGIN CATCH
     SET @distDb = NULL;
@@ -523,8 +530,7 @@ IF @distDb IS NULL AND EXISTS (SELECT 1 FROM sys.databases WHERE name = 'distrib
 IF @distDb IS NOT NULL AND EXISTS (SELECT 1 FROM sys.databases WHERE name = @distDb AND state = 0)
     SELECT 
         SERVERPROPERTY('ServerName') AS DistributorServer,
-        @distDb                      AS DistributionDB,
-        d.state_desc                 AS DBState
+        @distDb                      AS DistributionDB
     FROM sys.databases d
     WHERE d.name = @distDb;
 "@
@@ -533,44 +539,38 @@ IF @distDb IS NOT NULL AND EXISTS (SELECT 1 FROM sys.databases WHERE name = @dis
     if ($distData) {
         $distDbName = $distData[0].DistributionDB
         foreach ($row in $distData) {
-            $allDistributors += [PSCustomObject]@{
-                ServerName      = $server
-                DistributionDB  = $row.DistributionDB
-                DBState         = $row.DBState
-            }
+            [void]$allDistributors.Add([PSCustomObject]@{
+                ServerName     = $server
+                DistributionDB = $row.DistributionDB
+            })
         }
 
         # ── Distributor-side: publications from distribution DB ────────────
         $distPubQuery = @"
-DECLARE @sql NVARCHAR(MAX);
-SET @sql = '
 SELECT DISTINCT
     ISNULL(srv.name, CAST(pub.publisher_id AS VARCHAR(20))) AS PublisherServer,
     pub.publisher_db                  AS PublisherDB,
     pub.publication                   AS PublicationName,
     pub.description                   AS PublicationDesc,
     CASE pub.publication_type
-        WHEN 0 THEN ''Transactional''
-        WHEN 1 THEN ''Snapshot''
-        WHEN 2 THEN ''Merge''
-        ELSE ''Unknown''
+        WHEN 0 THEN 'Transactional'
+        WHEN 1 THEN 'Snapshot'
+        WHEN 2 THEN 'Merge'
+        ELSE 'Unknown'
     END                               AS ReplicationType,
-    ''Active''                        AS PublicationStatus,
+    'Active'                          AS PublicationStatus,
     pub.immediate_sync                AS ImmediateSync,
     pub.allow_push                    AS AllowPush,
     pub.allow_pull                    AS AllowPull,
-    pub.independent_agent             AS IndependentAgent,
     pub.retention                     AS RetentionPeriod
 FROM [$($distDbName)].dbo.MSpublications pub
 LEFT JOIN master.sys.servers srv ON pub.publisher_id = srv.server_id
-';
-EXEC sp_executesql @sql;
 "@
         $distPubData = Invoke-SqlQuerySafe -ServerInstance $server -Query $distPubQuery
         if ($distPubData) {
             $hasRepl = $true
             foreach ($row in $distPubData) {
-                $allPublications += [PSCustomObject]@{
+                [void]$allPublications.Add([PSCustomObject]@{
                     PublisherServer   = $row.PublisherServer
                     PublisherDB       = $row.PublisherDB
                     PublicationName   = $row.PublicationName
@@ -581,36 +581,32 @@ EXEC sp_executesql @sql;
                     AllowPush         = $row.AllowPush
                     AllowPull         = $row.AllowPull
                     RetentionPeriod   = $row.RetentionPeriod
-                }
+                })
             }
         }
 
         # ── Distributor-side: articles from distribution DB ───────────────
         $distArtQuery = @"
-DECLARE @sql NVARCHAR(MAX);
-SET @sql = '
 SELECT
     ISNULL(srv.name, CAST(a.publisher_id AS VARCHAR(20))) AS PublisherServer,
     a.publisher_db                    AS PublisherDB,
     pub.publication                   AS PublicationName,
     a.article                         AS ArticleName,
     a.destination_object              AS DestinationTable,
-    a.source_owner                    AS DestinationOwner,
-    ''N/A''                           AS ArticleType
+    a.destination_owner               AS DestinationOwner,
+    'N/A'                             AS ArticleType
 FROM [$($distDbName)].dbo.MSarticles a
 JOIN [$($distDbName)].dbo.MSpublications pub
     ON a.publisher_id = pub.publisher_id
     AND a.publisher_db = pub.publisher_db
     AND a.publication_id = pub.publication_id
 LEFT JOIN master.sys.servers srv ON a.publisher_id = srv.server_id
-';
-EXEC sp_executesql @sql;
 "@
         $distArtData = Invoke-SqlQuerySafe -ServerInstance $server -Query $distArtQuery
         if ($distArtData) {
             $hasRepl = $true
             foreach ($row in $distArtData) {
-                $allArticles += [PSCustomObject]@{
+                [void]$allArticles.Add([PSCustomObject]@{
                     PublisherServer   = $row.PublisherServer
                     PublisherDB       = $row.PublisherDB
                     PublicationName   = $row.PublicationName
@@ -618,14 +614,12 @@ EXEC sp_executesql @sql;
                     DestinationTable  = $row.DestinationTable
                     DestinationOwner  = $row.DestinationOwner
                     ArticleType       = $row.ArticleType
-                }
+                })
             }
         }
 
         # ── Distributor-side: subscriptions from distribution DB ──────────
         $distSubQuery = @"
-DECLARE @sql NVARCHAR(MAX);
-SET @sql = '
 SELECT DISTINCT
     ISNULL(srv_pub.name, CAST(da.publisher_id AS VARCHAR(20))) AS PublisherServer,
     da.publisher_db                   AS PublisherDB,
@@ -633,29 +627,27 @@ SELECT DISTINCT
     ISNULL(srv_sub.name, CAST(s.subscriber_id AS VARCHAR(20))) AS SubscriberServer,
     s.subscriber_db                   AS SubscriberDB,
     CASE s.subscription_type
-        WHEN 0 THEN ''Push''
-        WHEN 1 THEN ''Pull''
-        ELSE ''Unknown''
+        WHEN 0 THEN 'Push'
+        WHEN 1 THEN 'Pull'
+        ELSE 'Unknown'
     END                               AS SubscriptionType,
     CASE s.status
-        WHEN 0 THEN ''Inactive''
-        WHEN 1 THEN ''Subscribed''
-        WHEN 2 THEN ''Active''
-        ELSE ''Unknown''
+        WHEN 0 THEN 'Inactive'
+        WHEN 1 THEN 'Subscribed'
+        WHEN 2 THEN 'Active'
+        ELSE 'Unknown'
     END                               AS SubscriptionStatus
 FROM [$($distDbName)].dbo.MSdistribution_agents da
 JOIN [$($distDbName)].dbo.MSsubscriptions s ON da.id = s.agent_id
 LEFT JOIN master.sys.servers srv_pub ON da.publisher_id = srv_pub.server_id
 LEFT JOIN master.sys.servers srv_sub ON s.subscriber_id = srv_sub.server_id
 WHERE s.subscriber_db IS NOT NULL
-';
-EXEC sp_executesql @sql;
 "@
         $distSubData = Invoke-SqlQuerySafe -ServerInstance $server -Query $distSubQuery
         if ($distSubData) {
             $hasRepl = $true
             foreach ($row in $distSubData) {
-                $allSubscriptions += [PSCustomObject]@{
+                [void]$allSubscriptions.Add([PSCustomObject]@{
                     PublisherServer    = $row.PublisherServer
                     PublisherDB        = $row.PublisherDB
                     PublicationName    = $row.PublicationName
@@ -663,71 +655,66 @@ EXEC sp_executesql @sql;
                     SubscriberDB       = $row.SubscriberDB
                     SubscriptionType   = $row.SubscriptionType
                     SubscriptionStatus = $row.SubscriptionStatus
-                }
+                })
             }
         }
 
         # ── Distributor-side: replication agent schedules ─────────────────
         $schedQuery = @"
-DECLARE @sql NVARCHAR(MAX);
-SET @sql = '
-SELECT 
+SELECT
     da.publisher_db                  AS PublisherDB,
     pub.publication                  AS PublicationName,
     s.subscriber_db                  AS SubscriberDB,
     ss.name                          AS SubscriberServer,
     da.name                          AS AgentName,
-    CASE 
-        WHEN sjs.freq_type = 1    THEN ''Once''
-        WHEN sjs.freq_type = 4    THEN ''Daily''
-        WHEN sjs.freq_type = 8    THEN ''Weekly''
-        WHEN sjs.freq_type = 16   THEN ''Monthly''
-        WHEN sjs.freq_type = 32   THEN ''Monthly relative''
-        WHEN sjs.freq_type = 64   THEN ''SQL Agent start''
-        WHEN sjs.freq_type = 128  THEN ''When idle''
-        ELSE ''Every '' + CAST(sjs.freq_subday_interval AS VARCHAR(10)) + 
-             CASE sjs.freq_subday_type 
-                 WHEN 1 THEN '' (once)''
-                 WHEN 2 THEN '' seconds''
-                 WHEN 4 THEN '' minutes''
-                 WHEN 8 THEN '' hours''
-                 ELSE '''' 
-             END
+    CASE
+        WHEN sjs.freq_type = 1    THEN 'Once'
+        WHEN sjs.freq_type = 4    THEN 'Daily'
+        WHEN sjs.freq_type = 8    THEN 'Weekly'
+        WHEN sjs.freq_type = 16   THEN 'Monthly'
+        WHEN sjs.freq_type = 32   THEN 'Monthly relative'
+        WHEN sjs.freq_type = 64   THEN 'SQL Agent start'
+        WHEN sjs.freq_type = 128  THEN 'When idle'
+        ELSE ISNULL('Every ' + CAST(sjs.freq_subday_interval AS VARCHAR(10)) +
+             CASE sjs.freq_subday_type
+                 WHEN 2 THEN ' seconds'
+                 WHEN 4 THEN ' minutes'
+                 WHEN 8 THEN ' hours'
+                 ELSE ''
+             END, 'Unknown')
     END                              AS ScheduleFrequency,
     sjs.freq_subday_interval         AS FreqInterval,
-    CASE sjs.freq_subday_type 
-        WHEN 1 THEN ''At specified time''
-        WHEN 2 THEN ''Seconds''
-        WHEN 4 THEN ''Minutes''
-        WHEN 8 THEN ''Hours''
-        ELSE ''Unknown''
+    CASE sjs.freq_subday_type
+        WHEN 1 THEN 'At specified time'
+        WHEN 2 THEN 'Seconds'
+        WHEN 4 THEN 'Minutes'
+        WHEN 8 THEN 'Hours'
+        ELSE 'Unknown'
     END                              AS FreqSubdayType,
     sjs.active_start_time            AS ActiveStartTime,
     sjs.active_end_time              AS ActiveEndTime,
     sj.enabled                       AS JobEnabled
 FROM [$($distDbName)].dbo.MSdistribution_agents da
-JOIN [$($distDbName)].dbo.MSpublications pub 
+JOIN [$($distDbName)].dbo.MSpublications pub
     ON da.publisher_id = pub.publisher_id
     AND da.publisher_db = pub.publisher_db
     AND da.publication = pub.publication
-LEFT JOIN [$($distDbName)].dbo.MSsubscriptions s 
+LEFT JOIN [$($distDbName)].dbo.MSsubscriptions s
     ON da.id = s.agent_id
-LEFT JOIN master.sys.servers ss 
+LEFT JOIN master.sys.servers ss
     ON s.subscriber_id = ss.server_id
-LEFT JOIN msdb.dbo.sysjobs sj 
+LEFT JOIN msdb.dbo.sysjobs sj
     ON da.job_id = sj.job_id
-LEFT JOIN msdb.dbo.sysjobschedules sjsch 
+LEFT JOIN msdb.dbo.sysjobschedules sjsch
     ON sj.job_id = sjsch.job_id
-LEFT JOIN msdb.dbo.sysschedules sjs 
+LEFT JOIN msdb.dbo.sysschedules sjs
     ON sjsch.schedule_id = sjs.schedule_id
 WHERE s.subscriber_db IS NOT NULL
-';
-EXEC sp_executesql @sql;
 "@
         $schedData = Invoke-SqlQuerySafe -ServerInstance $server -Query $schedQuery
         if ($schedData) {
             foreach ($row in $schedData) {
-                $allReplSchedules += [PSCustomObject]@{
+                [void]$allReplSchedules.Add([PSCustomObject]@{
                     DistributorServer  = $server
                     PublisherDB        = $row.PublisherDB
                     PublicationName    = $row.PublicationName
@@ -740,7 +727,7 @@ EXEC sp_executesql @sql;
                     ActiveStartTime    = $row.ActiveStartTime
                     ActiveEndTime      = $row.ActiveEndTime
                     JobEnabled         = $row.JobEnabled
-                }
+                })
             }
         }
     }
@@ -761,7 +748,7 @@ BEGIN
         PublicationName NVARCHAR(256), PublicationDesc NVARCHAR(MAX),
         ReplicationType NVARCHAR(50), PublicationStatus NVARCHAR(50),
         ImmediateSync INT, AllowPush INT, AllowPull INT,
-        IndependentAgent INT, RetentionPeriod INT
+        RetentionPeriod INT
     );
 
     DECLARE @sql NVARCHAR(MAX) = '';
@@ -787,7 +774,6 @@ BEGIN
             p.immediate_sync,
             p.allow_push,
             p.allow_pull,
-            p.independent_agent,
             p.retention
         FROM dbo.syspublications p;
     '
@@ -799,17 +785,17 @@ BEGIN
 
     SELECT PublisherServer, PublisherDB, PublicationName, PublicationDesc,
            ReplicationType, PublicationStatus, ImmediateSync, AllowPush,
-           AllowPull, IndependentAgent, RetentionPeriod
+           AllowPull, RetentionPeriod
     FROM #pubs;
 
     DROP TABLE #pubs;
 END
-"
+"@
     $pubData = Invoke-SqlQuerySafe -ServerInstance $server -Query $pubQuery
     if ($pubData) {
         $hasRepl = $true
         foreach ($row in $pubData) {
-            $allPublications += [PSCustomObject]@{
+            [void]$allPublications.Add([PSCustomObject]@{
                 PublisherServer   = $row.PublisherServer
                 PublisherDB       = $row.PublisherDB
                 PublicationName   = $row.PublicationName
@@ -820,7 +806,7 @@ END
                 AllowPush         = $row.AllowPush
                 AllowPull         = $row.AllowPull
                 RetentionPeriod   = $row.RetentionPeriod
-            }
+            })
         }
     }
 
@@ -871,11 +857,11 @@ SELECT PublisherServer, PublisherDB, PublicationName, ArticleName,
 FROM #arts;
 
 DROP TABLE #arts;
-"
+"@
     $artData = Invoke-SqlQuerySafe -ServerInstance $server -Query $articleQuery
     if ($artData) {
         foreach ($row in $artData) {
-            $allArticles += [PSCustomObject]@{
+            [void]$allArticles.Add([PSCustomObject]@{
                 PublisherServer   = $row.PublisherServer
                 PublisherDB       = $row.PublisherDB
                 PublicationName   = $row.PublicationName
@@ -883,7 +869,7 @@ DROP TABLE #arts;
                 DestinationTable  = $row.DestinationTable
                 DestinationOwner  = $row.DestinationOwner
                 ArticleType       = $row.ArticleType
-            }
+            })
         }
     }
 
@@ -893,7 +879,7 @@ CREATE TABLE #subs (
     PublisherServer NVARCHAR(256), PublisherDB NVARCHAR(256),
     PublicationName NVARCHAR(256), SubscriberServer NVARCHAR(256),
     SubscriberDB NVARCHAR(256), SubscriptionType NVARCHAR(50),
-    SubscriptionStatus NVARCHAR(50), SyncType INT
+    SubscriptionStatus NVARCHAR(50)
 );
 
 DECLARE @sql NVARCHAR(MAX) = '';
@@ -918,8 +904,7 @@ IF EXISTS (SELECT 1 FROM sys.tables WHERE name = ''syssubscriptions'')
             WHEN 1 THEN ''Subscribed'' 
             WHEN 2 THEN ''Active'' 
             ELSE ''Unknown'' 
-        END,
-        s.sync_type
+        END
     FROM dbo.syssubscriptions s
     JOIN dbo.sysarticles a ON s.artid = a.artid
     JOIN dbo.syspublications p ON a.pubid = p.pubid
@@ -932,16 +917,16 @@ IF LEN(@sql) > 0
     EXEC sp_executesql @sql;
 
 SELECT PublisherServer, PublisherDB, PublicationName, SubscriberServer,
-       SubscriberDB, SubscriptionType, SubscriptionStatus, SyncType
+       SubscriberDB, SubscriptionType, SubscriptionStatus
 FROM #subs;
 
 DROP TABLE #subs;
-"
+"@
     $subData = Invoke-SqlQuerySafe -ServerInstance $server -Query $subQuery
     if ($subData) {
         $hasRepl = $true
         foreach ($row in $subData) {
-            $allSubscriptions += [PSCustomObject]@{
+            [void]$allSubscriptions.Add([PSCustomObject]@{
                 PublisherServer    = $row.PublisherServer
                 PublisherDB        = $row.PublisherDB
                 PublicationName    = $row.PublicationName
@@ -949,7 +934,7 @@ DROP TABLE #subs;
                 SubscriberDB       = $row.SubscriberDB
                 SubscriptionType   = $row.SubscriptionType
                 SubscriptionStatus = $row.SubscriptionStatus
-            }
+            })
         }
     }
 
@@ -961,7 +946,6 @@ SELECT
     SERVERPROPERTY('ServerName')  AS ServerName,
     d.name                        AS DatabaseName,
     d.is_cdc_enabled              AS IsCDCEnabled,
-    d.create_date                 AS DatabaseCreated,
     d.compatibility_level         AS CompatLevel
 FROM sys.databases d
 WHERE d.is_cdc_enabled = 1
@@ -971,12 +955,12 @@ ORDER BY d.name
     if ($cdcDbData) {
         $hasCDC = $true
         foreach ($row in $cdcDbData) {
-            $allCDCDatabases += [PSCustomObject]@{
+            [void]$allCDCDatabases.Add([PSCustomObject]@{
                 ServerName      = $row.ServerName
                 DatabaseName    = $row.DatabaseName
                 IsCDCEnabled    = $row.IsCDCEnabled
                 CompatLevel     = $row.CompatLevel
-            }
+            })
         }
     }
 
@@ -985,7 +969,7 @@ ORDER BY d.name
 CREATE TABLE #cdctables (
     ServerName NVARCHAR(256), DatabaseName NVARCHAR(256),
     CaptureInstance NVARCHAR(256), SourceTable NVARCHAR(512),
-    StartLSN BINARY(10), CaptureCreateDate DATETIME,
+    CaptureCreateDate DATETIME,
     SupportsNetChanges INT, HasDropPending INT,
     RoleName NVARCHAR(256), IndexName NVARCHAR(256),
     FilegroupName NVARCHAR(256), COL_COUNT INT
@@ -1000,7 +984,6 @@ SELECT
     DB_NAME(),
     ct.capture_instance,
     SCHEMA_NAME(st.schema_id) + ''.'' + st.name,
-    ct.start_lsn,
     ct.create_date,
     ct.supports_net_changes,
     ct.has_drop_pending,
@@ -1019,17 +1002,17 @@ IF LEN(@sql) > 0
     EXEC sp_executesql @sql;
 
 SELECT ServerName, DatabaseName, CaptureInstance, SourceTable,
-       StartLSN, CaptureCreateDate, SupportsNetChanges, HasDropPending,
+       CaptureCreateDate, SupportsNetChanges, HasDropPending,
        RoleName, IndexName, FilegroupName, COL_COUNT
 FROM #cdctables;
 
 DROP TABLE #cdctables;
-"
+"@
     $cdcTableData = Invoke-SqlQuerySafe -ServerInstance $server -Query $cdcTableQuery
     if ($cdcTableData) {
         $hasCDC = $true
         foreach ($row in $cdcTableData) {
-            $allCDCTables += [PSCustomObject]@{
+            [void]$allCDCTables.Add([PSCustomObject]@{
                 ServerName         = $row.ServerName
                 DatabaseName       = $row.DatabaseName
                 CaptureInstance    = $row.CaptureInstance
@@ -1041,7 +1024,7 @@ DROP TABLE #cdctables;
                 IndexName          = $row.IndexName
                 FilegroupName      = $row.FilegroupName
                 CapturedColumns    = $row.COL_COUNT
-            }
+            })
         }
     }
 
@@ -1049,8 +1032,7 @@ DROP TABLE #cdctables;
     $cdcJobQuery = @"
 CREATE TABLE #cdcjobs (
     ServerName NVARCHAR(256), DatabaseName NVARCHAR(256),
-    JobId UNIQUEIDENTIFIER, JobType NVARCHAR(50),
-    JobName NVARCHAR(256), JobStatus NVARCHAR(50),
+    JobType NVARCHAR(50), JobName NVARCHAR(256), JobStatus NVARCHAR(50),
     MaxTrans INT, MaxScans INT, IsContinuous INT,
     PollingIntervalSec INT, RetentionMinutes BIGINT,
     CleanupThreshold BIGINT
@@ -1063,7 +1045,6 @@ INSERT INTO #cdcjobs
 SELECT 
     SERVERPROPERTY(''ServerName''),
     DB_NAME(),
-    j.job_id,
     CASE LOWER(j.job_type) 
         WHEN ''capture'' THEN ''Capture'' 
         WHEN ''cleanup'' THEN ''Cleanup'' 
@@ -1090,17 +1071,17 @@ WHERE is_cdc_enabled = 1;
 IF LEN(@sql) > 0
     EXEC sp_executesql @sql;
 
-SELECT ServerName, DatabaseName, JobId, JobType, JobName, JobStatus,
+SELECT ServerName, DatabaseName, JobType, JobName, JobStatus,
        MaxTrans, MaxScans, IsContinuous, PollingIntervalSec,
        RetentionMinutes, CleanupThreshold
 FROM #cdcjobs;
 
 DROP TABLE #cdcjobs;
-"
+"@
     $cdcJobData = Invoke-SqlQuerySafe -ServerInstance $server -Query $cdcJobQuery
     if ($cdcJobData) {
         foreach ($row in $cdcJobData) {
-            $allCDCJobs += [PSCustomObject]@{
+            [void]$allCDCJobs.Add([PSCustomObject]@{
                 ServerName          = $row.ServerName
                 DatabaseName        = $row.DatabaseName
                 JobType             = $row.JobType
@@ -1112,13 +1093,13 @@ DROP TABLE #cdcjobs;
                 PollingIntervalSec  = $row.PollingIntervalSec
                 RetentionMinutes    = $row.RetentionMinutes
                 CleanupThreshold    = $row.CleanupThreshold
-            }
+            })
         }
     }
     }
 
     # Store server info
-    $allServerInfo += [PSCustomObject]@{
+    [void]$allServerInfo.Add([PSCustomObject]@{
         ServerName                 = $verInfo.ServerName
         ProductVersion             = $verInfo.ProductVersion
         ProductLevel               = $verInfo.ProductLevel
@@ -1158,7 +1139,7 @@ DROP TABLE #cdcjobs;
         HasAG                      = $hasAG
         HasReplication             = $hasRepl
         HasCDC                     = $hasCDC
-    }
+    })
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1182,12 +1163,17 @@ if (-not $InventoryOnly) {
             Sort-Object PublisherServer, PublisherDB, PublicationName, SubscriberServer, SubscriberDB -Unique
         Write-Host "  Subscriptions: $($allSubscriptions.Count) unique" -ForegroundColor DarkGray
     }
+    if ($allDistributors.Count -gt 0) {
+        $allDistributors = $allDistributors |
+            Sort-Object ServerName, DistributionDB -Unique
+        Write-Host "  Distributors: $($allDistributors.Count) unique" -ForegroundColor DarkGray
+    }
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
 # 2c. Build combined replication topology (joined view)
 # ─────────────────────────────────────────────────────────────────────────────
-$allReplTopology = @()
+$allReplTopology = [System.Collections.Generic.List[PSObject]]::new()
 if (-not $InventoryOnly -and $allSubscriptions.Count -gt 0) {
     Write-Host "Building combined replication topology..." -ForegroundColor DarkGray
 
@@ -1218,13 +1204,10 @@ if (-not $InventoryOnly -and $allSubscriptions.Count -gt 0) {
         $artCt = if ($artCountLookup.ContainsKey($pubKey)) { $artCountLookup[$pubKey] } else { 0 }
         $sched = $schedLookup[$schedKey]
 
-        # Find distributor for this publisher (from schedule data or distributor list)
-        $distServer = if ($sched) { $sched.DistributorServer } else {
-            $match = $allDistributors | Select-Object -First 1
-            if ($match) { $match.ServerName } else { 'Unknown' }
-        }
+        # Find distributor for this publisher (from schedule data only)
+        $distServer = if ($sched) { $sched.DistributorServer } else { 'Unknown' }
 
-        $allReplTopology += [PSCustomObject]@{
+        [void]$allReplTopology.Add([PSCustomObject]@{
             DistributorServer  = $distServer
             PublisherServer    = $sub.PublisherServer
             PublisherDB        = $sub.PublisherDB
@@ -1239,7 +1222,7 @@ if (-not $InventoryOnly -and $allSubscriptions.Count -gt 0) {
             AgentName          = if ($sched) { $sched.AgentName } else { 'N/A' }
             ScheduleFrequency  = if ($sched) { $sched.ScheduleFrequency } else { 'N/A' }
             JobEnabled         = if ($sched) { $sched.JobEnabled } else { 'N/A' }
-        }
+        })
     }
     Write-Host "  Topology rows: $($allReplTopology.Count)" -ForegroundColor DarkGray
 }
@@ -1255,8 +1238,7 @@ $reportDate = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
 $reportSuffix = Get-Date -Format 'yyyyMMdd_HHmmss'
 $reportFile = if ($InventoryOnly) {
     Join-Path $OutputPath "CMS_Inventory_Report_$reportSuffix.html"
-}
-else {
+} else {
     Join-Path $OutputPath "CMS_AG_Replication_Report_$reportSuffix.html"
 }
 
@@ -1280,10 +1262,10 @@ function ConvertTo-HtmlTable {
         foreach ($p in $props) {
             $val = $row.$p
             $class = ""
-            # Conditional highlighting
+            # Conditional highlighting (match before encoding)
             if ($val -match "UNREACHABLE|Error|Inactive|NOT_HEALTHY|SUSPENDED") { $class = " class='warn'" }
             elseif ($val -match "HEALTHY|Active|SYNCHRONIZED|ONLINE|CONNECTED") { $class = " class='good'" }
-            [void]$sb.Append("<td$class>$val</td>")
+            [void]$sb.Append("<td$class>$([System.Net.WebUtility]::HtmlEncode([string]$val))</td>")
         }
         [void]$sb.Append("</tr>")
     }
@@ -1297,22 +1279,19 @@ $cdcServers  = ($allServerInfo | Where-Object { $_.HasCDC }).Count
 
 $reportTitle = if ($InventoryOnly) {
     "CMS Server Report – Inventory"
-}
-else {
+} else {
     "CMS Server Report – Inventory, AG, Replication & CDC"
 }
 
 $reportHeader = if ($InventoryOnly) {
     "SQL Server CMS – Inventory Report"
-}
-else {
+} else {
     "SQL Server CMS – Inventory, Availability Group, Replication & CDC Report"
 }
 
 $summaryExtraCards = if ($InventoryOnly) {
     ""
-}
-else {
+} else {
 @"
     <div class="summary-card"><div class="number">$agServers</div><div class="label">Servers with Availability Groups</div></div>
     <div class="summary-card"><div class="number">$replServers</div><div class="label">Servers with Replication</div></div>
@@ -1323,8 +1302,7 @@ else {
 
 $tocExtraItems = if ($InventoryOnly) {
     ""
-}
-else {
+} else {
 @"
     <li><a href="#ag-replicas">2. Availability Group – Replicas</a></li>
     <li><a href="#ag-databases">3. Availability Group – Databases</a></li>
@@ -1459,8 +1437,8 @@ Write-Host "  Report saved to: $reportFile" -ForegroundColor Green
 Write-Host "═══════════════════════════════════════════════════════════════" -ForegroundColor Green
 Write-Host ""
 
-# Also export CSVs for each section
-$csvBase = Join-Path $OutputPath "CMS_Report_$(Get-Date -Format 'yyyyMMdd_HHmmss')"
+# Also export CSVs for each section (same timestamp suffix as the HTML report)
+$csvBase = Join-Path $OutputPath "CMS_Report_$reportSuffix"
 if ($allServerInfo.Count -gt 0)     { $allServerInfo    | Export-Csv "$($csvBase)_ServerInventory.csv" -NoTypeInformation }
 if (-not $InventoryOnly) {
     if ($allAGDetails.Count -gt 0)      { $allAGDetails     | Export-Csv "$($csvBase)_AG_Replicas.csv"     -NoTypeInformation }
