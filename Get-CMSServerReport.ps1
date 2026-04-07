@@ -759,24 +759,24 @@ BEGIN
     IF EXISTS (SELECT 1 FROM sys.tables WHERE name = ''syspublications'')
         INSERT INTO #pubs
         SELECT 
-            CONVERT(NVARCHAR(256), SERVERPROPERTY(''ServerName'')),
-            DB_NAME(),
-            p.name,
-            p.description,
+            CONVERT(NVARCHAR(256), SERVERPROPERTY(''ServerName'')) AS PublisherServer,
+            DB_NAME()                                              AS PublisherDB,
+            p.name                                                 AS PublicationName,
+            p.description                                          AS PublicationDesc,
             CASE p.repl_freq 
                 WHEN 0 THEN ''Transactional'' 
                 WHEN 1 THEN ''Snapshot'' 
                 ELSE ''Unknown'' 
-            END,
+            END                                                    AS ReplicationType,
             CASE p.status 
                 WHEN 0 THEN ''Inactive'' 
                 WHEN 1 THEN ''Active'' 
                 ELSE ''Unknown'' 
-            END,
-            p.immediate_sync,
-            p.allow_push,
-            p.allow_pull,
-            p.retention
+            END                                                    AS PublicationStatus,
+            p.immediate_sync                                       AS ImmediateSync,
+            p.allow_push                                           AS AllowPush,
+            p.allow_pull                                           AS AllowPull,
+            p.retention                                            AS RetentionPeriod
         FROM dbo.syspublications p;
     '
     FROM sys.databases
@@ -827,12 +827,12 @@ USE [' + name + '];
 IF EXISTS (SELECT 1 FROM sys.tables WHERE name = ''sysarticles'')
     INSERT INTO #arts
     SELECT 
-        CONVERT(NVARCHAR(256), SERVERPROPERTY(''ServerName'')),
-        DB_NAME(),
-        p.name,
-        a.name,
-        a.dest_table,
-        a.dest_owner,
+        CONVERT(NVARCHAR(256), SERVERPROPERTY(''ServerName'')) AS PublisherServer,
+        DB_NAME()                                              AS PublisherDB,
+        p.name                                                 AS PublicationName,
+        a.name                                                 AS ArticleName,
+        a.dest_table                                           AS DestinationTable,
+        a.dest_owner                                           AS DestinationOwner,
         CASE a.type 
             WHEN 1  THEN ''Log-based''
             WHEN 3  THEN ''Log-based with manual filter''
@@ -844,7 +844,7 @@ IF EXISTS (SELECT 1 FROM sys.tables WHERE name = ''sysarticles'')
             WHEN 64 THEN ''View (schema only)''
             WHEN 128 THEN ''Function (schema only)''
             ELSE ''Type '' + CAST(a.type AS VARCHAR(10))
-        END
+        END                                                    AS ArticleType
     FROM dbo.sysarticles a
     JOIN dbo.syspublications p ON a.pubid = p.pubid;
 '
@@ -891,22 +891,22 @@ IF EXISTS (SELECT 1 FROM sys.tables WHERE name = ''syssubscriptions'')
    AND EXISTS (SELECT 1 FROM sys.tables WHERE name = ''sysarticles'')
     INSERT INTO #subs
     SELECT DISTINCT
-        CONVERT(NVARCHAR(256), SERVERPROPERTY(''ServerName'')),
-        DB_NAME(),
-        p.name,
-        s.srvname,
-        s.dest_db,
+        CONVERT(NVARCHAR(256), SERVERPROPERTY(''ServerName'')) AS PublisherServer,
+        DB_NAME()                                              AS PublisherDB,
+        p.name                                                 AS PublicationName,
+        s.srvname                                              AS SubscriberServer,
+        s.dest_db                                              AS SubscriberDB,
         CASE s.subscription_type 
             WHEN 0 THEN ''Push'' 
             WHEN 1 THEN ''Pull'' 
             ELSE ''Unknown'' 
-        END,
+        END                                                    AS SubscriptionType,
         CASE s.status 
             WHEN 0 THEN ''Inactive'' 
             WHEN 1 THEN ''Subscribed'' 
             WHEN 2 THEN ''Active'' 
             ELSE ''Unknown'' 
-        END
+        END                                                    AS SubscriptionStatus
     FROM dbo.syssubscriptions s
     JOIN dbo.sysarticles a ON s.artid = a.artid
     JOIN dbo.syspublications p ON a.pubid = p.pubid
@@ -982,18 +982,18 @@ SELECT @sql = @sql + '
 USE [' + name + '];
 INSERT INTO #cdctables
 SELECT 
-    CONVERT(NVARCHAR(256), SERVERPROPERTY(''ServerName'')),
-    DB_NAME(),
-    ct.capture_instance,
-    SCHEMA_NAME(st.schema_id) + ''.'' + st.name,
-    ct.create_date,
-    ct.supports_net_changes,
-    ct.has_drop_pending,
-    ct.role_name,
-    ct.index_name,
-    ct.filegroup_name,
+    CONVERT(NVARCHAR(256), SERVERPROPERTY(''ServerName''))    AS ServerName,
+    DB_NAME()                                                 AS DatabaseName,
+    ct.capture_instance                                       AS CaptureInstance,
+    SCHEMA_NAME(st.schema_id) + ''.'' + st.name               AS SourceTable,
+    ct.create_date                                            AS CaptureCreateDate,
+    ct.supports_net_changes                                   AS SupportsNetChanges,
+    ct.has_drop_pending                                       AS HasDropPending,
+    ct.role_name                                              AS RoleName,
+    ct.index_name                                             AS IndexName,
+    ct.filegroup_name                                         AS FilegroupName,
     (SELECT COUNT(*) FROM cdc.captured_columns cc 
-     WHERE cc.object_id = ct.object_id)
+     WHERE cc.object_id = ct.object_id)                      AS COL_COUNT
 FROM cdc.change_tables ct
 JOIN sys.tables st ON ct.source_object_id = st.object_id;
 '
@@ -1045,24 +1045,24 @@ SELECT @sql = @sql + '
 USE [' + name + '];
 INSERT INTO #cdcjobs
 SELECT 
-    CONVERT(NVARCHAR(256), SERVERPROPERTY(''ServerName'')),
-    DB_NAME(),
+    CONVERT(NVARCHAR(256), SERVERPROPERTY(''ServerName''))    AS ServerName,
+    DB_NAME()                                                 AS DatabaseName,
     CASE LOWER(j.job_type) 
         WHEN ''capture'' THEN ''Capture'' 
         WHEN ''cleanup'' THEN ''Cleanup'' 
         ELSE ''Unknown'' 
-    END,
-    sj.name,
+    END                                                       AS JobType,
+    sj.name                                                   AS JobName,
     CASE sj.enabled 
         WHEN 1 THEN ''Enabled'' 
         WHEN 0 THEN ''Disabled'' 
-    END,
-    j.maxtrans,
-    j.maxscans,
-    j.continuous,
-    j.pollinginterval,
-    j.retention,
-    j.threshold
+    END                                                       AS JobStatus,
+    j.maxtrans                                                AS MaxTrans,
+    j.maxscans                                                AS MaxScans,
+    j.continuous                                              AS IsContinuous,
+    j.pollinginterval                                         AS PollingIntervalSec,
+    j.retention                                               AS RetentionMinutes,
+    j.threshold                                               AS CleanupThreshold
 FROM msdb.dbo.cdc_jobs j
 LEFT JOIN msdb.dbo.sysjobs sj ON j.job_id = sj.job_id
 WHERE j.database_id = DB_ID();
