@@ -283,18 +283,18 @@ foreach ($server in $registeredServers) {
     # ── Server version & edition ──────────────────────────────────────────
     $versionQuery = @"
 SELECT 
-    SERVERPROPERTY('ServerName')        AS ServerName,
-    SERVERPROPERTY('ProductVersion')    AS ProductVersion,
-    SERVERPROPERTY('ProductLevel')      AS ProductLevel,
-    SERVERPROPERTY('ProductMajorVersion') AS MajorVersion,
-    SERVERPROPERTY('Edition')           AS Edition,
-    SERVERPROPERTY('EngineEdition')     AS EngineEdition,
-    SERVERPROPERTY('ProductUpdateLevel') AS UpdateLevel,
-    SERVERPROPERTY('ProductUpdateReference') AS KBArticle,
-    SERVERPROPERTY('MachineName')       AS MachineName,
-    SERVERPROPERTY('IsClustered')       AS IsClustered,
-    SERVERPROPERTY('IsHadrEnabled')     AS IsHadrEnabled,
-    SERVERPROPERTY('Collation')         AS Collation,
+    CONVERT(NVARCHAR(256), SERVERPROPERTY('ServerName'))           AS ServerName,
+    CONVERT(NVARCHAR(50),  SERVERPROPERTY('ProductVersion'))       AS ProductVersion,
+    CONVERT(NVARCHAR(50),  SERVERPROPERTY('ProductLevel'))         AS ProductLevel,
+    CONVERT(NVARCHAR(20),  SERVERPROPERTY('ProductMajorVersion'))  AS MajorVersion,
+    CONVERT(NVARCHAR(128), SERVERPROPERTY('Edition'))              AS Edition,
+    CONVERT(INT,           SERVERPROPERTY('EngineEdition'))        AS EngineEdition,
+    CONVERT(NVARCHAR(50),  SERVERPROPERTY('ProductUpdateLevel'))   AS UpdateLevel,
+    CONVERT(NVARCHAR(50),  SERVERPROPERTY('ProductUpdateReference')) AS KBArticle,
+    CONVERT(NVARCHAR(256), SERVERPROPERTY('MachineName'))          AS MachineName,
+    CONVERT(INT,           SERVERPROPERTY('IsClustered'))          AS IsClustered,
+    CONVERT(INT,           SERVERPROPERTY('IsHadrEnabled'))        AS IsHadrEnabled,
+    CONVERT(NVARCHAR(128), SERVERPROPERTY('Collation'))            AS Collation,
     CASE 
         WHEN CONVERT(nvarchar(128), SERVERPROPERTY('Collation')) LIKE '%[_]CS[_]%' THEN 'Case-Sensitive'
         WHEN CONVERT(nvarchar(128), SERVERPROPERTY('Collation')) LIKE '%[_]CI[_]%' THEN 'Case-Insensitive'
@@ -517,8 +517,10 @@ ORDER BY ag.name
     $distQuery = @"
 DECLARE @distDb NVARCHAR(256);
 BEGIN TRY
-    IF EXISTS (SELECT 1 FROM msdb.dbo.MSdistributiondbs)
-        SELECT TOP 1 @distDb = name FROM msdb.dbo.MSdistributiondbs ORDER BY name;
+    EXEC sp_executesql
+        N'SELECT TOP 1 @d = name FROM msdb.dbo.MSdistributiondbs ORDER BY name',
+        N'@d NVARCHAR(256) OUTPUT',
+        @distDb OUTPUT;
 END TRY
 BEGIN CATCH
     SET @distDb = NULL;
@@ -528,9 +530,9 @@ IF @distDb IS NULL AND EXISTS (SELECT 1 FROM sys.databases WHERE name = 'distrib
     SET @distDb = 'distribution';
 
 IF @distDb IS NOT NULL AND EXISTS (SELECT 1 FROM sys.databases WHERE name = @distDb AND state = 0)
-    SELECT 
-        SERVERPROPERTY('ServerName') AS DistributorServer,
-        @distDb                      AS DistributionDB
+    SELECT
+        CONVERT(NVARCHAR(256), SERVERPROPERTY('ServerName')) AS DistributorServer,
+        @distDb                                              AS DistributionDB
     FROM sys.databases d
     WHERE d.name = @distDb;
 "@
@@ -757,7 +759,7 @@ BEGIN
     IF EXISTS (SELECT 1 FROM sys.tables WHERE name = ''syspublications'')
         INSERT INTO #pubs
         SELECT 
-            SERVERPROPERTY(''ServerName''),
+            CONVERT(NVARCHAR(256), SERVERPROPERTY(''ServerName'')),
             DB_NAME(),
             p.name,
             p.description,
@@ -825,7 +827,7 @@ USE [' + name + '];
 IF EXISTS (SELECT 1 FROM sys.tables WHERE name = ''sysarticles'')
     INSERT INTO #arts
     SELECT 
-        SERVERPROPERTY(''ServerName''),
+        CONVERT(NVARCHAR(256), SERVERPROPERTY(''ServerName'')),
         DB_NAME(),
         p.name,
         a.name,
@@ -889,7 +891,7 @@ IF EXISTS (SELECT 1 FROM sys.tables WHERE name = ''syssubscriptions'')
    AND EXISTS (SELECT 1 FROM sys.tables WHERE name = ''sysarticles'')
     INSERT INTO #subs
     SELECT DISTINCT
-        SERVERPROPERTY(''ServerName''),
+        CONVERT(NVARCHAR(256), SERVERPROPERTY(''ServerName'')),
         DB_NAME(),
         p.name,
         s.srvname,
@@ -943,10 +945,10 @@ DROP TABLE #subs;
     # CDC-enabled databases
     $cdcDbQuery = @"
 SELECT 
-    SERVERPROPERTY('ServerName')  AS ServerName,
-    d.name                        AS DatabaseName,
-    d.is_cdc_enabled              AS IsCDCEnabled,
-    d.compatibility_level         AS CompatLevel
+    CONVERT(NVARCHAR(256), SERVERPROPERTY('ServerName')) AS ServerName,
+    d.name                                               AS DatabaseName,
+    d.is_cdc_enabled                                     AS IsCDCEnabled,
+    d.compatibility_level                                AS CompatLevel
 FROM sys.databases d
 WHERE d.is_cdc_enabled = 1
 ORDER BY d.name
@@ -980,7 +982,7 @@ SELECT @sql = @sql + '
 USE [' + name + '];
 INSERT INTO #cdctables
 SELECT 
-    SERVERPROPERTY(''ServerName''),
+    CONVERT(NVARCHAR(256), SERVERPROPERTY(''ServerName'')),
     DB_NAME(),
     ct.capture_instance,
     SCHEMA_NAME(st.schema_id) + ''.'' + st.name,
@@ -1043,7 +1045,7 @@ SELECT @sql = @sql + '
 USE [' + name + '];
 INSERT INTO #cdcjobs
 SELECT 
-    SERVERPROPERTY(''ServerName''),
+    CONVERT(NVARCHAR(256), SERVERPROPERTY(''ServerName'')),
     DB_NAME(),
     CASE LOWER(j.job_type) 
         WHEN ''capture'' THEN ''Capture'' 
