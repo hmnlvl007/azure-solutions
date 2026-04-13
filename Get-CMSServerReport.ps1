@@ -1203,16 +1203,28 @@ if (-not $InventoryOnly -and $allSubscriptions.Count -gt 0) {
         if (-not $schedLookup.ContainsKey($key)) { $schedLookup[$key] = $s }
     }
 
+    # Secondary lookup: distributor by publication only (2-part key).
+    # Used when the 4-part schedule key misses due to subscriber name format differences
+    # (e.g. publisher-side s.srvname vs distributor-side master.sys.servers.name).
+    $distByPubLookup = @{}
+    foreach ($s in $allReplSchedules) {
+        $key = "$($s.PublisherDB)|$($s.PublicationName)"
+        if (-not $distByPubLookup.ContainsKey($key)) { $distByPubLookup[$key] = $s.DistributorServer }
+    }
+
     foreach ($sub in $allSubscriptions) {
-        $pubKey   = "$($sub.PublisherServer)|$($sub.PublisherDB)|$($sub.PublicationName)"
-        $schedKey = "$($sub.PublisherDB)|$($sub.PublicationName)|$($sub.SubscriberServer)|$($sub.SubscriberDB)"
+        $pubKey    = "$($sub.PublisherServer)|$($sub.PublisherDB)|$($sub.PublicationName)"
+        $schedKey  = "$($sub.PublisherDB)|$($sub.PublicationName)|$($sub.SubscriberServer)|$($sub.SubscriberDB)"
+        $distPubKey = "$($sub.PublisherDB)|$($sub.PublicationName)"
 
         $pub   = $pubLookup[$pubKey]
         $artCt = if ($artCountLookup.ContainsKey($pubKey)) { $artCountLookup[$pubKey] } else { 0 }
         $sched = $schedLookup[$schedKey]
 
-        # Find distributor for this publisher (from schedule data only)
-        $distServer = if ($sched) { $sched.DistributorServer } else { 'Unknown' }
+        # Find distributor: prefer exact schedule match, fall back to publication-level lookup
+        $distServer = if ($sched) { $sched.DistributorServer }
+                      elseif ($distByPubLookup.ContainsKey($distPubKey)) { $distByPubLookup[$distPubKey] }
+                      else { 'Unknown' }
 
         [void]$allReplTopology.Add([PSCustomObject]@{
             DistributorServer  = $distServer
