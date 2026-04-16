@@ -1,0 +1,118 @@
+;WITH BRGU_Filtered AS
+(
+    SELECT
+        BRGU_GU_ID,
+        BRGU_USAGE_ID,
+        RLTD_RULE_TYPE
+    FROM dbo.BPA_BRGU_RUL_GRP_U
+    WHERE RLTD_RULE_TYPE IN (?)
+      AND BRGU_USAGE_ID IN (?)
+),
+VBMP_Filtered AS
+(
+    SELECT
+        RLBP_GU_ID,
+        VBMP_VALUE
+    FROM dbo.BPA_VBMP_VBP_MAP
+    WHERE VBMP_TAG = ?
+      AND VBMP_VALUE IN (?)
+)
+SELECT
+    RLBP.RLBP_GU_ID,
+    BRGU.BRGU_USAGE_ID AS [PREFIX],
+    BRGU.RLTD_RULE_TYPE AS [SPCR OR SRCR],
+    SHDR.SHDR_ID AS [BASE ID],
+    RLBP.RLBP_SECTION AS [SECTION],
+    RLBP.RLBP_SEQ_NO AS [SEQUENCE],
+    QLGR.QLGR_GRP_DESC AS [QUALIFIER GRP],
+    RLBP.RLBP_DESC AS [RULE DESCRIPTION],
+    CAST(RLBP.RLBP_EFF_DT  AS date) AS [EFFECTIVE DATE],
+    CAST(RLBP.RLBP_TERM_DT AS date) AS [TERMINATION DATE],
+    VBMP.VBMP_VALUE AS [SUPP SEID],
+    VBMP1.VBMP_VALUE AS RPTC,
+    QLGR.QLGR_AND_OR_IND AS [AND OR INDICATOR],
+    RPTC.RPTC_DESC AS [RPTC DESC]
+FROM BRGU_Filtered AS BRGU
+JOIN dbo.BPA_BRGR_RUL_GRP_R AS BRGR
+    ON BRGR.BRGR_GU_ID = BRGU.BRGU_GU_ID
+JOIN dbo.BPA_RLGD_RUL_GRP_D AS RLGD
+    ON RLGD.RLGD_GU_ID = BRGR.RLGD_GU_ID
+   AND RLGD.RLTD_RULE_TYPE = BRGU.RLTD_RULE_TYPE
+   AND RLGD.RLGD_BRGU_GRP_ID = BRGU.BRGU_USAGE_ID
+JOIN dbo.BPA_RLGR_GRP_SET_R AS RLGR
+    ON RLGR.RLGD_GU_ID = RLGD.RLGD_GU_ID
+JOIN dbo.BPA_RLBP_BP_RULE_D AS RLBP
+    ON RLBP.RLBP_GU_ID = RLGR.RLBP_GU_ID
+JOIN dbo.BPA_QLCD_COND_D AS QLCD
+    ON QLCD.QLCD_GU_ID = RLBP.QLCD_GU_ID
+JOIN dbo.BPA_QLGR_REL_R AS QGRL
+    ON QGRL.QLCD_GU_ID = QLCD.QLCD_GU_ID
+JOIN dbo.BPA_QLGR_QGRP_D AS QLGR
+    ON QLGR.QLGR_GU_ID = QGRL.QLGR_GU_ID
+   AND QLGR.RLTD_RULE_TYPE = RLBP.RLTD_RULE_TYPE
+   AND QLGR.QLTD_QUAL_TYPE = RLGD.QLTD_QUAL_TYPE
+JOIN VBMP_Filtered AS VBMP
+    ON VBMP.RLBP_GU_ID = RLBP.RLBP_GU_ID
+JOIN dbo.BPA_VBMP_VBP_MAP AS VBMP1
+    ON VBMP1.RLBP_GU_ID = RLBP.RLBP_GU_ID
+JOIN dbo.CMC_RPTC_DESC AS RPTC
+    ON RPTC.RPTC_RPT_CAT = VBMP1.VBMP_VALUE
+JOIN dbo.BPA_SHDR_SECTION_HDR AS SHDR
+    ON SHDR.RLBP_GU_ID = RLBP.RLBP_GU_ID
+   AND SHDR.RLTD_RULE_TYPE = BRGU.RLTD_RULE_TYPE
+   AND SHDR.SHDR_GROUP_ID = BRGU.BRGU_USAGE_ID
+ORDER BY
+    SHDR.SHDR_ID,
+    RLBP.RLBP_TERM_DT,
+    BRGU.BRGU_USAGE_ID,
+    BRGU.RLTD_RULE_TYPE,
+    RLBP.RLBP_SECTION,
+    RLBP.RLBP_SEQ_NO;
+
+
+Your original SHDR derived table was effectively doing this:
+
+read RLBP again
+join to SHDR
+then come back out and join to the outer RLBP
+
+That is unnecessary. The outer query already has RLBP.
+
+2) It pushes filters earlier
+
+BRGU and VBMP are the selective points in your query:
+
+BRGU.RLTD_RULE_TYPE
+BRGU.BRGU_USAGE_ID
+VBMP.VBMP_TAG
+VBMP.VBMP_VALUE
+
+So filter them first, then join.
+
+3) It gives the optimizer a cleaner join graph
+
+The optimizer can reason better about this than about a derived table that re-reads RLBP.
+
+CREATE INDEX IX_BPA_VBMP_VBP_MAP_TAG_VALUE_GU
+ON dbo.BPA_VBMP_VBP_MAP
+(
+    VBMP_TAG,
+    VBMP_VALUE,
+    RLBP_GU_ID
+);
+
+JOIN dbo.BPA_VBMP_VBP_MAP AS VBMP1
+    ON VBMP1.RLBP_GU_ID = RLBP.RLBP_GU_ID
+JOIN dbo.CMC_RPTC_DESC AS RPTC
+    ON RPTC.RPTC_RPT_CAT = VBMP1.VBMP_VALUE
+
+There is no tag filter on VBMP1.
+
+If BPA_VBMP_VBP_MAP contains multiple tags per RLBP_GU_ID, this join can multiply rows badly.
+
+So I would ask one technical question of the data model:
+
+Is VBMP1 supposed to be a different tag type?
+
+If yes, then the correct fix is not another index. The correct fix is to add the missing predicate, for example:
+AND VBMP1.VBMP_TAG = 'some specific tag'
