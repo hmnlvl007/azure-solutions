@@ -69,50 +69,26 @@ ORDER BY
     RLBP.RLBP_SECTION,
     RLBP.RLBP_SEQ_NO;
 
-
-Your original SHDR derived table was effectively doing this:
-
-read RLBP again
-join to SHDR
-then come back out and join to the outer RLBP
-
-That is unnecessary. The outer query already has RLBP.
-
-2) It pushes filters earlier
-
-BRGU and VBMP are the selective points in your query:
-
-BRGU.RLTD_RULE_TYPE
-BRGU.BRGU_USAGE_ID
-VBMP.VBMP_TAG
-VBMP.VBMP_VALUE
-
-So filter them first, then join.
-
-3) It gives the optimizer a cleaner join graph
-
-The optimizer can reason better about this than about a derived table that re-reads RLBP.
-
-CREATE INDEX IX_BPA_VBMP_VBP_MAP_TAG_VALUE_GU
-ON dbo.BPA_VBMP_VBP_MAP
-(
-    VBMP_TAG,
-    VBMP_VALUE,
-    RLBP_GU_ID
-);
-
-JOIN dbo.BPA_VBMP_VBP_MAP AS VBMP1
-    ON VBMP1.RLBP_GU_ID = RLBP.RLBP_GU_ID
-JOIN dbo.CMC_RPTC_DESC AS RPTC
-    ON RPTC.RPTC_RPT_CAT = VBMP1.VBMP_VALUE
-
-There is no tag filter on VBMP1.
-
-If BPA_VBMP_VBP_MAP contains multiple tags per RLBP_GU_ID, this join can multiply rows badly.
-
-So I would ask one technical question of the data model:
-
-Is VBMP1 supposed to be a different tag type?
-
-If yes, then the correct fix is not another index. The correct fix is to add the missing predicate, for example:
-AND VBMP1.VBMP_TAG = 'some specific tag'
+SELECT
+    xd.value('(event/@timestamp)[1]',                                  'datetime2(3)')  AS event_time_utc,
+    xd.value('(event/@name)[1]',                                       'varchar(60)')   AS event_name,
+    @@SERVERNAME                                                                         AS server_instance_name,
+    xd.value('(event/action[@name="database_name"]/value)[1]',         'sysname')       AS database_name,
+    xd.value('(event/action[@name="server_principal_name"]/value)[1]', 'sysname')       AS server_principal_name,
+    xd.value('(event/action[@name="client_app_name"]/value)[1]',       'nvarchar(128)') AS client_app_name,
+    xd.value('(event/action[@name="client_hostname"]/value)[1]',       'nvarchar(128)') AS client_hostname,
+    xd.value('(event/data[@name="client_ip"]/value)[1]',               'varchar(48)')   AS client_ip_address,
+    xd.value('(event/action[@name="session_id"]/value)[1]',            'int')           AS session_id,
+    CASE
+        WHEN xd.value('(event/@name)[1]', 'varchar(60)') = 'login'
+        THEN TRY_CAST(
+                xd.value('(event/data[@name="success"]/value)[1]', 'varchar(5)')
+             AS bit)
+        ELSE NULL
+    END                                                                                  AS is_success,
+    f.file_name                                                                          AS xe_file_name
+FROM sys.fn_xe_file_target_read_file(N'D:\SQLXE\UserActivityAudit*.xel', NULL, NULL, NULL) AS f
+CROSS APPLY (SELECT CAST(f.event_data AS xml)) AS x(xd)
+ORDER BY
+    xd.value('(event/@timestamp)[1]', 'datetime2(3)') DESC;
+GO
