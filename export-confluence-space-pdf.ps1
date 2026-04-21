@@ -140,18 +140,20 @@ function Ensure-DirectorySafe {
 }
 
 function Copy-FileSafe {
-    # Copies a file with up to 3 retries for transient I/O errors.
-    # Uses [IO.File]::Copy which is more reliable over redirected/UNC/RDP paths
-    # than Copy-Item (which can fail with "device not functioning" errors).
+    # Transfers a file by reading all bytes locally then writing to destination.
+    # [IO.File]::Copy / Copy-Item both use the Win32 CopyFile API which fails
+    # with "A device attached to the system is not functioning" on \\tsclient\
+    # RDP-redirected drives. ReadAllBytes + WriteAllBytes uses a different code
+    # path (sequential read then write) that works reliably over RDP redirection.
     param([string]$Source, [string]$Dest)
     for ($try = 1; $try -le 3; $try++) {
         try {
-            # Ensure destination directory exists before writing
             $destDir = [IO.Path]::GetDirectoryName($Dest)
             if (-not [string]::IsNullOrEmpty($destDir) -and -not [IO.Directory]::Exists($destDir)) {
                 [IO.Directory]::CreateDirectory($destDir) | Out-Null
             }
-            [IO.File]::Copy($Source, $Dest, $true)
+            $bytes = [IO.File]::ReadAllBytes($Source)
+            [IO.File]::WriteAllBytes($Dest, $bytes)
             return
         }
         catch {
