@@ -123,8 +123,12 @@ function Ensure-DirectorySafe {
     param([string]$Path)
     for ($try = 1; $try -le 3; $try++) {
         try {
-            if (-not (Test-Path -LiteralPath $Path)) {
-                New-Item -Path $Path -ItemType Directory -Force | Out-Null
+            if (-not [IO.Directory]::Exists($Path)) {
+                [IO.Directory]::CreateDirectory($Path) | Out-Null
+            }
+            # Verify the directory actually exists after creation (catches silent failures on redirected drives)
+            if (-not [IO.Directory]::Exists($Path)) {
+                throw "Directory does not exist after creation attempt: $Path"
             }
             return
         }
@@ -137,10 +141,17 @@ function Ensure-DirectorySafe {
 
 function Copy-FileSafe {
     # Copies a file with up to 3 retries for transient I/O errors.
+    # Uses [IO.File]::Copy which is more reliable over redirected/UNC/RDP paths
+    # than Copy-Item (which can fail with "device not functioning" errors).
     param([string]$Source, [string]$Dest)
     for ($try = 1; $try -le 3; $try++) {
         try {
-            Copy-Item -LiteralPath $Source -Destination $Dest -Force
+            # Ensure destination directory exists before writing
+            $destDir = [IO.Path]::GetDirectoryName($Dest)
+            if (-not [string]::IsNullOrEmpty($destDir) -and -not [IO.Directory]::Exists($destDir)) {
+                [IO.Directory]::CreateDirectory($destDir) | Out-Null
+            }
+            [IO.File]::Copy($Source, $Dest, $true)
             return
         }
         catch {
@@ -427,7 +438,21 @@ foreach ($pg in $pages) {
 
     # Determine folder from page hierarchy
     $folder = Get-PageFolderPath -Ancestors $pg.ancestors -SpaceHomeId $homeId -RootFolder $outDir
-    Ensure-DirectorySafe -Path $folder
+    try {
+        Ensure-DirectorySafe -Path $folder
+    }
+    catch {
+        $failed += [PSCustomObject]@{ Id = $pg.id; Title = $pg.title; Reason = "Could not create output folder: $($_.Exception.Message)" }
+        Write-Host ('  FAIL ({0}) | folder create error: {1}' -f $pg.id, $_.Exception.Message) -ForegroundColor Red
+        continue
+    }
+
+    # Verify the output folder is accessible before attempting writes
+    if (-not [IO.Directory]::Exists($folder)) {
+        $failed += [PSCustomObject]@{ Id = $pg.id; Title = $pg.title; Reason = "Output folder inaccessible or could not be created: $folder" }
+        Write-Host ('  FAIL ({0}) | folder unavailable: {1}' -f $pg.id, $folder) -ForegroundColor Red
+        continue
+    }
 
     $rel = $folder.Substring($outDir.Length).TrimStart([IO.Path]::DirectorySeparatorChar)
     if ([string]::IsNullOrEmpty($rel)) { $rel = '.' }
