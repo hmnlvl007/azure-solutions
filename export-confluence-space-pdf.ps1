@@ -188,16 +188,20 @@ function Get-ConfluencePages {
 }
 
 function Get-PageFolderPath {
+    # MAX_PATH is 260. Reserve 80 chars for the file name (4-digit index + dash + 60-char title + .html).
+    # Once the folder path alone would exceed 180 chars, stop nesting - remaining ancestors are flattened.
     param($Ancestors, [string]$SpaceHomeId, [string]$RootFolder)
-    $folder = $RootFolder
+    $folder    = $RootFolder
+    $maxFolder = 180
     if ($null -ne $Ancestors) {
         foreach ($a in $Ancestors) {
             if ([string]$a.id -eq $SpaceHomeId) { continue }
-            $part = Get-CompactSafeName -Name $a.title -MaxLength 50
+            if ($folder.Length -ge $maxFolder) { break }   # path already at ceiling - stop nesting
+            $part      = Get-CompactSafeName -Name $a.title -MaxLength 50
             $candidate = Join-Path $folder $part
-            if ($candidate.Length -gt 220) {
-                $part = Get-CompactSafeName -Name ("{0}-{1}" -f $a.title, $a.id) -MaxLength 24
-                $candidate = Join-Path $folder $part
+            if ($candidate.Length -gt $maxFolder) {
+                # One more level would bust the ceiling - skip this and all remaining ancestors
+                break
             }
             $folder = $candidate
         }

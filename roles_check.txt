@@ -1,0 +1,155 @@
+SET NOCOUNT ON;
+
+;WITH RoleClosure AS
+(
+    -- direct role memberships
+    SELECT
+        drm.member_principal_id,
+        drm.role_principal_id,
+        CAST(USER_NAME(drm.role_principal_id) AS nvarchar(max)) AS role_path,
+        1 AS lvl
+    FROM sys.database_role_members AS drm
+
+    UNION ALL
+
+    -- nested roles
+    SELECT
+        rc.member_principal_id,
+        drm.role_principal_id,
+        CAST(rc.role_path + N' -> ' + USER_NAME(drm.role_principal_id) AS nvarchar(max)) AS role_path,
+        rc.lvl + 1
+    FROM RoleClosure rc
+    JOIN sys.database_role_members drm
+        ON rc.role_principal_id = drm.member_principal_id
+),
+UserRoleMap AS
+(
+    SELECT DISTINCT
+        rc.member_principal_id AS user_principal_id,
+        rc.role_principal_id   AS role_principal_id,
+        USER_NAME(rc.role_principal_id) AS role_name,
+        rc.role_path
+    FROM RoleClosure rc
+),
+DbUsers AS
+(
+    SELECT
+        dp.principal_id,
+        dp.name              AS database_user,
+        dp.type_desc         AS database_user_type,
+        dp.authentication_type_desc,
+        sp.name              AS server_login,
+        sp.type_desc         AS server_login_type,
+        dp.default_schema_name
+    FROM sys.database_principals dp
+    LEFT JOIN sys.server_principals sp
+        ON dp.sid = sp.sid
+    WHERE dp.type IN ('S','U','G')   -- SQL user, Windows login, Windows group
+      AND dp.principal_id > 4
+      AND dp.name NOT IN ('dbo','guest','INFORMATION_SCHEMA','sys')
+),
+DirectPerms AS
+(
+    SELECT
+        du.database_user,
+        du.database_user_type,
+        du.authentication_type_desc,
+        du.server_login,
+        du.server_login_type,
+        'DIRECT GRANT' AS grant_source,
+        CAST(NULL AS sysname) AS via_role,
+        dp.state_desc,
+        dp.permission_name,
+        CASE dp.class_desc
+            WHEN 'DATABASE' THEN DB_NAME()
+            WHEN 'SCHEMA'   THEN SCHEMA_NAME(dp.major_id)
+            WHEN 'OBJECT_OR_COLUMN' THEN
+                QUOTENAME(OBJECT_SCHEMA_NAME(dp.major_id)) + N'.' + QUOTENAME(OBJECT_NAME(dp.major_id))
+            ELSE dp.class_desc
+        END AS securable_name,
+        dp.class_desc AS securable_class
+    FROM DbUsers du
+    JOIN sys.database_permissions dp
+        ON dp.grantee_principal_id = du.principal_id
+    WHERE dp.state IN ('G','W')
+      AND dp.permission_name IN ('INSERT','UPDATE','DELETE','CONTROL')
+),
+RolePerms AS
+(
+    SELECT
+        du.database_user,
+        du.database_user_type,
+        du.authentication_type_desc,
+        du.server_login,
+        du.server_login_type,
+        'ROLE GRANT' AS grant_source,
+        urm.role_name AS via_role,
+        dp.state_desc,
+        dp.permission_name,
+        CASE dp.class_desc
+            WHEN 'DATABASE' THEN DB_NAME()
+            WHEN 'SCHEMA'   THEN SCHEMA_NAME(dp.major_id)
+            WHEN 'OBJECT_OR_COLUMN' THEN
+                QUOTENAME(OBJECT_SCHEMA_NAME(dp.major_id)) + N'.' + QUOTENAME(OBJECT_NAME(dp.major_id))
+            ELSE dp.class_desc
+        END AS securable_name,
+        dp.class_desc AS securable_class
+    FROM DbUsers du
+    JOIN UserRoleMap urm
+        ON urm.user_principal_id = du.principal_id
+    JOIN sys.database_permissions dp
+        ON dp.grantee_principal_id = urm.role_principal_id
+    WHERE dp.state IN ('G','W')
+      AND dp.permission_name IN ('INSERT','UPDATE','DELETE','CONTROL')
+),
+FixedRolePerms AS
+(
+    SELECT
+        du.database_user,
+        du.database_user_type,
+        du.authentication_type_desc,
+        du.server_login,
+        du.server_login_type,
+        'FIXED ROLE' AS grant_source,
+        urm.role_name AS via_role,
+        'GRANT' AS state_desc,
+        'INSERT/UPDATE/DELETE' AS permission_name,
+        CASE 
+            WHEN urm.role_name = 'db_owner' THEN DB_NAME()
+            WHEN urm.role_name = 'db_datawriter' THEN 'All user tables'
+        END AS securable_name,
+        'DATABASE_ROLE' AS securable_class
+    FROM DbUsers du
+    JOIN UserRoleMap urm
+        ON urm.user_principal_id = du.principal_id
+    WHERE urm.role_name IN ('db_owner','db_datawriter')
+)
+SELECT DISTINCT
+    DB_NAME() AS database_name,
+    database_user,
+    database_user_type,
+    authentication_type_desc,
+    server_login,
+    server_login_type,
+    grant_source,
+    via_role,
+    permission_name,
+    securable_class,
+    securable_name,
+    state_desc
+FROM
+(
+    SELECT * FROM DirectPerms
+    UNION ALL
+    SELECT * FROM RolePerms
+    UNION ALL
+    SELECT * FROM FixedRolePerms
+) x
+ORDER BY
+    database_user,
+    grant_source,
+    via_role,
+    permission_name,
+    securable_class,
+    securable_name
+OPTION (MAXRECURSION 100);
