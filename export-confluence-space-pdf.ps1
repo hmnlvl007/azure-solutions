@@ -119,6 +119,21 @@ function Write-FileSafe {
     }
 }
 
+function Assert-DirectoryWritable {
+    param([string]$Path)
+
+    $probe = Join-Path $Path ('.write-probe-' + [Guid]::NewGuid().ToString('N') + '.tmp')
+    try {
+        [IO.File]::WriteAllText($probe, 'ok', [Text.Encoding]::ASCII)
+    }
+    catch {
+        throw "Output path is not writable: $Path | $($_.Exception.Message)"
+    }
+    finally {
+        if (Test-Path $probe) { Remove-Item $probe -Force -ErrorAction SilentlyContinue }
+    }
+}
+
 function Ensure-DirectorySafe {
     param([string]$Path)
     for ($try = 1; $try -le 3; $try++) {
@@ -140,26 +155,79 @@ function Ensure-DirectorySafe {
 }
 
 function Copy-FileSafe {
-    # Transfers a file by reading all bytes locally then writing to destination.
-    # [IO.File]::Copy / Copy-Item both use the Win32 CopyFile API which fails
-    # with "A device attached to the system is not functioning" on \\tsclient\
-    # RDP-redirected drives. ReadAllBytes + WriteAllBytes uses a different code
-    # path (sequential read then write) that works reliably over RDP redirection.
+    # Transfers a file using multiple write strategies.
+    # Some storage providers (OneDrive placeholders, redirected/network drives,
+    # filter drivers) can intermittently fail specific Win32/.NET write paths.
+    # We try several methods before failing to improve reliability.
     param([string]$Source, [string]$Dest)
-    for ($try = 1; $try -le 3; $try++) {
+    for ($try = 1; $try -le 5; $try++) {
+        $errors = @()
+        $partial = "$Dest.__partial"
+
         try {
             $destDir = [IO.Path]::GetDirectoryName($Dest)
             if (-not [string]::IsNullOrEmpty($destDir) -and -not [IO.Directory]::Exists($destDir)) {
                 [IO.Directory]::CreateDirectory($destDir) | Out-Null
             }
+        }
+        catch {
+            if ($try -eq 5) { throw }
+            Start-Sleep -Milliseconds (500 * $try)
+            continue
+        }
+
+        # Method 1: ReadAllBytes + WriteAllBytes
+        try {
             $bytes = [IO.File]::ReadAllBytes($Source)
             [IO.File]::WriteAllBytes($Dest, $bytes)
             return
         }
         catch {
-            if ($try -eq 3) { throw }
-            Start-Sleep -Milliseconds (500 * $try)
+            $errors += "WriteAllBytes: $($_.Exception.Message)"
+            if (Test-Path $Dest) { Remove-Item $Dest -Force -ErrorAction SilentlyContinue }
         }
+
+        # Method 2: stream copy to partial in destination folder, then atomic move
+        try {
+            if (Test-Path $partial) { Remove-Item $partial -Force -ErrorAction SilentlyContinue }
+
+            $inStream = [IO.File]::OpenRead($Source)
+            try {
+                $outStream = [IO.File]::Open($partial, [IO.FileMode]::Create, [IO.FileAccess]::Write, [IO.FileShare]::None)
+                try {
+                    $inStream.CopyTo($outStream)
+                    $outStream.Flush()
+                }
+                finally {
+                    $outStream.Dispose()
+                }
+            }
+            finally {
+                $inStream.Dispose()
+            }
+
+            Move-Item -LiteralPath $partial -Destination $Dest -Force
+            return
+        }
+        catch {
+            $errors += "StreamCopy: $($_.Exception.Message)"
+            if (Test-Path $partial) { Remove-Item $partial -Force -ErrorAction SilentlyContinue }
+        }
+
+        # Method 3: Win32 CopyFile path
+        try {
+            [IO.File]::Copy($Source, $Dest, $true)
+            return
+        }
+        catch {
+            $errors += "File.Copy: $($_.Exception.Message)"
+        }
+
+        if ($try -eq 5) {
+            throw "Copy failed after $try attempts. Source=$Source Dest=$Dest Errors=$($errors -join ' | ')"
+        }
+
+        Start-Sleep -Milliseconds (700 * $try)
     }
 }
 
@@ -419,6 +487,7 @@ $homeId = Get-SpaceHomePageId -ApiBase $api -Space $SpaceKey -Headers $headers
 # Output root directory
 $outDir = Join-Path $OutputPath $SpaceKey
 Ensure-DirectorySafe -Path $outDir
+Assert-DirectoryWritable -Path $outDir
 
 # Fetch all pages (body.export_view pre-fetched - avoids extra API calls later)
 Write-Host ''
