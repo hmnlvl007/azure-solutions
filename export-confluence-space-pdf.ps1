@@ -11,6 +11,7 @@ param(
 $ErrorActionPreference = 'Stop'
 
 $script:TempRoot = $null
+$script:WritableDirectoryCache = @{}
 
 # ==============================================================================
 # HELPER FUNCTIONS
@@ -222,6 +223,36 @@ function Ensure-DirectorySafe {
     }
 }
 
+function Test-DirectoryWritable {
+    param(
+        [string]$Path,
+        [int]$MaxAttempts = 6,
+        [int]$BaseDelayMs = 1000
+    )
+
+    if ($script:WritableDirectoryCache.ContainsKey($Path)) {
+        return $true
+    }
+
+    Ensure-DirectorySafe -Path $Path
+
+    for ($try = 1; $try -le $MaxAttempts; $try++) {
+        try {
+            Assert-DirectoryWritable -Path $Path
+            $script:WritableDirectoryCache[$Path] = $true
+            return $true
+        }
+        catch {
+            if ($try -eq $MaxAttempts) {
+                throw
+            }
+            Start-Sleep -Milliseconds ($BaseDelayMs * $try)
+        }
+    }
+
+    return $false
+}
+
 function Copy-FileSafe {
     # Transfers a source file to a destination using multiple fallback strategies.
     #
@@ -251,6 +282,7 @@ function Copy-FileSafe {
             # .NET mkdir failed (expected on \tsclient\) - fall back to cmd mkdir
             $null = cmd /c "mkdir `"$destDir`"" 2>&1
         }
+        $null = Test-DirectoryWritable -Path $destDir
     }
 
     # Method 1: .NET WriteAllBytes  (works for local / UNC shares, NOT \\tsclient\)
@@ -492,7 +524,7 @@ function Save-PageAttachments {
         $shortBase = Get-CompactSafeName -Name $FileBaseName -MaxLength $headroom
         $dir       = Join-Path $PageFolder "$shortBase-att"
     }
-    Ensure-DirectorySafe -Path $dir
+    $null = Test-DirectoryWritable -Path $dir
 
     $n = 0
     $b = [long]0
@@ -567,8 +599,7 @@ $homeId = Get-SpaceHomePageId -ApiBase $api -Space $SpaceKey -Headers $headers
 
 # Output root directory
 $outDir = Join-Path $OutputPath $SpaceKey
-Ensure-DirectorySafe -Path $outDir
-Assert-DirectoryWritable -Path $outDir
+$null = Test-DirectoryWritable -Path $outDir
 Write-Host ("Temp staging: {0}" -f (Get-LocalTempRoot)) -ForegroundColor DarkGray
 
 # Fetch all pages (body.export_view pre-fetched - avoids extra API calls later)
@@ -606,7 +637,7 @@ foreach ($pg in $pages) {
     # Determine folder from page hierarchy
     $folder = Get-PageFolderPath -Ancestors $pg.ancestors -SpaceHomeId $homeId -RootFolder $outDir
     try {
-        Ensure-DirectorySafe -Path $folder
+        $null = Test-DirectoryWritable -Path $folder
     }
     catch {
         $failed += [PSCustomObject]@{ Id = $pg.id; Title = $pg.title; Reason = "Could not create output folder: $($_.Exception.Message)" }
@@ -640,32 +671,50 @@ foreach ($pg in $pages) {
     # --- WORD (primary) ---
     if (-not $wordOff) {
         $docDest = Get-SafeOutputFilePath -Folder $folder -BaseName $baseName -Extension '.doc'
-        try {
-            $result = Save-PageWord -WikiBase $wiki -PageId $pg.id `
-                          -Headers $headers -DestPath $docDest -Session $session
-            if ($result.OK) {
-                $wordStreak = 0
+        $wordHttpCode = 0
+        $wordErrorMessage = ''
+        for ($wordTry = 1; $wordTry -le 3; $wordTry++) {
+            try {
+                $result = Save-PageWord -WikiBase $wiki -PageId $pg.id `
+                              -Headers $headers -DestPath $docDest -Session $session
+                if ($result.OK) {
+                    $wordStreak = 0
+                    $wordErrorMessage = ''
+                    break
+                }
+
+                $result = $null
+                $wordErrorMessage = 'Word: empty or undersized response'
+                if ($wordTry -lt 3) {
+                    Start-Sleep -Milliseconds (1000 * $wordTry)
+                }
             }
-            else {
-                $wordStreak++
-                $reason = 'Word: empty or undersized response'
+            catch {
+                $result = $null
+                $wordErrorMessage = $_.Exception.Message
+                $wordHttpCode = 0
+                if ($null -ne $_.Exception.Response) {
+                    try { $wordHttpCode = [int]$_.Exception.Response.StatusCode } catch {}
+                }
+
+                if ($wordHttpCode -in @(401, 403)) {
+                    $wordOff = $true
+                    Write-Host "  Word returned HTTP $wordHttpCode - switching to HTML only" -ForegroundColor Yellow
+                    break
+                }
+
+                if ($wordTry -lt 3) {
+                    Start-Sleep -Milliseconds (1000 * $wordTry)
+                }
             }
         }
-        catch {
-            $reason = $_.Exception.Message
-            $httpCode = 0
-            if ($null -ne $_.Exception.Response) {
-                try { $httpCode = [int]$_.Exception.Response.StatusCode } catch {}
-            }
-            if ($httpCode -in @(401, 403)) {
-                $wordOff = $true
-                Write-Host "  Word returned HTTP $httpCode - switching to HTML only" -ForegroundColor Yellow
-            }
-            elseif ($httpCode -gt 0) {
+
+        if ($null -eq $result -or -not $result.OK) {
+            $reason = $wordErrorMessage
+            if ($wordHttpCode -gt 0) {
                 # Only count HTTP errors toward streak - not I/O errors
                 $wordStreak++
             }
-            $result = $null
         }
 
         if ((-not $wordOff) -and $wordStreak -ge 3) {
