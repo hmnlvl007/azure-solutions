@@ -107,6 +107,7 @@ function Get-LocalTempRoot {
     }
 
     $candidates = @(
+        $(if (-not [string]::IsNullOrWhiteSpace($env:LOCALAPPDATA)) { Join-Path $env:LOCALAPPDATA 'ConfluenceExportStaging' }),
         $env:TEMP,
         $env:TMP,
         [IO.Path]::GetTempPath(),
@@ -133,6 +134,13 @@ function Get-LocalTempRoot {
     }
 
     throw 'Could not locate a writable local temp folder for staging export files.'
+}
+
+function Test-IsTsClientPath {
+    param([string]$Path)
+
+    if ([string]::IsNullOrWhiteSpace($Path)) { return $false }
+    return $Path.StartsWith('\\tsclient\', [StringComparison]::OrdinalIgnoreCase)
 }
 
 function New-LocalTempFilePath {
@@ -283,6 +291,42 @@ function Copy-FileSafe {
             $null = cmd /c "mkdir `"$destDir`"" 2>&1
         }
         $null = Test-DirectoryWritable -Path $destDir
+    }
+
+    $isTsClient = (Test-IsTsClientPath -Path $Dest) -or (Test-IsTsClientPath -Path $destDir)
+
+    if ($isTsClient) {
+        for ($copyTry = 1; $copyTry -le 5; $copyTry++) {
+            try {
+                $null = cmd /c "copy /Y `"$Source`" `"$Dest`"" 2>&1
+                if ($LASTEXITCODE -eq 0) { return }
+                $errors += ("cmd copy try {0}: exit {1}" -f $copyTry, $LASTEXITCODE)
+            }
+            catch {
+                $errors += ("cmd copy try {0}: {1}" -f $copyTry, $_.Exception.Message)
+            }
+
+            try {
+                $srcFile = [IO.Path]::GetFileName($Source)
+                $srcDir  = [IO.Path]::GetDirectoryName($Source)
+                $tmpDest = Join-Path $destDir $srcFile
+                $null = robocopy $srcDir $destDir $srcFile /R:2 /W:1 /NP /NJH /NJS 2>&1
+                if ($LASTEXITCODE -le 1) {
+                    if ($srcFile -ne [IO.Path]::GetFileName($Dest)) {
+                        $null = cmd /c "move /Y `"$tmpDest`" `"$Dest`"" 2>&1
+                    }
+                    return
+                }
+                $errors += ("robocopy try {0}: exit {1}" -f $copyTry, $LASTEXITCODE)
+            }
+            catch {
+                $errors += ("robocopy try {0}: {1}" -f $copyTry, $_.Exception.Message)
+            }
+
+            Start-Sleep -Milliseconds (750 * $copyTry)
+        }
+
+        throw "Copy failed. Source=$Source Dest=$Dest Errors=$($errors -join ' | ')"
     }
 
     # Method 1: .NET WriteAllBytes  (works for local / UNC shares, NOT \\tsclient\)
