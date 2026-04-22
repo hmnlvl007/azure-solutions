@@ -392,9 +392,7 @@ function Save-PageHtml {
     $html = $head + $body
 
     Write-FileSafe -Path $DestPath -Text $html
-    $fmt = [IO.Path]::GetExtension($DestPath).TrimStart('.').ToLowerInvariant()
-    if ([string]::IsNullOrWhiteSpace($fmt)) { $fmt = 'html' }
-    return [PSCustomObject]@{ OK = $true; Fmt = $fmt; Path = $DestPath }
+    return [PSCustomObject]@{ OK = $true; Fmt = 'html'; Path = $DestPath }
 }
 
 # ==============================================================================
@@ -609,8 +607,12 @@ foreach ($pg in $pages) {
     }
 
     # --- HTML (fallback) ---
+    # NOTE: Use .doc extension even for HTML content. OneDrive's sync filter driver
+    # blocks .html file creation in synced SharePoint libraries (security policy that
+    # prevents script injection). .doc is always permitted and Word/SharePoint/M365
+    # Copilot all open HTML-in-doc wrappers natively with full fidelity.
     if ($null -eq $result -or -not $result.OK) {
-        $htmlDest = Get-SafeOutputFilePath -Folder $folder -BaseName $baseName -Extension '.html'
+        $htmlDest = Get-SafeOutputFilePath -Folder $folder -BaseName $baseName -Extension '.doc'
 
         # Use body already fetched during page listing - no extra API call needed
         $body = $null
