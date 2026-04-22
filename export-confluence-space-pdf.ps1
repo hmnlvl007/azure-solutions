@@ -99,17 +99,28 @@ function Get-SafeOutputFilePath {
 }
 
 function Write-FileSafe {
-    # Writes text to a local temp file first, then transfers to destination.
-    # The temp file must NOT be deleted inside the loop - Copy-FileSafe reads it
-    # on each attempt. Cleanup happens once after all retries complete.
+    # Writes text via a local temp file then copies to destination with retries.
+    # IMPORTANT: $tmp must be declared INSIDE the loop so each retry creates a
+    # fresh temp file. The finally block deletes it after every iteration
+    # (success or failure), which is correct - each retry writes a new one.
+    # The retry + sleep is intentional: on \\tsclient\ RDP redirected paths,
+    # the first write to a newly-created folder can fail while OneDrive is
+    # still registering the directory. A short delay before retry succeeds.
     param([string]$Path, [string]$Text)
-    $tmp = [IO.Path]::Combine([IO.Path]::GetTempPath(), ([IO.Path]::GetRandomFileName() + '.tmp'))
-    try {
-        [IO.File]::WriteAllText($tmp, $Text, [Text.Encoding]::UTF8)
-        Copy-FileSafe -Source $tmp -Dest $Path
-    }
-    finally {
-        if (Test-Path $tmp) { Remove-Item $tmp -Force -ErrorAction SilentlyContinue }
+    for ($try = 1; $try -le 3; $try++) {
+        $tmp = [IO.Path]::Combine([IO.Path]::GetTempPath(), ([IO.Path]::GetRandomFileName() + '.tmp'))
+        try {
+            [IO.File]::WriteAllText($tmp, $Text, [Text.Encoding]::UTF8)
+            Copy-FileSafe -Source $tmp -Dest $Path
+            return
+        }
+        catch {
+            if ($try -eq 3) { throw }
+            Start-Sleep -Milliseconds (800 * $try)
+        }
+        finally {
+            if (Test-Path $tmp) { Remove-Item $tmp -Force -ErrorAction SilentlyContinue }
+        }
     }
 }
 
@@ -176,11 +187,16 @@ function Copy-FileSafe {
 
     $errors = @()
 
+    # Ensure destination directory exists.
+    # Do NOT call [IO.Directory]::Exists() outside a try/catch - on \tsclient\
+    # RDP redirected paths it can throw IOException uncaught (ERROR_DEV_NOT_EXIST).
     $destDir = [IO.Path]::GetDirectoryName($Dest)
-    if (-not [string]::IsNullOrEmpty($destDir) -and -not [IO.Directory]::Exists($destDir)) {
-        try { [IO.Directory]::CreateDirectory($destDir) | Out-Null }
+    if (-not [string]::IsNullOrEmpty($destDir)) {
+        try {
+            [IO.Directory]::CreateDirectory($destDir) | Out-Null
+        }
         catch {
-            # Directory create can also fail on \\tsclient\ - try cmd mkdir
+            # .NET mkdir failed (expected on \tsclient\) - fall back to cmd mkdir
             $null = cmd /c "mkdir `"$destDir`"" 2>&1
         }
     }
@@ -636,7 +652,10 @@ foreach ($pg in $pages) {
 
     if ($result.OK) {
         $fmts[$result.Fmt]++
-        $sz    = (Get-Item $result.Path).Length
+        # Get-Item against \tsclient\ paths throws on some RDP sessions - use
+        # a dedicated try/catch and fall back to zero for size reporting only.
+        $sz = 0
+        try { $sz = (Get-Item -LiteralPath $result.Path -ErrorAction Stop).Length } catch {}
         $bytes += $sz
 
         if ($sz -ge 1MB)      { $szStr = '{0:N1} MB' -f ($sz / 1MB) }
