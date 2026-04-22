@@ -157,6 +157,31 @@ function New-LocalTempFilePath {
     return (Join-Path (Get-LocalTempRoot) $name)
 }
 
+function Remove-FileQuietly {
+    param([string]$Path)
+
+    if ([string]::IsNullOrWhiteSpace($Path)) { return }
+
+    $restoreNativePreference = $false
+    if (Get-Variable -Name PSNativeCommandUseErrorActionPreference -ErrorAction SilentlyContinue) {
+        $restoreNativePreference = $true
+        $previousNativePreference = $PSNativeCommandUseErrorActionPreference
+        $PSNativeCommandUseErrorActionPreference = $false
+    }
+
+    try {
+        $null = cmd /d /c "if exist `"$Path`" del /F /Q `"$Path`"" 2>$null
+    }
+    catch {
+        # Best-effort cleanup only.
+    }
+    finally {
+        if ($restoreNativePreference) {
+            $PSNativeCommandUseErrorActionPreference = $previousNativePreference
+        }
+    }
+}
+
 function Write-FileSafe {
     # Writes text via a local temp file then copies to destination with retries.
     # IMPORTANT: $tmp must be declared INSIDE the loop so each retry creates a
@@ -207,8 +232,8 @@ function Assert-DirectoryWritable {
     finally {
         if (Test-Path -LiteralPath $localTmp) { Remove-Item -LiteralPath $localTmp -Force -ErrorAction SilentlyContinue }
         # Do NOT use Test-Path on $destProbe - it is a \tsclient\ path and throws.
-        # Always attempt delete; cmd del silently ignores missing files.
-        $null = cmd /c "del /F /Q `"$destProbe`"" 2>&1
+        # Best-effort cleanup only; redirected paths can emit benign stderr.
+        Remove-FileQuietly -Path $destProbe
     }
 }
 
@@ -338,7 +363,7 @@ function Copy-FileSafe {
     catch {
         $errors += "WriteAllBytes: $($_.Exception.Message)"
         # Attempt cleanup - may silently fail on \\tsclient\, that is fine
-        $null = cmd /c "del /F /Q `"$Dest`"" 2>&1
+        Remove-FileQuietly -Path $Dest
     }
 
     # Method 2: .NET File.Copy  (same Win32 layer as above, worth one try)
