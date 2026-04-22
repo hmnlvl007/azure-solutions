@@ -122,136 +122,127 @@ function Write-FileSafe {
 function Assert-DirectoryWritable {
     param([string]$Path)
 
-    $probe = Join-Path $Path ('.write-probe-' + [Guid]::NewGuid().ToString('N') + '.tmp')
+    # Use a temp-file + cmd copy probe so this works on \\tsclient\ paths
+    # where [IO.File]::WriteAllText fails with "device not functioning".
+    $probeName = '.write-probe-' + [Guid]::NewGuid().ToString('N') + '.tmp'
+    $localTmp  = [IO.Path]::Combine([IO.Path]::GetTempPath(), $probeName)
+    $destProbe = Join-Path $Path $probeName
     try {
-        [IO.File]::WriteAllText($probe, 'ok', [Text.Encoding]::ASCII)
+        [IO.File]::WriteAllText($localTmp, 'ok', [Text.Encoding]::ASCII)
+        $null = cmd /c "copy /Y `"$localTmp`" `"$destProbe`"" 2>&1
+        if ($LASTEXITCODE -ne 0 -or -not (Test-Path -LiteralPath $destProbe)) {
+            throw "cmd copy probe failed (exit $LASTEXITCODE)"
+        }
     }
     catch {
         throw "Output path is not writable: $Path | $($_.Exception.Message)"
     }
     finally {
-        if (Test-Path $probe) { Remove-Item $probe -Force -ErrorAction SilentlyContinue }
-    }
-}
-
-function Test-ExtensionWritable {
-    param(
-        [string]$Folder,
-        [string]$Extension
-    )
-
-    $ext = if ([string]::IsNullOrWhiteSpace($Extension)) { '.tmp' }
-           elseif ($Extension.StartsWith('.')) { $Extension }
-           else { ".{0}" -f $Extension }
-
-    $probe = Join-Path $Folder ('.ext-probe-' + [Guid]::NewGuid().ToString('N') + $ext)
-    try {
-        [IO.File]::WriteAllText($probe, 'probe', [Text.Encoding]::ASCII)
-        return [PSCustomObject]@{ OK = $true; Message = '' }
-    }
-    catch {
-        return [PSCustomObject]@{ OK = $false; Message = $_.Exception.Message }
-    }
-    finally {
-        if (Test-Path $probe) { Remove-Item $probe -Force -ErrorAction SilentlyContinue }
+        if (Test-Path $localTmp) { Remove-Item $localTmp -Force -ErrorAction SilentlyContinue }
+        if (Test-Path $destProbe) { $null = cmd /c "del /F /Q `"$destProbe`"" 2>&1 }
     }
 }
 
 function Ensure-DirectorySafe {
     param([string]$Path)
-    for ($try = 1; $try -le 3; $try++) {
-        try {
-            if (-not [IO.Directory]::Exists($Path)) {
-                [IO.Directory]::CreateDirectory($Path) | Out-Null
-            }
-            # Verify the directory actually exists after creation (catches silent failures on redirected drives)
-            if (-not [IO.Directory]::Exists($Path)) {
-                throw "Directory does not exist after creation attempt: $Path"
-            }
-            return
-        }
-        catch {
-            if ($try -eq 3) { throw }
-            Start-Sleep -Milliseconds (500 * $try)
-        }
+
+    if ([IO.Directory]::Exists($Path)) { return }
+
+    # Try .NET first; fall back to cmd mkdir for \\tsclient\ paths where
+    # [IO.Directory]::CreateDirectory fails with "device not functioning".
+    try {
+        [IO.Directory]::CreateDirectory($Path) | Out-Null
+    }
+    catch {
+        $null = cmd /c "mkdir `"$Path`"" 2>&1
+    }
+
+    if (-not [IO.Directory]::Exists($Path)) {
+        throw "Could not create directory: $Path"
     }
 }
 
 function Copy-FileSafe {
-    # Transfers a file using multiple write strategies.
-    # Some storage providers (OneDrive placeholders, redirected/network drives,
-    # filter drivers) can intermittently fail specific Win32/.NET write paths.
-    # We try several methods before failing to improve reliability.
+    # Transfers a source file to a destination using multiple fallback strategies.
+    #
+    # The destination may be an RDP-redirected client drive (\\tsclient\C\...).
+    # On such paths ALL .NET / Win32 file-write APIs (WriteAllBytes, FileStream,
+    # File.Copy) fail with "A device attached to the system is not functioning"
+    # because they route through NtWriteFile which the TS client redirector does
+    # not support reliably.
+    #
+    # cmd.exe  "copy /Y"  and  robocopy  use the SMB-layer redirector path and
+    # are the only methods that work reliably on \\tsclient\ paths.
+    # We therefore try .NET methods first (fast for local paths) and fall through
+    # to cmd copy / robocopy so that \\tsclient\ targets always succeed.
     param([string]$Source, [string]$Dest)
-    for ($try = 1; $try -le 5; $try++) {
-        $errors = @()
-        $partial = "$Dest.__partial"
 
-        try {
-            $destDir = [IO.Path]::GetDirectoryName($Dest)
-            if (-not [string]::IsNullOrEmpty($destDir) -and -not [IO.Directory]::Exists($destDir)) {
-                [IO.Directory]::CreateDirectory($destDir) | Out-Null
-            }
-        }
+    $errors = @()
+
+    $destDir = [IO.Path]::GetDirectoryName($Dest)
+    if (-not [string]::IsNullOrEmpty($destDir) -and -not [IO.Directory]::Exists($destDir)) {
+        try { [IO.Directory]::CreateDirectory($destDir) | Out-Null }
         catch {
-            if ($try -eq 5) { throw }
-            Start-Sleep -Milliseconds (500 * $try)
-            continue
+            # Directory create can also fail on \\tsclient\ - try cmd mkdir
+            $null = cmd /c "mkdir `"$destDir`"" 2>&1
         }
-
-        # Method 1: ReadAllBytes + WriteAllBytes
-        try {
-            $bytes = [IO.File]::ReadAllBytes($Source)
-            [IO.File]::WriteAllBytes($Dest, $bytes)
-            return
-        }
-        catch {
-            $errors += "WriteAllBytes: $($_.Exception.Message)"
-            if (Test-Path $Dest) { Remove-Item $Dest -Force -ErrorAction SilentlyContinue }
-        }
-
-        # Method 2: stream copy to partial in destination folder, then atomic move
-        try {
-            if (Test-Path $partial) { Remove-Item $partial -Force -ErrorAction SilentlyContinue }
-
-            $inStream = [IO.File]::OpenRead($Source)
-            try {
-                $outStream = [IO.File]::Open($partial, [IO.FileMode]::Create, [IO.FileAccess]::Write, [IO.FileShare]::None)
-                try {
-                    $inStream.CopyTo($outStream)
-                    $outStream.Flush()
-                }
-                finally {
-                    $outStream.Dispose()
-                }
-            }
-            finally {
-                $inStream.Dispose()
-            }
-
-            Move-Item -LiteralPath $partial -Destination $Dest -Force
-            return
-        }
-        catch {
-            $errors += "StreamCopy: $($_.Exception.Message)"
-            if (Test-Path $partial) { Remove-Item $partial -Force -ErrorAction SilentlyContinue }
-        }
-
-        # Method 3: Win32 CopyFile path
-        try {
-            [IO.File]::Copy($Source, $Dest, $true)
-            return
-        }
-        catch {
-            $errors += "File.Copy: $($_.Exception.Message)"
-        }
-
-        if ($try -eq 5) {
-            throw "Copy failed after $try attempts. Source=$Source Dest=$Dest Errors=$($errors -join ' | ')"
-        }
-
-        Start-Sleep -Milliseconds (700 * $try)
     }
+
+    # Method 1: .NET WriteAllBytes  (works for local / UNC shares, NOT \\tsclient\)
+    try {
+        $bytes = [IO.File]::ReadAllBytes($Source)
+        [IO.File]::WriteAllBytes($Dest, $bytes)
+        return
+    }
+    catch {
+        $errors += "WriteAllBytes: $($_.Exception.Message)"
+        # Attempt cleanup - may silently fail on \\tsclient\, that is fine
+        $null = cmd /c "del /F /Q `"$Dest`"" 2>&1
+    }
+
+    # Method 2: .NET File.Copy  (same Win32 layer as above, worth one try)
+    try {
+        [IO.File]::Copy($Source, $Dest, $true)
+        return
+    }
+    catch {
+        $errors += "File.Copy: $($_.Exception.Message)"
+    }
+
+    # Method 3: cmd.exe copy  (uses SMB-layer redirector - works on \\tsclient\)
+    try {
+        $null = cmd /c "copy /Y `"$Source`" `"$Dest`"" 2>&1
+        if ($LASTEXITCODE -eq 0 -and (Test-Path -LiteralPath $Dest)) { return }
+        $errors += "cmd copy: exit $LASTEXITCODE"
+    }
+    catch {
+        $errors += "cmd copy: $($_.Exception.Message)"
+    }
+
+    # Method 4: robocopy  (most robust SMB-layer transfer)
+    try {
+        $srcFile = [IO.Path]::GetFileName($Source)
+        $dstFile = [IO.Path]::GetFileName($Dest)
+        $srcDir  = [IO.Path]::GetDirectoryName($Source)
+        if ($srcFile -ne $dstFile) {
+            # robocopy does not rename - copy then rename via cmd
+            $tmpDest = Join-Path $destDir $srcFile
+            $null = robocopy $srcDir $destDir $srcFile /R:3 /W:2 /NP /NJH /NJS 2>&1
+            if ($LASTEXITCODE -le 1 -and (Test-Path -LiteralPath $tmpDest)) {
+                $null = cmd /c "move /Y `"$tmpDest`" `"$Dest`"" 2>&1
+            }
+        }
+        else {
+            $null = robocopy $srcDir $destDir $srcFile /R:3 /W:2 /NP /NJH /NJS 2>&1
+        }
+        if (Test-Path -LiteralPath $Dest) { return }
+        $errors += "robocopy: exit $LASTEXITCODE"
+    }
+    catch {
+        $errors += "robocopy: $($_.Exception.Message)"
+    }
+
+    throw "Copy failed. Source=$Source Dest=$Dest Errors=$($errors -join ' | ')"
 }
 
 # ==============================================================================
@@ -514,21 +505,6 @@ $outDir = Join-Path $OutputPath $SpaceKey
 Ensure-DirectorySafe -Path $outDir
 Assert-DirectoryWritable -Path $outDir
 
-# Some synced SharePoint/OneDrive targets block .html writes while allowing .doc.
-# Probe once up front and select the safest fallback extension.
-$htmlFallbackExtension = '.html'
-$htmlProbe = Test-ExtensionWritable -Folder $outDir -Extension '.html'
-if (-not $htmlProbe.OK) {
-    $docProbe = Test-ExtensionWritable -Folder $outDir -Extension '.doc'
-    if ($docProbe.OK) {
-        $htmlFallbackExtension = '.doc'
-        Write-Host ("Notice: .html writes are blocked at target. HTML fallback will be saved as .doc. Reason: {0}" -f $htmlProbe.Message) -ForegroundColor Yellow
-    }
-    else {
-        Write-Host ("Warning: .html probe failed and .doc probe also failed. HTML fallback may fail. HTML reason: {0} | DOC reason: {1}" -f $htmlProbe.Message, $docProbe.Message) -ForegroundColor Yellow
-    }
-}
-
 # Fetch all pages (body.export_view pre-fetched - avoids extra API calls later)
 Write-Host ''
 Write-Host "Fetching pages from space '$SpaceKey'..." -ForegroundColor Yellow
@@ -634,7 +610,7 @@ foreach ($pg in $pages) {
 
     # --- HTML (fallback) ---
     if ($null -eq $result -or -not $result.OK) {
-        $htmlDest = Get-SafeOutputFilePath -Folder $folder -BaseName $baseName -Extension $htmlFallbackExtension
+        $htmlDest = Get-SafeOutputFilePath -Folder $folder -BaseName $baseName -Extension '.html'
 
         # Use body already fetched during page listing - no extra API call needed
         $body = $null
@@ -648,26 +624,10 @@ foreach ($pg in $pages) {
             }
         }
         catch {
-            if ($htmlFallbackExtension -eq '.html') {
-                try {
-                    $altDest = Get-SafeOutputFilePath -Folder $folder -BaseName $baseName -Extension '.doc'
-                    $result = Save-PageHtml -WikiBase $wiki -PageId $pg.id `
-                                  -PageTitle $pg.title -BodyHtml $body -DestPath $altDest
-                    Write-Host '  HTML write blocked; saved fallback content as DOC wrapper' -ForegroundColor Yellow
-                }
-                catch {
-                    $result = [PSCustomObject]@{ OK = $false; Fmt = $null; Path = $null }
-                    $pathLen = 0
-                    try { $pathLen = $htmlDest.Length } catch {}
-                    $reason = "HTML write failed (len=$pathLen): $($_.Exception.Message)"
-                }
-            }
-            else {
-                $result = [PSCustomObject]@{ OK = $false; Fmt = $null; Path = $null }
-                $pathLen = 0
-                try { $pathLen = $htmlDest.Length } catch {}
-                $reason = "Fallback write failed (len=$pathLen): $($_.Exception.Message)"
-            }
+            $result = [PSCustomObject]@{ OK = $false; Fmt = $null; Path = $null }
+            $pathLen = 0
+            try { $pathLen = $htmlDest.Length } catch {}
+            $reason = "HTML write failed (len=$pathLen): $($_.Exception.Message)"
         }
     }
 
