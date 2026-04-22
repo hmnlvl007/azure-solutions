@@ -134,6 +134,29 @@ function Assert-DirectoryWritable {
     }
 }
 
+function Test-ExtensionWritable {
+    param(
+        [string]$Folder,
+        [string]$Extension
+    )
+
+    $ext = if ([string]::IsNullOrWhiteSpace($Extension)) { '.tmp' }
+           elseif ($Extension.StartsWith('.')) { $Extension }
+           else { ".{0}" -f $Extension }
+
+    $probe = Join-Path $Folder ('.ext-probe-' + [Guid]::NewGuid().ToString('N') + $ext)
+    try {
+        [IO.File]::WriteAllText($probe, 'probe', [Text.Encoding]::ASCII)
+        return [PSCustomObject]@{ OK = $true; Message = '' }
+    }
+    catch {
+        return [PSCustomObject]@{ OK = $false; Message = $_.Exception.Message }
+    }
+    finally {
+        if (Test-Path $probe) { Remove-Item $probe -Force -ErrorAction SilentlyContinue }
+    }
+}
+
 function Ensure-DirectorySafe {
     param([string]$Path)
     for ($try = 1; $try -le 3; $try++) {
@@ -378,7 +401,9 @@ function Save-PageHtml {
     $html = $head + $body
 
     Write-FileSafe -Path $DestPath -Text $html
-    return [PSCustomObject]@{ OK = $true; Fmt = 'html'; Path = $DestPath }
+    $fmt = [IO.Path]::GetExtension($DestPath).TrimStart('.').ToLowerInvariant()
+    if ([string]::IsNullOrWhiteSpace($fmt)) { $fmt = 'html' }
+    return [PSCustomObject]@{ OK = $true; Fmt = $fmt; Path = $DestPath }
 }
 
 # ==============================================================================
@@ -489,6 +514,21 @@ $outDir = Join-Path $OutputPath $SpaceKey
 Ensure-DirectorySafe -Path $outDir
 Assert-DirectoryWritable -Path $outDir
 
+# Some synced SharePoint/OneDrive targets block .html writes while allowing .doc.
+# Probe once up front and select the safest fallback extension.
+$htmlFallbackExtension = '.html'
+$htmlProbe = Test-ExtensionWritable -Folder $outDir -Extension '.html'
+if (-not $htmlProbe.OK) {
+    $docProbe = Test-ExtensionWritable -Folder $outDir -Extension '.doc'
+    if ($docProbe.OK) {
+        $htmlFallbackExtension = '.doc'
+        Write-Host ("Notice: .html writes are blocked at target. HTML fallback will be saved as .doc. Reason: {0}" -f $htmlProbe.Message) -ForegroundColor Yellow
+    }
+    else {
+        Write-Host ("Warning: .html probe failed and .doc probe also failed. HTML fallback may fail. HTML reason: {0} | DOC reason: {1}" -f $htmlProbe.Message, $docProbe.Message) -ForegroundColor Yellow
+    }
+}
+
 # Fetch all pages (body.export_view pre-fetched - avoids extra API calls later)
 Write-Host ''
 Write-Host "Fetching pages from space '$SpaceKey'..." -ForegroundColor Yellow
@@ -594,7 +634,7 @@ foreach ($pg in $pages) {
 
     # --- HTML (fallback) ---
     if ($null -eq $result -or -not $result.OK) {
-        $htmlDest = Get-SafeOutputFilePath -Folder $folder -BaseName $baseName -Extension '.html'
+        $htmlDest = Get-SafeOutputFilePath -Folder $folder -BaseName $baseName -Extension $htmlFallbackExtension
 
         # Use body already fetched during page listing - no extra API call needed
         $body = $null
@@ -608,10 +648,26 @@ foreach ($pg in $pages) {
             }
         }
         catch {
-            $result = [PSCustomObject]@{ OK = $false; Fmt = $null; Path = $null }
-            $pathLen = 0
-            try { $pathLen = $htmlDest.Length } catch {}
-            $reason = "HTML write failed (len=$pathLen): $($_.Exception.Message)"
+            if ($htmlFallbackExtension -eq '.html') {
+                try {
+                    $altDest = Get-SafeOutputFilePath -Folder $folder -BaseName $baseName -Extension '.doc'
+                    $result = Save-PageHtml -WikiBase $wiki -PageId $pg.id `
+                                  -PageTitle $pg.title -BodyHtml $body -DestPath $altDest
+                    Write-Host '  HTML write blocked; saved fallback content as DOC wrapper' -ForegroundColor Yellow
+                }
+                catch {
+                    $result = [PSCustomObject]@{ OK = $false; Fmt = $null; Path = $null }
+                    $pathLen = 0
+                    try { $pathLen = $htmlDest.Length } catch {}
+                    $reason = "HTML write failed (len=$pathLen): $($_.Exception.Message)"
+                }
+            }
+            else {
+                $result = [PSCustomObject]@{ OK = $false; Fmt = $null; Path = $null }
+                $pathLen = 0
+                try { $pathLen = $htmlDest.Length } catch {}
+                $reason = "Fallback write failed (len=$pathLen): $($_.Exception.Message)"
+            }
         }
     }
 
