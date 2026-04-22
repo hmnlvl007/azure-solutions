@@ -124,16 +124,19 @@ function Assert-DirectoryWritable {
     try {
         [IO.File]::WriteAllText($localTmp, 'ok', [Text.Encoding]::ASCII)
         $null = cmd /c "copy /Y `"$localTmp`" `"$destProbe`"" 2>&1
-        if ($LASTEXITCODE -ne 0 -or -not (Test-Path -LiteralPath $destProbe)) {
+        if ($LASTEXITCODE -ne 0) {
             throw "cmd copy probe failed (exit $LASTEXITCODE)"
         }
+
     }
     catch {
         throw "Output path is not writable: $Path | $($_.Exception.Message)"
     }
     finally {
         if (Test-Path $localTmp) { Remove-Item $localTmp -Force -ErrorAction SilentlyContinue }
-        if (Test-Path $destProbe) { $null = cmd /c "del /F /Q `"$destProbe`"" 2>&1 }
+        # Do NOT use Test-Path on $destProbe - it is a \tsclient\ path and throws.
+        # Always attempt delete; cmd del silently ignores missing files.
+        $null = cmd /c "del /F /Q `"$destProbe`"" 2>&1
     }
 }
 
@@ -204,9 +207,12 @@ function Copy-FileSafe {
     }
 
     # Method 3: cmd.exe copy  (uses SMB-layer redirector - works on \\tsclient\)
+    # Do NOT call Test-Path against $Dest - on \\tsclient\ paths Test-Path itself
+    # throws "A device attached to the system is not functioning" uncaught.
+    # Trust exit code 0 as success.
     try {
         $null = cmd /c "copy /Y `"$Source`" `"$Dest`"" 2>&1
-        if ($LASTEXITCODE -eq 0 -and (Test-Path -LiteralPath $Dest)) { return }
+        if ($LASTEXITCODE -eq 0) { return }
         $errors += "cmd copy: exit $LASTEXITCODE"
     }
     catch {
@@ -214,22 +220,19 @@ function Copy-FileSafe {
     }
 
     # Method 4: robocopy  (most robust SMB-layer transfer)
+    # robocopy cannot rename; copy source file to dest dir under its own name,
+    # then use cmd move to rename to final dest name.
     try {
         $srcFile = [IO.Path]::GetFileName($Source)
-        $dstFile = [IO.Path]::GetFileName($Dest)
         $srcDir  = [IO.Path]::GetDirectoryName($Source)
-        if ($srcFile -ne $dstFile) {
-            # robocopy does not rename - copy then rename via cmd
-            $tmpDest = Join-Path $destDir $srcFile
-            $null = robocopy $srcDir $destDir $srcFile /R:3 /W:2 /NP /NJH /NJS 2>&1
-            if ($LASTEXITCODE -le 1 -and (Test-Path -LiteralPath $tmpDest)) {
+        $tmpDest = Join-Path $destDir $srcFile
+        $null = robocopy $srcDir $destDir $srcFile /R:2 /W:1 /NP /NJH /NJS 2>&1
+        if ($LASTEXITCODE -le 1) {
+            if ($srcFile -ne [IO.Path]::GetFileName($Dest)) {
                 $null = cmd /c "move /Y `"$tmpDest`" `"$Dest`"" 2>&1
             }
+            return
         }
-        else {
-            $null = robocopy $srcDir $destDir $srcFile /R:3 /W:2 /NP /NJH /NJS 2>&1
-        }
-        if (Test-Path -LiteralPath $Dest) { return }
         $errors += "robocopy: exit $LASTEXITCODE"
     }
     catch {
@@ -455,8 +458,10 @@ function Save-PageAttachments {
         }
     }
 
-    if ($n -eq 0 -and (Test-Path $dir)) {
-        Remove-Item $dir -Force -Recurse -ErrorAction SilentlyContinue
+    if ($n -eq 0) {
+        # Do NOT use Test-Path against \tsclient\ paths - it throws on RDP redirected drives.
+        # Attempt remove silently; it will no-op if dir does not exist.
+        try { Remove-Item $dir -Force -Recurse -ErrorAction SilentlyContinue } catch {}
     }
     return [PSCustomObject]@{ Count = $n; Bytes = $b }
 }
