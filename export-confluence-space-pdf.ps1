@@ -10,6 +10,8 @@ param(
 
 $ErrorActionPreference = 'Stop'
 
+$script:TempRoot = $null
+
 # ==============================================================================
 # HELPER FUNCTIONS
 # ==============================================================================
@@ -98,6 +100,54 @@ function Get-SafeOutputFilePath {
     return (Join-Path $Folder ($fallbackBase + $ext))
 }
 
+function Get-LocalTempRoot {
+    if (-not [string]::IsNullOrWhiteSpace($script:TempRoot)) {
+        return $script:TempRoot
+    }
+
+    $candidates = @(
+        $env:TEMP,
+        $env:TMP,
+        [IO.Path]::GetTempPath(),
+        $(if (-not [string]::IsNullOrWhiteSpace($env:LOCALAPPDATA)) { Join-Path $env:LOCALAPPDATA 'Temp' }),
+        $(if (-not [string]::IsNullOrWhiteSpace($env:USERPROFILE)) { Join-Path $env:USERPROFILE 'AppData\Local\Temp' }),
+        $(if (-not [string]::IsNullOrWhiteSpace($PSScriptRoot)) { Join-Path $PSScriptRoot '.tmp' })
+    ) | Where-Object { -not [string]::IsNullOrWhiteSpace($_) } | Select-Object -Unique
+
+    foreach ($dir in $candidates) {
+        $probe = $null
+        try {
+            [IO.Directory]::CreateDirectory($dir) | Out-Null
+            $probe = Join-Path $dir ('.probe-' + [Guid]::NewGuid().ToString('N') + '.tmp')
+            [IO.File]::WriteAllText($probe, 'ok', [Text.Encoding]::ASCII)
+            Remove-Item -LiteralPath $probe -Force -ErrorAction SilentlyContinue
+            $script:TempRoot = $dir
+            return $script:TempRoot
+        }
+        catch {
+            if ($probe) {
+                Remove-Item -LiteralPath $probe -Force -ErrorAction SilentlyContinue
+            }
+        }
+    }
+
+    throw 'Could not locate a writable local temp folder for staging export files.'
+}
+
+function New-LocalTempFilePath {
+    param(
+        [string]$Prefix = 'conf',
+        [string]$Extension = '.tmp'
+    )
+
+    $ext = if ([string]::IsNullOrWhiteSpace($Extension)) { '.tmp' }
+           elseif ($Extension.StartsWith('.')) { $Extension }
+           else { ".{0}" -f $Extension }
+
+    $name = '{0}-{1}{2}' -f $Prefix, [Guid]::NewGuid().ToString('N'), $ext
+    return (Join-Path (Get-LocalTempRoot) $name)
+}
+
 function Write-FileSafe {
     # Writes text via a local temp file then copies to destination with retries.
     # IMPORTANT: $tmp must be declared INSIDE the loop so each retry creates a
@@ -108,18 +158,20 @@ function Write-FileSafe {
     # still registering the directory. A short delay before retry succeeds.
     param([string]$Path, [string]$Text)
     for ($try = 1; $try -le 3; $try++) {
-        $tmp = [IO.Path]::Combine([IO.Path]::GetTempPath(), ([IO.Path]::GetRandomFileName() + '.tmp'))
+        $tmp = New-LocalTempFilePath -Prefix 'conf-write' -Extension '.tmp'
         try {
             [IO.File]::WriteAllText($tmp, $Text, [Text.Encoding]::UTF8)
             Copy-FileSafe -Source $tmp -Dest $Path
             return
         }
         catch {
-            if ($try -eq 3) { throw }
+            if ($try -eq 3) {
+                throw "File write failed. TempRoot=$(Get-LocalTempRoot) | $($_.Exception.Message)"
+            }
             Start-Sleep -Milliseconds (800 * $try)
         }
         finally {
-            if (Test-Path $tmp) { Remove-Item $tmp -Force -ErrorAction SilentlyContinue }
+            if (Test-Path -LiteralPath $tmp) { Remove-Item -LiteralPath $tmp -Force -ErrorAction SilentlyContinue }
         }
     }
 }
@@ -130,7 +182,7 @@ function Assert-DirectoryWritable {
     # Use a temp-file + cmd copy probe so this works on \\tsclient\ paths
     # where [IO.File]::WriteAllText fails with "device not functioning".
     $probeName = '.write-probe-' + [Guid]::NewGuid().ToString('N') + '.tmp'
-    $localTmp  = [IO.Path]::Combine([IO.Path]::GetTempPath(), $probeName)
+    $localTmp  = Join-Path (Get-LocalTempRoot) $probeName
     $destProbe = Join-Path $Path $probeName
     try {
         [IO.File]::WriteAllText($localTmp, 'ok', [Text.Encoding]::ASCII)
@@ -144,7 +196,7 @@ function Assert-DirectoryWritable {
         throw "Output path is not writable: $Path | $($_.Exception.Message)"
     }
     finally {
-        if (Test-Path $localTmp) { Remove-Item $localTmp -Force -ErrorAction SilentlyContinue }
+        if (Test-Path -LiteralPath $localTmp) { Remove-Item -LiteralPath $localTmp -Force -ErrorAction SilentlyContinue }
         # Do NOT use Test-Path on $destProbe - it is a \tsclient\ path and throws.
         # Always attempt delete; cmd del silently ignores missing files.
         $null = cmd /c "del /F /Q `"$destProbe`"" 2>&1
@@ -322,7 +374,7 @@ function Save-PageWord {
     )
 
     $url = "{0}/exportword?pageId={1}&os_authType=basic" -f $WikiBase, $PageId
-    $tmp = [IO.Path]::Combine([IO.Path]::GetTempPath(), "conf-word-$PageId.doc")
+    $tmp = New-LocalTempFilePath -Prefix "conf-word-$PageId" -Extension '.doc'
 
     $params = @{
         Uri                = $url
@@ -456,7 +508,7 @@ function Save-PageAttachments {
         if ([string]::IsNullOrWhiteSpace($base)) { $base = 'attachment' }
         $base = Get-CompactSafeName -Name $base -MaxLength 48
         $dest = Get-SafeOutputFilePath -Folder $dir -BaseName $base -Extension $ext
-        $tmp  = [IO.Path]::Combine([IO.Path]::GetTempPath(), "conf-att-$($att.id).tmp")
+        $tmp  = New-LocalTempFilePath -Prefix "conf-att-$($att.id)" -Extension '.tmp'
         $url  = "{0}{1}" -f $WikiBase, $dlPath
 
         try {
@@ -517,6 +569,7 @@ $homeId = Get-SpaceHomePageId -ApiBase $api -Space $SpaceKey -Headers $headers
 $outDir = Join-Path $OutputPath $SpaceKey
 Ensure-DirectorySafe -Path $outDir
 Assert-DirectoryWritable -Path $outDir
+Write-Host ("Temp staging: {0}" -f (Get-LocalTempRoot)) -ForegroundColor DarkGray
 
 # Fetch all pages (body.export_view pre-fetched - avoids extra API calls later)
 Write-Host ''
