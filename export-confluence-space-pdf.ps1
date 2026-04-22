@@ -99,23 +99,17 @@ function Get-SafeOutputFilePath {
 }
 
 function Write-FileSafe {
-    # Writes text via local temp file, then copies to destination with retries.
-    # This avoids direct WriteAllText calls against flaky network/redirected paths.
+    # Writes text to a local temp file first, then transfers to destination.
+    # The temp file must NOT be deleted inside the loop - Copy-FileSafe reads it
+    # on each attempt. Cleanup happens once after all retries complete.
     param([string]$Path, [string]$Text)
-    $tmp = [IO.Path]::Combine([IO.Path]::GetTempPath(), ([IO.Path]::GetRandomFileName() + '.txt'))
-    for ($try = 1; $try -le 3; $try++) {
-        try {
-            [IO.File]::WriteAllText($tmp, $Text, [Text.Encoding]::UTF8)
-            Copy-FileSafe -Source $tmp -Dest $Path
-            return
-        }
-        catch {
-            if ($try -eq 3) { throw }
-            Start-Sleep -Milliseconds (500 * $try)
-        }
-        finally {
-            if (Test-Path $tmp) { Remove-Item $tmp -Force -ErrorAction SilentlyContinue }
-        }
+    $tmp = [IO.Path]::Combine([IO.Path]::GetTempPath(), ([IO.Path]::GetRandomFileName() + '.tmp'))
+    try {
+        [IO.File]::WriteAllText($tmp, $Text, [Text.Encoding]::UTF8)
+        Copy-FileSafe -Source $tmp -Dest $Path
+    }
+    finally {
+        if (Test-Path $tmp) { Remove-Item $tmp -Force -ErrorAction SilentlyContinue }
     }
 }
 
