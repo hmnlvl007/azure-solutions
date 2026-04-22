@@ -101,6 +101,16 @@ function Get-SafeOutputFilePath {
     return (Join-Path $Folder ($fallbackBase + $ext))
 }
 
+function Get-MaxDirectoryPathLength {
+    param([string]$Path)
+
+    if (Test-IsTsClientPath -Path $Path) {
+        return 190
+    }
+
+    return 240
+}
+
 function Get-LocalTempRoot {
     if (-not [string]::IsNullOrWhiteSpace($script:TempRoot)) {
         return $script:TempRoot
@@ -182,6 +192,25 @@ function Remove-FileQuietly {
     }
 }
 
+function Test-DirectoryExistsSafe {
+    param([string]$Path)
+
+    if ([string]::IsNullOrWhiteSpace($Path)) { return $false }
+
+    try {
+        return [IO.Directory]::Exists($Path)
+    }
+    catch {
+        try {
+            $null = cmd /d /c "if exist `"$Path\NUL`" (exit 0) else (exit 1)" 2>$null
+            return ($LASTEXITCODE -eq 0)
+        }
+        catch {
+            return $false
+        }
+    }
+}
+
 function Write-FileSafe {
     # Writes text via a local temp file then copies to destination with retries.
     # IMPORTANT: $tmp must be declared INSIDE the loop so each retry creates a
@@ -219,6 +248,7 @@ function Assert-DirectoryWritable {
     $localTmp  = Join-Path (Get-LocalTempRoot) $probeName
     $destProbe = Join-Path $Path $probeName
     try {
+        Ensure-DirectorySafe -Path $Path
         [IO.File]::WriteAllText($localTmp, 'ok', [Text.Encoding]::ASCII)
         $null = cmd /c "copy /Y `"$localTmp`" `"$destProbe`"" 2>&1
         if ($LASTEXITCODE -ne 0) {
@@ -240,19 +270,39 @@ function Assert-DirectoryWritable {
 function Ensure-DirectorySafe {
     param([string]$Path)
 
-    if ([IO.Directory]::Exists($Path)) { return }
+    if (Test-DirectoryExistsSafe -Path $Path) { return }
 
-    # Try .NET first; fall back to cmd mkdir for \\tsclient\ paths where
-    # [IO.Directory]::CreateDirectory fails with "device not functioning".
-    try {
-        [IO.Directory]::CreateDirectory($Path) | Out-Null
-    }
-    catch {
-        $null = cmd /c "mkdir `"$Path`"" 2>&1
+    $errors = @()
+    for ($attempt = 1; $attempt -le 6; $attempt++) {
+        try {
+            [IO.Directory]::CreateDirectory($Path) | Out-Null
+        }
+        catch {
+            $errors += ("CreateDirectory try {0}: {1}" -f $attempt, $_.Exception.Message)
+        }
+
+        if (-not (Test-DirectoryExistsSafe -Path $Path)) {
+            try {
+                $null = cmd /d /c "mkdir `"$Path`"" 2>&1
+                if ($LASTEXITCODE -ne 0) {
+                    $errors += ("cmd mkdir try {0}: exit {1}" -f $attempt, $LASTEXITCODE)
+                }
+            }
+            catch {
+                $errors += ("cmd mkdir try {0}: {1}" -f $attempt, $_.Exception.Message)
+            }
+        }
+
+        if (Test-DirectoryExistsSafe -Path $Path) {
+            return
+        }
+
+        Start-Sleep -Milliseconds (300 * $attempt)
     }
 
-    if (-not [IO.Directory]::Exists($Path)) {
-        throw "Could not create directory: $Path"
+    if (-not (Test-DirectoryExistsSafe -Path $Path)) {
+        $detail = if ($errors.Count -gt 0) { " | " + ($errors -join ' | ') } else { '' }
+        throw ("Could not create directory: {0}{1}" -f $Path, $detail)
     }
 }
 
@@ -267,10 +317,9 @@ function Test-DirectoryWritable {
         return $true
     }
 
-    Ensure-DirectorySafe -Path $Path
-
     for ($try = 1; $try -le $MaxAttempts; $try++) {
         try {
+            Ensure-DirectorySafe -Path $Path
             Assert-DirectoryWritable -Path $Path
             $script:WritableDirectoryCache[$Path] = $true
             return $true
@@ -308,13 +357,7 @@ function Copy-FileSafe {
     # RDP redirected paths it can throw IOException uncaught (ERROR_DEV_NOT_EXIST).
     $destDir = [IO.Path]::GetDirectoryName($Dest)
     if (-not [string]::IsNullOrEmpty($destDir)) {
-        try {
-            [IO.Directory]::CreateDirectory($destDir) | Out-Null
-        }
-        catch {
-            # .NET mkdir failed (expected on \tsclient\) - fall back to cmd mkdir
-            $null = cmd /c "mkdir `"$destDir`"" 2>&1
-        }
+        Ensure-DirectorySafe -Path $destDir
         $null = Test-DirectoryWritable -Path $destDir
     }
 
@@ -438,26 +481,66 @@ function Get-ConfluencePages {
 }
 
 function Get-PageFolderPath {
-    # Windows dir path limit: 247 chars.
-    # Longest suffix appended to the folder after this function returns:
-    #   "\NNNN-<60charTitle>-attachments"  =  1 + 5 + 60 + 12 = 78 chars
-    # Therefore the folder itself must stay at or below 247 - 78 = 169 chars.
-    # NOTE: if $RootFolder is already >= 169 we cannot nest at all, but we still
-    # return it as-is; the attachments guard in Save-PageAttachments handles that.
+    # Keep enough headroom for the eventual page file / attachment folder.
     param($Ancestors, [string]$SpaceHomeId, [string]$RootFolder)
     $folder    = $RootFolder
-    $maxFolder = 169
+    $maxDirLen = Get-MaxDirectoryPathLength -Path $RootFolder
+    $reserved  = 80
+    $maxFolder = [Math]::Max($RootFolder.Length, ($maxDirLen - $reserved))
     if ($null -ne $Ancestors) {
         foreach ($a in $Ancestors) {
             if ([string]$a.id -eq $SpaceHomeId) { continue }
             if ($folder.Length -ge $maxFolder) { break }
-            $part      = Get-CompactSafeName -Name $a.title -MaxLength 50
+            $remaining = [Math]::Max(12, $maxFolder - $folder.Length - 1)
+            $part      = Get-CompactSafeName -Name $a.title -MaxLength ([Math]::Min(40, $remaining))
             $candidate = Join-Path $folder $part
             if ($candidate.Length -gt $maxFolder) { break }
             $folder = $candidate
         }
     }
     return $folder
+}
+
+function Get-AttachmentsFolderPath {
+    param(
+        [string]$PageFolder,
+        [string]$OutputRoot,
+        [string]$FileBaseName,
+        [string]$PageId
+    )
+
+    if (Test-IsTsClientPath -Path $OutputRoot) {
+        return (Join-Path (Join-Path $OutputRoot '_a') $PageId)
+    }
+
+    $maxDirLen = Get-MaxDirectoryPathLength -Path $OutputRoot
+
+    $localCandidates = @(
+        "$FileBaseName-attachments",
+        ((Get-CompactSafeName -Name $FileBaseName -MaxLength 24) + '-att'),
+        ($PageId + '-att')
+    )
+
+    foreach ($name in $localCandidates) {
+        $candidate = Join-Path $PageFolder $name
+        if ($candidate.Length -le $maxDirLen) {
+            return $candidate
+        }
+    }
+
+    $hubRoot = Join-Path $OutputRoot '_a'
+    $hubCandidates = @(
+        (Join-Path $hubRoot ($PageId + '-' + (Get-CompactSafeName -Name $FileBaseName -MaxLength 16))),
+        (Join-Path $hubRoot $PageId)
+    )
+
+    foreach ($candidate in $hubCandidates) {
+        if ($candidate.Length -le $maxDirLen) {
+            return $candidate
+        }
+    }
+
+    return (Join-Path $hubRoot ((Get-CompactSafeName -Name $PageId -MaxLength 12) + '-att'))
 }
 
 # ==============================================================================
@@ -572,7 +655,8 @@ function Save-PageAttachments {
         [string]$PageId,
         [hashtable]$Headers,
         [string]$PageFolder,
-        [string]$FileBaseName
+        [string]$FileBaseName,
+        [string]$OutputRoot
     )
 
     $uri = "{0}/content/{1}/child/attachment?limit=100" -f $ApiBase, $PageId
@@ -583,17 +667,21 @@ function Save-PageAttachments {
         return [PSCustomObject]@{ Count = 0; Bytes = [long]0 }
     }
 
-    # Build attachments subfolder, capping total dir path below the 247-char Windows limit.
-    # $FileBaseName can be up to 65 chars; adding "-attachments" makes the suffix 77 chars.
-    # If the combined path would exceed 240 (safe margin below 247), shorten the subfolder name.
-    $attSuffix = "$FileBaseName-attachments"
-    $dir = Join-Path $PageFolder $attSuffix
-    if ($dir.Length -gt 240) {
-        $headroom  = [Math]::Max(8, 240 - $PageFolder.Length - 5)  # 5 = separator + "-att"
-        $shortBase = Get-CompactSafeName -Name $FileBaseName -MaxLength $headroom
-        $dir       = Join-Path $PageFolder "$shortBase-att"
+    try {
+        $dir = Get-AttachmentsFolderPath -PageFolder $PageFolder -OutputRoot $OutputRoot `
+            -FileBaseName $FileBaseName -PageId $PageId
+        Ensure-DirectorySafe -Path $dir
     }
-    $null = Test-DirectoryWritable -Path $dir
+    catch {
+        try {
+            $fallbackDir = Join-Path (Join-Path $OutputRoot '_a') $PageId
+            Ensure-DirectorySafe -Path $fallbackDir
+            $dir = $fallbackDir
+        }
+        catch {
+            return [PSCustomObject]@{ Count = 0; Bytes = [long]0 }
+        }
+    }
 
     $n = 0
     $b = [long]0
@@ -715,7 +803,7 @@ foreach ($pg in $pages) {
     }
 
     # Verify the output folder is accessible before attempting writes
-    if (-not [IO.Directory]::Exists($folder)) {
+    if (-not (Test-DirectoryExistsSafe -Path $folder)) {
         $failed += [PSCustomObject]@{ Id = $pg.id; Title = $pg.title; Reason = "Output folder inaccessible or could not be created: $folder" }
         Write-Host ('  FAIL ({0}) | folder unavailable: {1}' -f $pg.id, $folder) -ForegroundColor Red
         continue
@@ -838,7 +926,7 @@ foreach ($pg in $pages) {
 
         # Download attachments
         $att = Save-PageAttachments -ApiBase $api -WikiBase $wiki -PageId $pg.id `
-                   -Headers $headers -PageFolder $folder -FileBaseName $baseName
+                   -Headers $headers -PageFolder $folder -FileBaseName $baseName -OutputRoot $outDir
         if ($att.Count -gt 0) {
             $attTotal  += $att.Count
             $attBytes  += $att.Bytes
