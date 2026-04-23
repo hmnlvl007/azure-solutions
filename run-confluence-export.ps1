@@ -1,61 +1,108 @@
 [CmdletBinding()]
-param()
+param(
+    [string]$ConfluenceBaseUrl = 'https://your-company.atlassian.net',
+    [string]$SpaceKey = 'DBA',
+    [string]$Email = 'you@your-company.com',
+    [string]$ApiToken = $env:CONFLUENCE_API_TOKEN,
+    [string]$ExportSubFolder = 'ConfluenceExports',
+    [ValidateSet('Incremental','Full')][string]$ExportMode = 'Incremental',
+    [ValidateRange(1,100)][int]$PageSize = 100
+)
 
 $ErrorActionPreference = 'Stop'
 
-# ---------------------------------------------------------------------------
-# OneDrive for Business path detection
-# $env:OneDriveCommercial  -> OneDrive for Business (syncs to SharePoint)
-# $env:OneDrive            -> fallback (personal OneDrive or older clients)
-# ---------------------------------------------------------------------------
-$oneDriveRoot = if (-not [string]::IsNullOrWhiteSpace($env:OneDriveCommercial)) {
-    $env:OneDriveCommercial
-} elseif (-not [string]::IsNullOrWhiteSpace($env:OneDrive)) {
-    $env:OneDrive
-} else {
-    $null
+function Resolve-OneDriveRoot {
+    $root = if (-not [string]::IsNullOrWhiteSpace($env:OneDriveCommercial)) {
+        $env:OneDriveCommercial
+    } elseif (-not [string]::IsNullOrWhiteSpace($env:OneDrive)) {
+        $env:OneDrive
+    } else {
+        $null
+    }
+
+    if ([string]::IsNullOrWhiteSpace($root) -or -not (Test-Path -LiteralPath $root)) {
+        throw (
+            'Cannot locate a synced OneDrive folder. ' +
+            'Sign into OneDrive for Business and confirm sync is active, ' +
+            'or set `$env:OneDriveCommercial` manually.'
+        )
+    }
+
+    return $root
 }
 
-if ([string]::IsNullOrWhiteSpace($oneDriveRoot) -or -not (Test-Path -LiteralPath $oneDriveRoot)) {
-    throw (
-        'Cannot locate a synced OneDrive folder. ' +
-        'Make sure OneDrive for Business is signed in and sync is active, ' +
-        'or set $env:OneDriveCommercial to the correct path manually.'
+function Assert-RequiredValue {
+    param(
+        [Parameter(Mandatory)][string]$Name,
+        [AllowNull()][AllowEmptyString()][string]$Value,
+        [string]$Hint = ''
     )
+
+    if ([string]::IsNullOrWhiteSpace($Value)) {
+        if ([string]::IsNullOrWhiteSpace($Hint)) {
+            throw "Missing required value: $Name"
+        }
+        throw "Missing required value: $Name. $Hint"
+    }
 }
 
-# Sub-folder inside OneDrive that will be synced to your SharePoint document library.
-# Change "ConfluenceExports" to match the SharePoint library / sub-folder name you pre-created.
-$exportSubFolder = 'ConfluenceExports'
-$resolvedOutputPath = Join-Path -Path $oneDriveRoot -ChildPath $exportSubFolder
+function Assert-NotPlaceholder {
+    param(
+        [Parameter(Mandatory)][string]$Name,
+        [AllowNull()][AllowEmptyString()][string]$Value,
+        [Parameter(Mandatory)][string[]]$BlockedValues,
+        [string]$Hint = ''
+    )
 
-Write-Host "OneDrive root : $oneDriveRoot"
-Write-Host "Export target : $resolvedOutputPath"
+    if ([string]::IsNullOrWhiteSpace($Value)) { return }
 
-# Edit these values once, then use this wrapper for manual or scheduled runs.
-$config = @{
-    ConfluenceBaseUrl = 'https://your-company.atlassian.net'
-    SpaceKey          = 'DBA'
-    Email             = 'you@your-company.com'
-    ApiToken          = $env:CONFLUENCE_API_TOKEN
-
-    # Automatically resolved to the OneDrive for Business folder above.
-    # Files placed here are synced to SharePoint by the OneDrive client.
-    OutputPath        = $resolvedOutputPath
-
-    PageSize          = 100
+    foreach ($blocked in $BlockedValues) {
+        if ($Value.Trim().ToLowerInvariant() -eq $blocked.Trim().ToLowerInvariant()) {
+            if ([string]::IsNullOrWhiteSpace($Hint)) {
+                throw "Invalid placeholder value for ${Name}: '$Value'"
+            }
+            throw "Invalid placeholder value for ${Name}: '$Value'. $Hint"
+        }
+    }
 }
 
-if ([string]::IsNullOrWhiteSpace($config.ApiToken)) {
-    throw 'CONFLUENCE_API_TOKEN is empty. Set it in your user environment variables before running this script.'
+try {
+    $oneDriveRoot = Resolve-OneDriveRoot
+    $resolvedOutputPath = Join-Path -Path $oneDriveRoot -ChildPath $ExportSubFolder
+    New-Item -ItemType Directory -Path $resolvedOutputPath -Force -ErrorAction Stop | Out-Null
+
+    Assert-RequiredValue -Name 'ConfluenceBaseUrl' -Value $ConfluenceBaseUrl
+    Assert-RequiredValue -Name 'SpaceKey' -Value $SpaceKey
+    Assert-RequiredValue -Name 'Email' -Value $Email
+    Assert-RequiredValue -Name 'ApiToken' -Value $ApiToken -Hint 'Set CONFLUENCE_API_TOKEN in your user environment variables.'
+
+    Assert-NotPlaceholder -Name 'ConfluenceBaseUrl' -Value $ConfluenceBaseUrl -BlockedValues @('https://your-company.atlassian.net') -Hint 'Set your actual Confluence Cloud URL.'
+    Assert-NotPlaceholder -Name 'Email' -Value $Email -BlockedValues @('you@your-company.com') -Hint 'Set your Atlassian account email.'
+
+    $scriptPath = Join-Path -Path $PSScriptRoot -ChildPath 'export-confluence-space-pdf.ps1'
+    if (-not (Test-Path -LiteralPath $scriptPath)) {
+        throw "Exporter script not found: $scriptPath"
+    }
+
+    Write-Host "OneDrive root : $oneDriveRoot"
+    Write-Host "Export target : $resolvedOutputPath"
+    Write-Host "Space key    : $SpaceKey"
+    Write-Host "Mode         : $ExportMode"
+
+    $exportArgs = @{
+        ConfluenceBaseUrl = $ConfluenceBaseUrl
+        SpaceKey          = $SpaceKey
+        Email             = $Email
+        ApiToken          = $ApiToken
+        OutputPath        = $resolvedOutputPath
+        PageSize          = $PageSize
+        ExportMode        = $ExportMode
+    }
+
+    & $scriptPath @exportArgs
+    exit $LASTEXITCODE
 }
-
-$scriptPath = Join-Path -Path $PSScriptRoot -ChildPath 'export-confluence-space-pdf.ps1'
-
-& $scriptPath `
-    -ConfluenceBaseUrl $config.ConfluenceBaseUrl `
-    -SpaceKey $config.SpaceKey `
-    -Email $config.Email `
-    -ApiToken $config.ApiToken `
-    -OutputPath $config.OutputPath `
-    -PageSize $config.PageSize
+catch {
+    Write-Error $_.Exception.Message
+    exit 1
+}
