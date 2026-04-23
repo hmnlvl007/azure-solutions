@@ -486,10 +486,13 @@ function Get-PageFolderPath {
     $folder    = $RootFolder
     $maxDirLen = Get-MaxDirectoryPathLength -Path $RootFolder
     $reserved  = 80
-    $maxFolder = [Math]::Max($RootFolder.Length, ($maxDirLen - $reserved))
+    # Cap at (maxDirLen - reserved) but never below root length + 1 so at
+    # least one subfolder level can always be added when ancestors exist.
+    $maxFolder = $maxDirLen - $reserved
     if ($null -ne $Ancestors) {
         foreach ($a in $Ancestors) {
             if ([string]$a.id -eq $SpaceHomeId) { continue }
+            # Stop adding depth only when the current folder already exceeds the cap
             if ($folder.Length -ge $maxFolder) { break }
             $remaining = [Math]::Max(12, $maxFolder - $folder.Length - 1)
             $part      = Get-CompactSafeName -Name $a.title -MaxLength ([Math]::Min(40, $remaining))
@@ -619,8 +622,9 @@ function Save-PageHtml {
     $head += 'h1{border-bottom:2px solid #0052CC;padding-bottom:.3em}'
     $head += 'h2,h3{color:#0052CC}'
     $head += 'a{color:#0052CC;text-decoration:underline}'
-    $head += 'table{border-collapse:collapse;max-width:100%;margin:1em 0}'
-    $head += 'th,td{border:1px solid #C1C7D0;padding:.5em .75em;text-align:left;word-wrap:break-word}'
+    $head += '.table-wrap{overflow-x:auto;-webkit-overflow-scrolling:touch;width:100%;margin:1em 0}'
+    $head += 'table{border-collapse:collapse;width:100%;table-layout:auto}'
+    $head += 'th,td{border:1px solid #C1C7D0;padding:.5em .75em;text-align:left;overflow-wrap:break-word;word-break:break-word;min-width:60px}'
     $head += 'th{background:#F4F5F7;font-weight:600}'
     $head += 'tr:nth-child(even){background:#FAFBFC}'
     $head += 'code,pre{background:#F4F5F7;border-radius:3px;font-size:.9em}'
@@ -629,13 +633,20 @@ function Save-PageHtml {
     $head += 'img{max-width:100%;height:auto}'
     $head += '.src{font-size:.85em;color:#6B778C;margin-bottom:1.5em}'
     $head += '.src a{color:#6B778C}'
-    $head += '@media print{body{margin:0}.src{display:none}}'
+    $head += '@media print{body{margin:0}.src{display:none}.table-wrap{overflow-x:visible}}'
     $head += '</style></head>'
+
+    # Wrap every table in a scrollable div so wide tables don't clip content
+    $wrappedBody = $BodyHtml
+    if (-not [string]::IsNullOrWhiteSpace($wrappedBody)) {
+        $wrappedBody = [regex]::Replace($wrappedBody, '(?i)<table', '<div class="table-wrap"><table')
+        $wrappedBody = [regex]::Replace($wrappedBody, '(?i)</table>', '</table></div>')
+    }
 
     $body  = '<body>'
     $body += '<h1>' + $safe + '</h1>'
     $body += '<div class="src">Source: <a href="' + $src + '">View in Confluence</a></div>'
-    $body += $BodyHtml
+    $body += $wrappedBody
     $body += '</body></html>'
 
     $html = $head + $body
