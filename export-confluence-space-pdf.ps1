@@ -683,7 +683,10 @@ foreach ($pg in $pages) {
                 if ($t -lt 3) { Start-Sleep -Milliseconds (1000 * $t) }
             }
         }
-        if ($null -eq $result -or -not $result.OK) { $reason = $wMsg; if ($wCode -gt 0) { $wordStreak++ } }
+        if ($null -eq $result -or -not $result.OK) {
+            $reason = $wMsg
+            if (-not $wordOff) { $wordStreak++ }
+        }
         if (-not $wordOff -and $wordStreak -ge 3) { $wordOff = $true; Write-Host '  Word failed 3x - switching to HTML' -ForegroundColor Yellow }
     }
 
