@@ -1,105 +1,76 @@
 [CmdletBinding()]
 param(
-    [string]$ConfluenceBaseUrl = 'https://your-company.atlassian.net',
-    [string]$SpaceKey = 'DBA',
-    [string]$Email = 'you@your-company.com',
-    [string]$ApiToken = $env:CONFLUENCE_API_TOKEN,
-    [string]$ExportSubFolder = 'ConfluenceExports',
-    [ValidateSet('Incremental','Full')][string]$ExportMode = 'Incremental',
-    [ValidateRange(1,100)][int]$PageSize = 100
+    [Parameter(Mandatory = $false)][string]$ConfluenceBaseUrl = 'https://your-company.atlassian.net',
+    [Parameter(Mandatory = $false)][string]$SpaceKey = 'DADS',
+    [Parameter(Mandatory = $false)][string]$Email = 'you@your-company.com',
+    [Parameter(Mandatory = $false)][string]$ApiToken = $env:CONFLUENCE_API_TOKEN,
+    [Parameter(Mandatory = $false)][string]$ExportSubFolder = 'ConfluenceExports',
+    [Parameter(Mandatory = $false)][ValidateSet('Incremental','Full')][string]$ExportMode = 'Incremental',
+    [Parameter(Mandatory = $false)][ValidateRange(1,100)][int]$PageSize = 100
 )
 
 $ErrorActionPreference = 'Stop'
 
 function Resolve-OneDriveRoot {
-    $root = if (-not [string]::IsNullOrWhiteSpace($env:OneDriveCommercial)) {
-        $env:OneDriveCommercial
-    } elseif (-not [string]::IsNullOrWhiteSpace($env:OneDrive)) {
-        $env:OneDrive
-    } else {
-        $null
+    if (-not [string]::IsNullOrWhiteSpace($env:OneDriveCommercial) -and (Test-Path -LiteralPath $env:OneDriveCommercial)) {
+        return $env:OneDriveCommercial
     }
-
-    if ([string]::IsNullOrWhiteSpace($root) -or -not (Test-Path -LiteralPath $root)) {
-        throw (
-            'Cannot locate a synced OneDrive folder. ' +
-            'Sign into OneDrive for Business and confirm sync is active, ' +
-            'or set `$env:OneDriveCommercial` manually.'
-        )
+    if (-not [string]::IsNullOrWhiteSpace($env:OneDrive) -and (Test-Path -LiteralPath $env:OneDrive)) {
+        return $env:OneDrive
     }
-
-    return $root
+    throw 'Cannot locate OneDrive root. Sign into OneDrive for Business or set $env:OneDriveCommercial.'
 }
 
-function Assert-RequiredValue {
+function Assert-Value {
     param(
         [Parameter(Mandatory)][string]$Name,
         [AllowNull()][AllowEmptyString()][string]$Value,
-        [string]$Hint = ''
+        [Parameter(Mandatory)][string]$Message
     )
 
     if ([string]::IsNullOrWhiteSpace($Value)) {
-        if ([string]::IsNullOrWhiteSpace($Hint)) {
-            throw "Missing required value: $Name"
-        }
-        throw "Missing required value: $Name. $Hint"
-    }
-}
-
-function Assert-NotPlaceholder {
-    param(
-        [Parameter(Mandatory)][string]$Name,
-        [AllowNull()][AllowEmptyString()][string]$Value,
-        [Parameter(Mandatory)][string[]]$BlockedValues,
-        [string]$Hint = ''
-    )
-
-    if ([string]::IsNullOrWhiteSpace($Value)) { return }
-
-    foreach ($blocked in $BlockedValues) {
-        if ($Value.Trim().ToLowerInvariant() -eq $blocked.Trim().ToLowerInvariant()) {
-            if ([string]::IsNullOrWhiteSpace($Hint)) {
-                throw "Invalid placeholder value for ${Name}: '$Value'"
-            }
-            throw "Invalid placeholder value for ${Name}: '$Value'. $Hint"
-        }
+        throw "$Name is required. $Message"
     }
 }
 
 try {
+    Assert-Value -Name 'ConfluenceBaseUrl' -Value $ConfluenceBaseUrl -Message 'Set your Confluence Cloud URL.'
+    Assert-Value -Name 'SpaceKey' -Value $SpaceKey -Message 'Set the target Confluence space key.'
+    Assert-Value -Name 'Email' -Value $Email -Message 'Set your Atlassian login email.'
+    Assert-Value -Name 'ApiToken' -Value $ApiToken -Message 'Set CONFLUENCE_API_TOKEN in your user environment variables.'
+
+    if ($ConfluenceBaseUrl -eq 'https://your-company.atlassian.net') {
+        throw 'ConfluenceBaseUrl is still the placeholder value. Update it first.'
+    }
+    if ($Email -eq 'you@your-company.com') {
+        throw 'Email is still the placeholder value. Update it first.'
+    }
+
     $oneDriveRoot = Resolve-OneDriveRoot
-    $resolvedOutputPath = Join-Path -Path $oneDriveRoot -ChildPath $ExportSubFolder
-    New-Item -ItemType Directory -Path $resolvedOutputPath -Force -ErrorAction Stop | Out-Null
+    $outputRoot = Join-Path -Path $oneDriveRoot -ChildPath $ExportSubFolder
+    New-Item -ItemType Directory -Path $outputRoot -Force | Out-Null
 
-    Assert-RequiredValue -Name 'ConfluenceBaseUrl' -Value $ConfluenceBaseUrl
-    Assert-RequiredValue -Name 'SpaceKey' -Value $SpaceKey
-    Assert-RequiredValue -Name 'Email' -Value $Email
-    Assert-RequiredValue -Name 'ApiToken' -Value $ApiToken -Hint 'Set CONFLUENCE_API_TOKEN in your user environment variables.'
-
-    Assert-NotPlaceholder -Name 'ConfluenceBaseUrl' -Value $ConfluenceBaseUrl -BlockedValues @('https://your-company.atlassian.net') -Hint 'Set your actual Confluence Cloud URL.'
-    Assert-NotPlaceholder -Name 'Email' -Value $Email -BlockedValues @('you@your-company.com') -Hint 'Set your Atlassian account email.'
-
-    $scriptPath = Join-Path -Path $PSScriptRoot -ChildPath 'export-confluence-space-pdf.ps1'
-    if (-not (Test-Path -LiteralPath $scriptPath)) {
-        throw "Exporter script not found: $scriptPath"
+    $exporterPath = Join-Path -Path $PSScriptRoot -ChildPath 'export-confluence-space-pdf.ps1'
+    if (-not (Test-Path -LiteralPath $exporterPath)) {
+        throw "Exporter script not found: $exporterPath"
     }
 
     Write-Host "OneDrive root : $oneDriveRoot"
-    Write-Host "Export target : $resolvedOutputPath"
-    Write-Host "Space key    : $SpaceKey"
-    Write-Host "Mode         : $ExportMode"
+    Write-Host "Export target : $outputRoot"
+    Write-Host "Space key     : $SpaceKey"
+    Write-Host "Mode          : $ExportMode"
 
-    $exportArgs = @{
+    $params = @{
         ConfluenceBaseUrl = $ConfluenceBaseUrl
         SpaceKey          = $SpaceKey
         Email             = $Email
         ApiToken          = $ApiToken
-        OutputPath        = $resolvedOutputPath
+        OutputPath        = $outputRoot
         PageSize          = $PageSize
         ExportMode        = $ExportMode
     }
 
-    & $scriptPath @exportArgs
+    & $exporterPath @params
     exit $LASTEXITCODE
 }
 catch {
