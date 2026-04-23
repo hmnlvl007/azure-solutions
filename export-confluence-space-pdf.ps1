@@ -220,6 +220,49 @@ function Get-PageBodyHtml {
     return [string]$response.body.export_view.value
 }
 
+function Get-ResolvedAncestors {
+    param(
+        [object]$Page,
+        [string]$ApiBase,
+        [hashtable]$Headers,
+        [hashtable]$AncestorCache
+    )
+
+    $pageId = ''
+    try { $pageId = [string]$Page.id } catch { $pageId = '' }
+
+    if (-not [string]::IsNullOrWhiteSpace($pageId) -and $AncestorCache.ContainsKey($pageId)) {
+        return @($AncestorCache[$pageId])
+    }
+
+    if ([string]::IsNullOrWhiteSpace($pageId)) {
+        return @()
+    }
+
+    $inlineAncestors = $null
+    try { $inlineAncestors = $Page.ancestors } catch { $inlineAncestors = $null }
+    if ($null -ne $inlineAncestors -and $null -ne $inlineAncestors.results) {
+        $inlineAncestors = $inlineAncestors.results
+    }
+
+    try {
+        $uri = "$ApiBase/content/$pageId?expand=ancestors"
+        $fullPage = Invoke-RestMethod -Uri $uri -Method Get -Headers $Headers -ErrorAction Stop
+        $resolved = $fullPage.ancestors
+        if ($null -ne $resolved -and $null -ne $resolved.results) {
+            $resolved = $resolved.results
+        }
+        $resolvedArray = @($resolved)
+        $AncestorCache[$pageId] = $resolvedArray
+        return $resolvedArray
+    }
+    catch {
+        $fallback = @($inlineAncestors)
+        $AncestorCache[$pageId] = $fallback
+        return $fallback
+    }
+}
+
 function Save-WordExport {
     param(
         [string]$WikiBase,
@@ -308,8 +351,34 @@ function Save-HtmlFallback {
     h1 { border-bottom: 1px solid #DFE1E6; padding-bottom: 8px; }
     .source { margin: 12px 0 24px; color: #505F79; font-size: 12px; }
     img { max-width: 100%; height: auto; }
-    table { border-collapse: collapse; width: 100%; }
-    th, td { border: 1px solid #C1C7D0; padding: 6px 8px; text-align: left; }
+        table, .confluenceTable {
+            border-collapse: collapse;
+            border-spacing: 0;
+            width: 100%;
+            table-layout: auto;
+            margin: 12px 0;
+            font-size: 12px;
+        }
+        th, td, .confluenceTh, .confluenceTd {
+            border: 1px solid #C1C7D0;
+            padding: 6px 8px;
+            text-align: left;
+            vertical-align: top;
+            word-break: break-word;
+            overflow-wrap: anywhere;
+        }
+        th, .confluenceTh {
+            background: #F4F5F7;
+            font-weight: 600;
+        }
+        tr { page-break-inside: avoid; }
+        @media print {
+            thead { display: table-header-group; }
+            tfoot { display: table-footer-group; }
+            table { page-break-inside: auto; }
+            tr { page-break-inside: avoid; page-break-after: auto; }
+            th, td { white-space: normal; }
+        }
   </style>
 </head>
 <body>
@@ -460,6 +529,7 @@ $wordDisabled = $false
 $wordFailureStreak = 0
 $currentPages = [System.Collections.Generic.List[object]]::new()
 $currentIds = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
+$ancestorCache = @{}
 
 $index = 0
 foreach ($page in $pages) {
@@ -475,10 +545,7 @@ foreach ($page in $pages) {
 
     $null = $currentIds.Add($pageId)
 
-    $ancestors = $page.ancestors
-    if ($null -ne $ancestors -and $null -ne $ancestors.results) {
-        $ancestors = $ancestors.results
-    }
+    $ancestors = Get-ResolvedAncestors -Page $page -ApiBase $apiBase -Headers $headers -AncestorCache $ancestorCache
 
     $folder = Get-PageFolder -Ancestors @($ancestors) -HomePageId $homePageId -Root $spaceRoot
     Ensure-Directory -Path $folder
