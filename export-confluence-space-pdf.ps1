@@ -61,7 +61,7 @@ function Get-CompactName {
 function Ensure-Directory {
     param([string]$Path)
     if (-not (Test-Path -LiteralPath $Path)) {
-        New-Item -ItemType Directory -Path $Path -Force | Out-Null
+        New-Item -ItemType Directory -LiteralPath $Path -Force | Out-Null
     }
 }
 
@@ -392,6 +392,8 @@ function Save-HtmlFallback {
 </html>
 "@
 
+    $destDir = Split-Path -LiteralPath $DestinationPath -Parent
+    if (-not [string]::IsNullOrWhiteSpace($destDir)) { Ensure-Directory -Path $destDir }
     [IO.File]::WriteAllText($DestinationPath, $html, [Text.Encoding]::UTF8)
     return [PSCustomObject]@{ Success = $true; Reason = '' }
 }
@@ -431,7 +433,7 @@ function Save-Attachments {
         try { $downloadPath = [string]$item._links.download } catch { $downloadPath = $null }
         if ([string]::IsNullOrWhiteSpace($downloadPath)) { continue }
 
-        $fileName = Get-SafeFileName -Name ([string]$item.title)
+        $fileName = Get-CompactName -Name ([string]$item.title) -MaxLength 80
         $filePath = Join-Path -Path $attachmentFolder -ChildPath $fileName
         $tempFile = Join-Path -Path ([IO.Path]::GetTempPath()) -ChildPath ("cf-att-$([Guid]::NewGuid().ToString('N')).tmp")
 
