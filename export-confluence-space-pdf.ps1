@@ -5,7 +5,8 @@ param(
     [Parameter(Mandatory)][string]$Email,
     [Parameter(Mandatory)][string]$ApiToken,
     [Parameter(Mandatory)][string]$OutputPath,
-    [int]$PageSize = 50
+    [int]$PageSize = 50,
+    [ValidateSet('Incremental','Full')][string]$ExportMode = 'Incremental'
 )
 
 $ErrorActionPreference = 'Stop'
@@ -139,6 +140,29 @@ function Ensure-DirectorySafe {
     if (-not (Test-DirectoryExistsSafe -Path $Path)) { throw "Could not create directory: $Path" }
 }
 
+function Remove-DirectoryTreeSafe {
+    param([string]$Path)
+    if ([string]::IsNullOrWhiteSpace($Path)) { return }
+    if (-not (Test-DirectoryExistsSafe -Path $Path)) { return }
+
+    for ($i = 1; $i -le 5; $i++) {
+        try {
+            Remove-Item -LiteralPath $Path -Recurse -Force -ErrorAction Stop
+        } catch {}
+
+        if (-not (Test-DirectoryExistsSafe -Path $Path)) { return }
+
+        try { $null = cmd /d /c "rmdir /S /Q `"$Path`"" 2>&1 } catch {}
+        if (-not (Test-DirectoryExistsSafe -Path $Path)) { return }
+
+        Start-Sleep -Milliseconds (600 * $i)
+    }
+
+    if (Test-DirectoryExistsSafe -Path $Path) {
+        throw "Could not remove existing output directory: $Path"
+    }
+}
+
 function Copy-FileSafe {
     param([string]$Source, [string]$Dest)
     $destDir = [IO.Path]::GetDirectoryName($Dest)
@@ -187,6 +211,27 @@ function Write-FileSafe {
             if (Test-Path -LiteralPath $tmp) { Remove-Item -LiteralPath $tmp -Force -ErrorAction SilentlyContinue }
         }
     }
+}
+
+function Read-JsonFileSafe {
+    param([string]$Path)
+    if ([string]::IsNullOrWhiteSpace($Path)) { return $null }
+    if (-not (Test-Path -LiteralPath $Path)) { return $null }
+    try {
+        $raw = Get-Content -LiteralPath $Path -Raw -Encoding UTF8 -ErrorAction Stop
+        if ([string]::IsNullOrWhiteSpace($raw)) { return $null }
+        return ($raw | ConvertFrom-Json -Depth 20)
+    } catch {
+        Write-Host ("  Warning: unable to read JSON file: {0}" -f $Path) -ForegroundColor Yellow
+        return $null
+    }
+}
+
+function Remove-FileIfExistsSafe {
+    param([string]$Path)
+    if ([string]::IsNullOrWhiteSpace($Path)) { return }
+    if (-not (Test-Path -LiteralPath $Path)) { return }
+    try { Remove-Item -LiteralPath $Path -Force -ErrorAction Stop } catch { Remove-FileQuietly -Path $Path }
 }
 
 function Test-DirectoryWritable {
@@ -278,6 +323,109 @@ function Get-PageFolderPath {
         }
     }
     return $folder
+}
+
+function Resolve-PageIdentity {
+    param($Page, [int]$Index = 0)
+
+    $id = $null
+    $idCandidates = @(
+        (try { $Page.id } catch { $null }),
+        (try { $Page.pageId } catch { $null }),
+        (try { $Page.contentId } catch { $null }),
+        (try { $Page.content.id } catch { $null })
+    )
+    foreach ($c in $idCandidates) {
+        if (-not [string]::IsNullOrWhiteSpace([string]$c)) {
+            $id = [string]$c
+            break
+        }
+    }
+
+    $title = $null
+    $titleCandidates = @(
+        (try { $Page.title } catch { $null }),
+        (try { $Page.name } catch { $null }),
+        (try { $Page.content.title } catch { $null })
+    )
+    foreach ($c in $titleCandidates) {
+        if (-not [string]::IsNullOrWhiteSpace([string]$c)) {
+            $title = [string]$c
+            break
+        }
+    }
+
+    if ([string]::IsNullOrWhiteSpace($title)) {
+        $title = if ($Index -gt 0) { "Untitled page $Index" } else { 'Untitled page' }
+    }
+
+    return [PSCustomObject]@{ Id = $id; Title = $title }
+}
+
+function Initialize-HierarchyFolders {
+    # Pre-creates folder paths needed to mirror the Confluence tree.
+    # 1) Every ancestor chain target folder used by exported pages.
+    # 2) Any page that acts as a parent for other pages gets its own folder node.
+    param([object[]]$Pages, [string]$HomeId, [string]$Root)
+
+    $pageById  = @{}
+    $parentIds = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
+
+    foreach ($p in $Pages) {
+        $id = [string]$p.id
+        if (-not [string]::IsNullOrWhiteSpace($id) -and -not $pageById.ContainsKey($id)) {
+            $pageById[$id] = $p
+        }
+
+        $anc = $p.ancestors
+        if ($null -ne $anc -and $null -ne $anc.results) { $anc = $anc.results }
+        foreach ($a in @($anc)) {
+            $aid = [string]$a.id
+            if (-not [string]::IsNullOrWhiteSpace($aid) -and $aid -ne $HomeId) {
+                $null = $parentIds.Add($aid)
+            }
+        }
+    }
+
+    $seen = @{}
+    $created = 0
+    $maxDir = (Get-MaxDirPathLength -Path $Root) - 80
+
+    foreach ($p in $Pages) {
+        $anc = $p.ancestors
+        if ($null -ne $anc -and $null -ne $anc.results) { $anc = $anc.results }
+        $folder = Get-PageFolderPath -Ancestors $anc -HomeId $HomeId -Root $Root
+        if (-not $seen.ContainsKey($folder)) {
+            $null = Test-DirectoryWritable -Path $folder
+            $seen[$folder] = $true
+            $created++
+        }
+    }
+
+    foreach ($pid in $parentIds) {
+        if (-not $pageById.ContainsKey($pid)) { continue }
+        $parentPage = $pageById[$pid]
+        $title = [string]$parentPage.title
+        if ([string]::IsNullOrWhiteSpace($title)) { $title = "page-$pid" }
+
+        $anc = $parentPage.ancestors
+        if ($null -ne $anc -and $null -ne $anc.results) { $anc = $anc.results }
+        $baseFolder = Get-PageFolderPath -Ancestors $anc -HomeId $HomeId -Root $Root
+        if ($baseFolder.Length -ge $maxDir) { continue }
+
+        $remaining = [Math]::Max(12, $maxDir - $baseFolder.Length - 1)
+        $part = Get-CompactSafeName -Name $title -MaxLength ([Math]::Min(60, $remaining))
+        $folder = Join-Path $baseFolder $part
+        if ($folder.Length -gt $maxDir) { continue }
+
+        if (-not $seen.ContainsKey($folder)) {
+            $null = Test-DirectoryWritable -Path $folder
+            $seen[$folder] = $true
+            $created++
+        }
+    }
+
+    return [PSCustomObject]@{ Created = $created; ParentNodes = $parentIds.Count }
 }
 
 # ==============================================================================
@@ -404,7 +552,28 @@ $homeId = Get-SpaceHomePageId -ApiBase $api -Space $SpaceKey -Headers $headers
 Write-Host "  Home page ID: $homeId" -ForegroundColor DarkGray
 
 $outDir = Join-Path $OutputPath $SpaceKey
-$null   = Test-DirectoryWritable -Path $outDir
+if ($ExportMode -eq 'Full') {
+    Write-Host 'Resetting output folder for a full refresh export...' -ForegroundColor DarkCyan
+    if (Test-DirectoryExistsSafe -Path $outDir) {
+        Remove-DirectoryTreeSafe -Path $outDir
+    }
+} else {
+    Write-Host 'Running incremental export (changed/new pages only)...' -ForegroundColor DarkCyan
+}
+$null = Test-DirectoryWritable -Path $outDir
+$statePath = Join-Path $outDir 'export-state.json'
+
+$prevStateById = @{}
+if ($ExportMode -eq 'Incremental') {
+    $prevState = Read-JsonFileSafe -Path $statePath
+    $prevPages = @()
+    if ($null -ne $prevState) { $prevPages = @($prevState.pages) }
+    foreach ($sp in $prevPages) {
+        $sid = [string]$sp.id
+        if (-not [string]::IsNullOrWhiteSpace($sid)) { $prevStateById[$sid] = $sp }
+    }
+    Write-Host ("  Previous state entries: {0}" -f $prevStateById.Count) -ForegroundColor DarkGray
+}
 Write-Host "Output root  : $outDir"
 Write-Host "Temp staging : $(Get-LocalTempRoot)" -ForegroundColor DarkGray
 
@@ -418,17 +587,33 @@ if ($pages.Count -eq 0) {
 }
 Write-Host "Found $($pages.Count) pages." -ForegroundColor Green
 Write-Host 'Strategy: Word (.doc) primary, HTML fallback + attachments' -ForegroundColor Green
+Write-Host 'Materializing folder hierarchy from page ancestry...' -ForegroundColor DarkCyan
+$hier = Initialize-HierarchyFolders -Pages $pages -HomeId $homeId -Root $outDir
+Write-Host ("  Ready folders: {0} (parent nodes: {1})" -f $hier.Created, $hier.ParentNodes) -ForegroundColor DarkGray
 Write-Host ''
 
-$idx = 0; $failed = @(); $fmts = @{ doc = 0; html = 0 }
+$idx = 0; $failed = @(); $skipped = @(); $fmts = @{ doc = 0; html = 0 }; $unchanged = 0
 $bytes = [long]0; $attTotal = 0; $attBytes = [long]0
 $t0 = [DateTime]::UtcNow; $wordOff = $false; $wordStreak = 0
+$currentStatePages = [System.Collections.Generic.List[object]]::new()
+$currentPageIds = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
 
 foreach ($pg in $pages) {
     $idx++
     $ps       = [DateTime]::UtcNow
-    $safeName = Get-CompactSafeName -Name $pg.title -MaxLength 60
-    $baseName = '{0:D4}-{1}' -f $idx, $safeName
+    $identity = Resolve-PageIdentity -Page $pg -Index $idx
+    $pageId   = $identity.Id
+    $pageTitle = $identity.Title
+    $safeName = Get-CompactSafeName -Name $pageTitle -MaxLength 52
+    $baseName = '{0}-{1}' -f $safeName, $pageId
+
+    if ([string]::IsNullOrWhiteSpace($pageId)) {
+        $failed += [PSCustomObject]@{ Id = '(unknown)'; Title = $pageTitle; Reason = 'missing page id in API response' }
+        Write-Host ("  FAIL ({0}) missing page id in API response" -f $pageTitle) -ForegroundColor Red
+        continue
+    }
+
+    $null = $currentPageIds.Add($pageId)
 
     $ancestors = $pg.ancestors
     if ($null -ne $ancestors -and $null -ne $ancestors.results) { $ancestors = $ancestors.results }
@@ -437,8 +622,8 @@ foreach ($pg in $pages) {
     $folder = Get-PageFolderPath -Ancestors $ancestors -HomeId $homeId -Root $outDir
     try { $null = Test-DirectoryWritable -Path $folder }
     catch {
-        $failed += [PSCustomObject]@{ Id = $pg.id; Title = $pg.title; Reason = "folder: $($_.Exception.Message)" }
-        Write-Host ("  FAIL ({0}) folder: {1}" -f $pg.id, $_.Exception.Message) -ForegroundColor Red
+        $failed += [PSCustomObject]@{ Id = $pageId; Title = $pageTitle; Reason = "folder: $($_.Exception.Message)" }
+        Write-Host ("  FAIL ({0}) folder: {1}" -f $pageId, $_.Exception.Message) -ForegroundColor Red
         continue
     }
 
@@ -450,17 +635,44 @@ foreach ($pg in $pages) {
                    ' | ETA {0:hh\:mm\:ss}' -f [TimeSpan]::FromSeconds([math]::Round($avg * ($pages.Count - $idx + 1)))
                } else { '' }
     $ancInfo = if ($ancCount -gt 0) { " | anc:$ancCount" } else { '' }
-    Write-Host ("[{0}/{1} {2}%{3}{4}] {5}" -f $idx, $pages.Count, $pct, $eta, $ancInfo, $pg.title) -ForegroundColor Cyan
+    Write-Host ("[{0}/{1} {2}%{3}{4}] {5}" -f $idx, $pages.Count, $pct, $eta, $ancInfo, $pageTitle) -ForegroundColor Cyan
+
+    $expectedPath = Get-SafeOutputFilePath -Folder $folder -BaseName $baseName -Extension '.doc'
+    $currentVersion = 0
+    try { $currentVersion = [int]$pg.version.number } catch { $currentVersion = 0 }
+
+    $prev = $null
+    if ($prevStateById.ContainsKey($pageId)) { $prev = $prevStateById[$pageId] }
+
+    if ($ExportMode -eq 'Incremental' -and $null -ne $prev) {
+        $prevVersion = 0
+        try { $prevVersion = [int]$prev.version } catch { $prevVersion = 0 }
+        $prevPath = [string]$prev.outputPath
+        $sameVersion = ($prevVersion -eq $currentVersion)
+        $samePath = (-not [string]::IsNullOrWhiteSpace($prevPath) -and ($prevPath -eq $expectedPath))
+        if ($sameVersion -and $samePath -and (Test-Path -LiteralPath $expectedPath)) {
+            $unchanged++
+            $sz = 0; try { $sz = (Get-Item -LiteralPath $expectedPath -ErrorAction Stop).Length } catch {}
+            $bytes += $sz
+            Write-Host ("  KEEP unchanged v{0} | {1}" -f $currentVersion, $rel) -ForegroundColor DarkGreen
+            $currentStatePages.Add([PSCustomObject]@{
+                id = $pageId; title = $pageTitle; version = $currentVersion
+                outputPath = $expectedPath; folder = $folder; baseName = $baseName
+                format = [string]$prev.format; attachmentsPath = [string]$prev.attachmentsPath
+            }) | Out-Null
+            continue
+        }
+    }
 
     $result = $null; $reason = ''
 
     # --- Word (primary) ---
     if (-not $wordOff) {
-        $docDest = Get-SafeOutputFilePath -Folder $folder -BaseName $baseName -Extension '.doc'
+        $docDest = $expectedPath
         $wCode = 0; $wMsg = ''
         for ($t = 1; $t -le 3; $t++) {
             try {
-                $result = Save-PageWord -WikiBase $wiki -PageId $pg.id -Headers $headers -DestPath $docDest -Session $session
+                $result = Save-PageWord -WikiBase $wiki -PageId $pageId -Headers $headers -DestPath $docDest -Session $session
                 if ($result.OK) { $wordStreak = 0; $wMsg = ''; break }
                 $result = $null; $wMsg = 'empty/undersized response'
                 if ($t -lt 3) { Start-Sleep -Milliseconds (1000 * $t) }
@@ -477,10 +689,10 @@ foreach ($pg in $pages) {
 
     # --- HTML fallback ---
     if ($null -eq $result -or -not $result.OK) {
-        $htmlDest = Get-SafeOutputFilePath -Folder $folder -BaseName $baseName -Extension '.doc'
-        $body     = Get-PageBodyHtml -ApiBase $api -PageId $pg.id -Headers $headers
+        $htmlDest = $expectedPath
+        $body     = Get-PageBodyHtml -ApiBase $api -PageId $pageId -Headers $headers
         try {
-            $result = Save-PageHtml -WikiBase $wiki -PageId $pg.id -PageTitle $pg.title -BodyHtml $body -DestPath $htmlDest
+            $result = Save-PageHtml -WikiBase $wiki -PageId $pageId -PageTitle $pageTitle -BodyHtml $body -DestPath $htmlDest
             if (-not $result.OK -and $result.Fmt -eq 'empty') { $reason = 'empty page (container/parent)' }
         } catch {
             $result = [PSCustomObject]@{ OK = $false; Fmt = $null; Path = $null }
@@ -497,20 +709,45 @@ foreach ($pg in $pages) {
         $szStr = if ($sz -ge 1MB) { '{0:N1} MB' -f ($sz/1MB) } elseif ($sz -ge 1KB) { '{0:N0} KB' -f ($sz/1KB) } else { "$sz B" }
         Write-Host ("  OK   {0} | {1} | {2:N1}s | {3}" -f $result.Fmt.ToUpper().PadRight(4), $szStr, $dur, $rel) -ForegroundColor Green
 
-        $att = Save-PageAttachments -ApiBase $api -WikiBase $wiki -PageId $pg.id `
+        $att = Save-PageAttachments -ApiBase $api -WikiBase $wiki -PageId $pageId `
                    -Headers $headers -PageFolder $folder -FileBaseName $baseName -OutputRoot $outDir
+        $attPath = Join-Path $folder ($baseName + '-attachments')
+        if ($att.Count -eq 0) { $attPath = $null }
         if ($att.Count -gt 0) {
             $attTotal += $att.Count; $attBytes += $att.Bytes; $bytes += $att.Bytes
             $aStr = if ($att.Bytes -ge 1KB) { '{0:N0} KB' -f ($att.Bytes/1KB) } else { "$($att.Bytes) B" }
             Write-Host ("       + $($att.Count) attachment(s) | $aStr") -ForegroundColor DarkCyan
         }
+
+        if ($ExportMode -eq 'Incremental' -and $null -ne $prev) {
+            $prevPath = [string]$prev.outputPath
+            if (-not [string]::IsNullOrWhiteSpace($prevPath) -and $prevPath -ne $result.Path) {
+                Remove-FileIfExistsSafe -Path $prevPath
+            }
+            $prevAttPath = [string]$prev.attachmentsPath
+            if (-not [string]::IsNullOrWhiteSpace($prevAttPath) -and $prevAttPath -ne $attPath) {
+                try { Remove-DirectoryTreeSafe -Path $prevAttPath } catch {}
+            }
+        }
+
+        $currentStatePages.Add([PSCustomObject]@{
+            id = $pageId; title = $pageTitle; version = $currentVersion
+            outputPath = $result.Path; folder = $folder; baseName = $baseName
+            format = $result.Fmt; attachmentsPath = $attPath
+        }) | Out-Null
     } else {
         $r = if ($reason) { $reason } else { 'unknown error' }
-        $failed += [PSCustomObject]@{ Id = $pg.id; Title = $pg.title; Reason = $r }
         if ($reason -match 'empty page') {
-            Write-Host ("  SKIP empty ({0}) | {1:N1}s" -f $pg.id, $dur) -ForegroundColor DarkYellow
+            $skipped += [PSCustomObject]@{ Id = $pageId; Title = $pageTitle; Reason = $r }
+            Write-Host ("  SKIP empty ({0}) | {1:N1}s" -f $pageId, $dur) -ForegroundColor DarkYellow
+            $currentStatePages.Add([PSCustomObject]@{
+                id = $pageId; title = $pageTitle; version = $currentVersion
+                outputPath = $null; folder = $folder; baseName = $baseName
+                format = 'empty'; attachmentsPath = $null
+            }) | Out-Null
         } else {
-            Write-Host ("  FAIL ({0}) | {1:N1}s | {2}" -f $pg.id, $dur, $r) -ForegroundColor Red
+            $failed += [PSCustomObject]@{ Id = $pageId; Title = $pageTitle; Reason = $r }
+            Write-Host ("  FAIL ({0}) | {1:N1}s | {2}" -f $pageId, $dur, $r) -ForegroundColor Red
         }
     }
 
@@ -520,6 +757,27 @@ foreach ($pg in $pages) {
         $ts  = if ($bytes -ge 1MB) { '{0:N1} MB' -f ($bytes/1MB) } elseif ($bytes -ge 1KB) { '{0:N0} KB' -f ($bytes/1KB) } else { "$bytes B" }
         Write-Host ("  --- {0} exported (DOC:{1} HTML:{2}) | {3} failed | {4} | elapsed {5:hh\:mm\:ss} ---" -f `
             $exp, $fmts.doc, $fmts.html, $failed.Count, $ts, $el) -ForegroundColor DarkGray
+    }
+}
+
+if ($ExportMode -eq 'Incremental' -and $prevStateById.Count -gt 0) {
+    $removed = 0
+    foreach ($kv in $prevStateById.GetEnumerator()) {
+        $pid = [string]$kv.Key
+        if ($currentPageIds.Contains($pid)) { continue }
+        $rec = $kv.Value
+        $oldPath = [string]$rec.outputPath
+        if (-not [string]::IsNullOrWhiteSpace($oldPath)) {
+            Remove-FileIfExistsSafe -Path $oldPath
+        }
+        $oldAttPath = [string]$rec.attachmentsPath
+        if (-not [string]::IsNullOrWhiteSpace($oldAttPath)) {
+            try { Remove-DirectoryTreeSafe -Path $oldAttPath } catch {}
+        }
+        $removed++
+    }
+    if ($removed -gt 0) {
+        Write-Host ("  Cleanup: removed {0} stale page export(s)" -f $removed) -ForegroundColor DarkGray
     }
 }
 
@@ -536,24 +794,39 @@ $totalStr = if ($bytes -ge 1MB) { '{0:N1} MB' -f ($bytes/1MB) } elseif ($bytes -
 $summary = [PSCustomObject]@{
     runAtUtc       = (Get-Date).ToUniversalTime().ToString('o')
     durationSec    = [math]::Round($elapsed.TotalSeconds)
+    exportMode     = $ExportMode
     spaceKey       = $SpaceKey
     confluence     = $wiki
     totalPages     = $pages.Count
     exported       = [PSCustomObject]@{ doc = $fmts.doc; html = $fmts.html }
     exportedCount  = $exported
+    unchangedCount = $unchanged
     totalSizeBytes = $bytes
     attachments    = [PSCustomObject]@{ count = $attTotal; bytes = $attBytes }
     failedCount    = $failed.Count
     failures       = $failed
+    skippedCount   = $skipped.Count
+    skipped        = $skipped
     outputFolder   = $outDir
 }
 Write-FileSafe -Path $sumPath -Text ($summary | ConvertTo-Json -Depth 5)
 
+$state = [PSCustomObject]@{
+    runAtUtc = (Get-Date).ToUniversalTime().ToString('o')
+    spaceKey = $SpaceKey
+    exportMode = $ExportMode
+    pages = $currentStatePages
+}
+Write-FileSafe -Path $statePath -Text ($state | ConvertTo-Json -Depth 6)
+
 Write-Host ''
 Write-Host '--- EXPORT COMPLETE ---' -ForegroundColor Cyan
 Write-Host "  Space    : $SpaceKey"
+Write-Host "  Mode     : $ExportMode"
 Write-Host "  Pages    : $($pages.Count)"
 Write-Host "  Exported : $exported  (DOC: $($fmts.doc) | HTML: $($fmts.html))" -ForegroundColor Green
+Write-Host ("  Kept     : {0} unchanged" -f $unchanged) -ForegroundColor DarkGreen
+Write-Host ("  Skipped  : {0}" -f $skipped.Count) -ForegroundColor $(if ($skipped.Count -gt 0) { 'DarkYellow' } else { 'Green' })
 if ($attTotal -gt 0) {
     $atStr = if ($attBytes -ge 1KB) { '{0:N0} KB' -f ($attBytes/1KB) } else { "$attBytes B" }
     Write-Host "  Attach.  : $attTotal files ($atStr)" -ForegroundColor DarkCyan
@@ -563,11 +836,16 @@ Write-Host "  Size     : $totalStr"
 Write-Host ('  Duration : {0:hh\:mm\:ss}' -f $elapsed)
 Write-Host "  Output   : $outDir"
 Write-Host "  Summary  : $sumPath"
+Write-Host "  State    : $statePath"
 
 if ($failed.Count -gt 0) {
     Write-Host ''
     Write-Host '  Failed pages:' -ForegroundColor Red
-    foreach ($f in $failed) { Write-Host "    - $($f.Title) (ID $($f.Id))" -ForegroundColor Red }
+    foreach ($f in $failed) {
+        $ft = if ([string]::IsNullOrWhiteSpace([string]$f.Title)) { '(untitled)' } else { $f.Title }
+        $fi = if ([string]::IsNullOrWhiteSpace([string]$f.Id)) { '(unknown)' } else { $f.Id }
+        Write-Host "    - $ft (ID $fi)" -ForegroundColor Red
+    }
     Write-Host ''
     exit 2
 }
