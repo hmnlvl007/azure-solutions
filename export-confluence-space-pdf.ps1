@@ -238,7 +238,7 @@ function Get-AllPages {
     param([string]$ApiBase, [string]$Space, [hashtable]$Headers, [int]$BatchSize)
     $all   = [System.Collections.Generic.List[object]]::new()
     $start = 0
-    do {
+    while ($true) {
         $uri   = "$ApiBase/content?spaceKey=$([uri]::EscapeDataString($Space))&type=page&limit=$BatchSize&start=$start&expand=ancestors,version"
         $resp  = Invoke-RestMethod -Uri $uri -Method Get -Headers $Headers -ErrorAction Stop
         $batch = @($resp.results)
@@ -246,7 +246,8 @@ function Get-AllPages {
         foreach ($p in $batch) { $all.Add($p) }
         Write-Host ("  batch start={0,4}  got={1,3}  total={2}" -f $start, $batch.Count, $all.Count) -ForegroundColor DarkGray
         $start += $batch.Count
-    } while ($resp._links.next -and $batch.Count -eq $BatchSize)
+        if (-not $resp._links.next) { break }
+    }
     return $all.ToArray()
 }
 
@@ -557,7 +558,7 @@ if ($attTotal -gt 0) {
     $atStr = if ($attBytes -ge 1KB) { '{0:N0} KB' -f ($attBytes/1KB) } else { "$attBytes B" }
     Write-Host "  Attach.  : $attTotal files ($atStr)" -ForegroundColor DarkCyan
 }
-Write-Host ("  Failed   : {0}" -f $failed.Count) -ForegroundColor (if ($failed.Count -gt 0) { 'Red' } else { 'Green' })
+Write-Host ("  Failed   : {0}" -f $failed.Count) -ForegroundColor $(if ($failed.Count -gt 0) { 'Red' } else { 'Green' })
 Write-Host "  Size     : $totalStr"
 Write-Host ('  Duration : {0:hh\:mm\:ss}' -f $elapsed)
 Write-Host "  Output   : $outDir"
