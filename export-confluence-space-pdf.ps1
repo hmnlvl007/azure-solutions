@@ -466,18 +466,66 @@ function Get-SpaceHomePageId {
 }
 
 function Get-ConfluencePages {
+    # NOTE: body.export_view is intentionally NOT expanded here.
+    # Fetching large page bodies alongside ancestors in the same bulk request
+    # causes Confluence Cloud to silently return ancestors as an empty array
+    # (response payload limit), which breaks the folder hierarchy. Body is
+    # fetched on-demand via Get-PageBodyHtml only when the HTML fallback is
+    # actually needed.
+    #
+    # Pagination notes:
+    # - Use a smaller effective page size (50) when expanding ancestors to avoid
+    #   Confluence Cloud silently truncating ancestor arrays due to payload limits.
+    # - Advance $start by the ACTUAL number of results returned, not $resp.limit,
+    #   because Confluence Cloud sometimes omits or zeroes the limit field in the
+    #   response, which would stall the loop at the same offset indefinitely.
+    # - Stop when results returned < requested limit even if _links.next is present
+    #   (defensive guard against API inconsistencies that can loop forever).
     param([string]$ApiBase, [string]$TargetSpace, [hashtable]$Headers, [int]$Limit)
+
+    # Cap the effective fetch size at 50 when ancestors are expanded; larger
+    # payloads cause Confluence Cloud to silently drop ancestor data.
+    $effectiveLimit = [Math]::Min($Limit, 50)
+
     $all   = @()
     $start = 0
+    $page  = 0
     while ($true) {
-        $uri = "{0}/content?spaceKey={1}&type=page&limit={2}&start={3}&expand=ancestors,version,body.export_view" `
-               -f $ApiBase, [uri]::EscapeDataString($TargetSpace), $Limit, $start
+        $page++
+        $uri = "{0}/content?spaceKey={1}&type=page&limit={2}&start={3}&expand=ancestors,version" `
+               -f $ApiBase, [uri]::EscapeDataString($TargetSpace), $effectiveLimit, $start
         $resp = Invoke-RestMethod -Uri $uri -Method Get -Headers $Headers
         if ($null -eq $resp.results -or $resp.results.Count -eq 0) { break }
-        $all += $resp.results
-        if ($resp._links.next) { $start += [int]$resp.limit } else { break }
+
+        $fetched = $resp.results.Count
+        $all    += $resp.results
+        Write-Host ("  [Fetch page {0}] {1} pages (cumulative: {2})" -f $page, $fetched, $all.Count) -ForegroundColor DarkGray
+
+        # Advance by actual count - safe even when $resp.limit is null/zero.
+        $start += $fetched
+
+        # Stop conditions: no next link AND fewer results than requested (end of data).
+        # Also stop if no next link at all (standard end-of-results signal).
+        if (-not $resp._links.next) { break }
+
+        # Safety: if we received fewer results than requested, there are no more pages
+        # regardless of what _links.next says.
+        if ($fetched -lt $effectiveLimit) { break }
     }
     return $all
+}
+
+function Get-PageBodyHtml {
+    # Fetches body.export_view for a single page on demand (HTML fallback only).
+    param([string]$ApiBase, [string]$PageId, [hashtable]$Headers)
+    try {
+        $resp = Invoke-RestMethod -Uri ("{0}/content/{1}?expand=body.export_view" -f $ApiBase, $PageId) `
+                    -Method Get -Headers $Headers -ErrorAction Stop
+        return $resp.body.export_view.value
+    }
+    catch {
+        return $null
+    }
 }
 
 function Get-PageFolderPath {
@@ -770,15 +818,17 @@ $outDir = Join-Path $OutputPath $SpaceKey
 $null = Test-DirectoryWritable -Path $outDir
 Write-Host ("Temp staging: {0}" -f (Get-LocalTempRoot)) -ForegroundColor DarkGray
 
-# Fetch all pages (body.export_view pre-fetched - avoids extra API calls later)
+# Fetch all pages in paginated batches (body.export_view NOT pre-fetched to avoid
+# Confluence Cloud silently truncating ancestors due to payload size limits).
 Write-Host ''
-Write-Host "Fetching pages from space '$SpaceKey'..." -ForegroundColor Yellow
+Write-Host "Fetching ALL pages from space '$SpaceKey' (paginated, up to 50/batch)..." -ForegroundColor Yellow
 $pages = Get-ConfluencePages -ApiBase $api -TargetSpace $SpaceKey -Headers $headers -Limit $PageSize
 
 if ($pages.Count -eq 0) {
     Write-Host 'No pages found.' -ForegroundColor Red
     exit 0
 }
+Write-Host "Total pages fetched: $($pages.Count)" -ForegroundColor Green
 
 Write-Host "Found $($pages.Count) pages. Exporting to: $outDir" -ForegroundColor Green
 Write-Host 'Strategy: Word (.doc) primary, HTML fallback + attachments' -ForegroundColor Green
@@ -803,7 +853,14 @@ foreach ($pg in $pages) {
     $baseName = '{0:D4}-{1}' -f $idx, $safeName
 
     # Determine folder from page hierarchy
-    $folder = Get-PageFolderPath -Ancestors $pg.ancestors -SpaceHomeId $homeId -RootFolder $outDir
+    # ancestors is a plain array from the API (body.export_view removed from
+    # the bulk listing so the field is never truncated by payload size limits)
+    $ancestors = $pg.ancestors
+    # Defensive: unwrap paginated container if Confluence ever returns one
+    if ($null -ne $ancestors -and $null -ne $ancestors.results) { $ancestors = $ancestors.results }
+    $ancCount  = if ($null -ne $ancestors) { @($ancestors).Count } else { 0 }
+
+    $folder = Get-PageFolderPath -Ancestors $ancestors -SpaceHomeId $homeId -RootFolder $outDir
     try {
         $null = Test-DirectoryWritable -Path $folder
     }
@@ -831,7 +888,8 @@ foreach ($pg in $pages) {
         $rem = $avg * ($pages.Count - $idx + 1)
         $eta = ' | ETA {0:hh\:mm\:ss}' -f [TimeSpan]::FromSeconds([math]::Round($rem))
     }
-    Write-Host ('[{0}/{1} {2}%{3}] {4}' -f $idx, $pages.Count, $pct, $eta, $pg.title) -ForegroundColor Cyan
+    $ancInfo = if ($ancCount -gt 0) { ' | anc:{0}' -f $ancCount } else { '' }
+    Write-Host ('[{0}/{1} {2}%{3}{4}] {5}' -f $idx, $pages.Count, $pct, $eta, $ancInfo, $pg.title) -ForegroundColor Cyan
 
     $result = $null
     $reason = ''
@@ -899,9 +957,9 @@ foreach ($pg in $pages) {
     if ($null -eq $result -or -not $result.OK) {
         $htmlDest = Get-SafeOutputFilePath -Folder $folder -BaseName $baseName -Extension '.doc'
 
-        # Use body already fetched during page listing - no extra API call needed
-        $body = $null
-        try { $body = $pg.body.export_view.value } catch {}
+        # Fetch body on demand (not pre-fetched in bulk listing to avoid
+        # Confluence truncating ancestors due to response payload size).
+        $body = Get-PageBodyHtml -ApiBase $api -PageId $pg.id -Headers $headers
 
         try {
             $result = Save-PageHtml -WikiBase $wiki -PageId $pg.id `
