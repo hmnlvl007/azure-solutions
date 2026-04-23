@@ -472,45 +472,17 @@ function Get-ConfluencePages {
     # (response payload limit), which breaks the folder hierarchy. Body is
     # fetched on-demand via Get-PageBodyHtml only when the HTML fallback is
     # actually needed.
-    #
-    # Pagination notes:
-    # - Use a smaller effective page size (50) when expanding ancestors to avoid
-    #   Confluence Cloud silently truncating ancestor arrays due to payload limits.
-    # - Advance $start by the ACTUAL number of results returned, not $resp.limit,
-    #   because Confluence Cloud sometimes omits or zeroes the limit field in the
-    #   response, which would stall the loop at the same offset indefinitely.
-    # - Stop when results returned < requested limit even if _links.next is present
-    #   (defensive guard against API inconsistencies that can loop forever).
     param([string]$ApiBase, [string]$TargetSpace, [hashtable]$Headers, [int]$Limit)
-
-    # Cap the effective fetch size at 50 when ancestors are expanded; larger
-    # payloads cause Confluence Cloud to silently drop ancestor data.
-    $effectiveLimit = [Math]::Min($Limit, 50)
-
     $all   = @()
     $start = 0
-    $page  = 0
     while ($true) {
-        $page++
         $uri = "{0}/content?spaceKey={1}&type=page&limit={2}&start={3}&expand=ancestors,version" `
-               -f $ApiBase, [uri]::EscapeDataString($TargetSpace), $effectiveLimit, $start
+               -f $ApiBase, [uri]::EscapeDataString($TargetSpace), $Limit, $start
         $resp = Invoke-RestMethod -Uri $uri -Method Get -Headers $Headers
         if ($null -eq $resp.results -or $resp.results.Count -eq 0) { break }
-
-        $fetched = $resp.results.Count
-        $all    += $resp.results
-        Write-Host ("  [Fetch page {0}] {1} pages (cumulative: {2})" -f $page, $fetched, $all.Count) -ForegroundColor DarkGray
-
-        # Advance by actual count - safe even when $resp.limit is null/zero.
-        $start += $fetched
-
-        # Stop conditions: no next link AND fewer results than requested (end of data).
-        # Also stop if no next link at all (standard end-of-results signal).
+        $all   += $resp.results
+        $start += $resp.results.Count
         if (-not $resp._links.next) { break }
-
-        # Safety: if we received fewer results than requested, there are no more pages
-        # regardless of what _links.next says.
-        if ($fetched -lt $effectiveLimit) { break }
     }
     return $all
 }
@@ -818,17 +790,15 @@ $outDir = Join-Path $OutputPath $SpaceKey
 $null = Test-DirectoryWritable -Path $outDir
 Write-Host ("Temp staging: {0}" -f (Get-LocalTempRoot)) -ForegroundColor DarkGray
 
-# Fetch all pages in paginated batches (body.export_view NOT pre-fetched to avoid
-# Confluence Cloud silently truncating ancestors due to payload size limits).
+# Fetch all pages
 Write-Host ''
-Write-Host "Fetching ALL pages from space '$SpaceKey' (paginated, up to 50/batch)..." -ForegroundColor Yellow
+Write-Host "Fetching pages from space '$SpaceKey'..." -ForegroundColor Yellow
 $pages = Get-ConfluencePages -ApiBase $api -TargetSpace $SpaceKey -Headers $headers -Limit $PageSize
 
 if ($pages.Count -eq 0) {
     Write-Host 'No pages found.' -ForegroundColor Red
     exit 0
 }
-Write-Host "Total pages fetched: $($pages.Count)" -ForegroundColor Green
 
 Write-Host "Found $($pages.Count) pages. Exporting to: $outDir" -ForegroundColor Green
 Write-Host 'Strategy: Word (.doc) primary, HTML fallback + attachments' -ForegroundColor Green
