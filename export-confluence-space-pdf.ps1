@@ -61,7 +61,7 @@ function Get-CompactName {
 function Ensure-Directory {
     param([string]$Path)
     if (-not (Test-Path -LiteralPath $Path)) {
-        New-Item -ItemType Directory -LiteralPath $Path -Force | Out-Null
+        [IO.Directory]::CreateDirectory($Path) | Out-Null
     }
 }
 
@@ -206,11 +206,13 @@ function Get-PageFolder {
 
 function Get-DestinationPath {
     param([string]$Folder, [string]$Title, [string]$PageId)
-    $baseName = '{0}-{1}' -f (Get-CompactName -Name $Title -MaxLength 80), $PageId
-    $path = Join-Path -Path $Folder -ChildPath ($baseName + '.doc')
-    if ($path.Length -le 235) { return $path }
-    $baseName = '{0}-{1}' -f (Get-CompactName -Name $Title -MaxLength 40), $PageId
-    return (Join-Path -Path $Folder -ChildPath ($baseName + '.doc'))
+    foreach ($maxLen in @(60, 40, 20, 8)) {
+        $baseName = '{0}-{1}' -f (Get-CompactName -Name $Title -MaxLength $maxLen), $PageId
+        $path = Join-Path -Path $Folder -ChildPath ($baseName + '.doc')
+        if ($path.Length -le 235) { return $path }
+    }
+    # Last resort: use only the page ID
+    return (Join-Path -Path $Folder -ChildPath ($PageId + '.doc'))
 }
 
 function Get-PageBodyHtml {
@@ -278,7 +280,7 @@ function Save-WordExport {
     $url = "$WikiBase/exportword?pageId=$PageId&os_authType=basic"
     $tempFile = Join-Path -Path ([IO.Path]::GetTempPath()) -ChildPath ("cf-word-$PageId-$([Guid]::NewGuid().ToString('N')).doc")
     try {
-        $args = @{
+        $iwrParams = @{
             Uri = $url
             Method = 'Get'
             OutFile = $tempFile
@@ -288,9 +290,9 @@ function Save-WordExport {
             Headers = @{ Authorization = $Headers.Authorization }
         }
         if ($null -ne $Session) {
-            $args.WebSession = $Session
+            $iwrParams.WebSession = $Session
         }
-        Invoke-WebRequest @args | Out-Null
+        Invoke-WebRequest @iwrParams | Out-Null
 
         if (-not (Test-Path -LiteralPath $tempFile)) {
             return [PSCustomObject]@{ Success = $false; Reason = 'Word export did not produce a file'; StatusCode = 0 }
@@ -301,7 +303,9 @@ function Save-WordExport {
             return [PSCustomObject]@{ Success = $false; Reason = 'Word export file was empty/too small'; StatusCode = 0 }
         }
 
-        Move-Item -LiteralPath $tempFile -Destination $DestinationPath -Force
+        $destDir = [IO.Path]::GetDirectoryName($DestinationPath)
+        if (-not [string]::IsNullOrWhiteSpace($destDir)) { Ensure-Directory -Path $destDir }
+        [IO.File]::Move($tempFile, $DestinationPath)
         return [PSCustomObject]@{ Success = $true; Reason = ''; StatusCode = 0 }
     }
     catch {
@@ -392,7 +396,7 @@ function Save-HtmlFallback {
 </html>
 "@
 
-    $destDir = Split-Path -LiteralPath $DestinationPath -Parent
+    $destDir = [IO.Path]::GetDirectoryName($DestinationPath)
     if (-not [string]::IsNullOrWhiteSpace($destDir)) { Ensure-Directory -Path $destDir }
     [IO.File]::WriteAllText($DestinationPath, $html, [Text.Encoding]::UTF8)
     return [PSCustomObject]@{ Success = $true; Reason = '' }
@@ -440,7 +444,7 @@ function Save-Attachments {
         try {
             $url = "$WikiBase$downloadPath"
             Invoke-WebRequest -Uri $url -Method Get -OutFile $tempFile -UseBasicParsing -Headers @{ Authorization = $Headers.Authorization } -ErrorAction Stop | Out-Null
-            Move-Item -LiteralPath $tempFile -Destination $filePath -Force
+            [IO.File]::Move($tempFile, $filePath)
             $size = (Get-Item -LiteralPath $filePath).Length
             $count++
             $totalBytes += $size
