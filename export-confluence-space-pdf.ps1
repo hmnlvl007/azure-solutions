@@ -100,20 +100,95 @@ function Get-SpaceHomePageId {
 }
 
 function Get-AllPages {
-    param([string]$ApiBase, [string]$Key, [hashtable]$Headers, [int]$BatchSize)
-    $all = [System.Collections.Generic.List[object]]::new()
+    param(
+        [string]$ApiBase,
+        [string]$Key,
+        [hashtable]$Headers,
+        [int]$BatchSize,
+        [string]$HomePageId
+    )
+
+    $byId = @{}
+
+    function Add-UniquePages {
+        param([object[]]$Items)
+        $added = 0
+        foreach ($item in @($Items)) {
+            $id = [string]$item.id
+            if ([string]::IsNullOrWhiteSpace($id)) { continue }
+            if ($byId.ContainsKey($id)) { continue }
+            $byId[$id] = $item
+            $added++
+        }
+        return $added
+    }
+
+    $contentTotal = 0
     $start = 0
     while ($true) {
-        $uri = "$ApiBase/content?spaceKey=$([Uri]::EscapeDataString($Key))&type=page&expand=ancestors,version&limit=$BatchSize&start=$start"
+        $uri = "$ApiBase/content?spaceKey=$([Uri]::EscapeDataString($Key))&type=page&status=current&expand=ancestors,version&limit=$BatchSize&start=$start"
         $response = Invoke-RestMethod -Uri $uri -Method Get -Headers $Headers -ErrorAction Stop
         $batch = @($response.results)
         if ($batch.Count -eq 0) { break }
-        foreach ($item in $batch) { $all.Add($item) }
-        Write-Host ("  batch start={0,4} got={1,3} total={2}" -f $start, $batch.Count, $all.Count) -ForegroundColor DarkGray
+        $added = Add-UniquePages -Items $batch
+        $contentTotal += $added
+        Write-Host ("  content    start={0,4} got={1,3} added={2,3} total={3}" -f $start, $batch.Count, $added, $byId.Count) -ForegroundColor DarkGray
         $start += $batch.Count
         if (-not $response._links.next) { break }
     }
-    return $all.ToArray()
+
+    $searchTotal = 0
+    try {
+        $start = 0
+        $cql = [Uri]::EscapeDataString("space=`"$Key`" AND type=page")
+        while ($true) {
+            $uri = "$ApiBase/content/search?cql=$cql&expand=ancestors,version&limit=$BatchSize&start=$start"
+            $response = Invoke-RestMethod -Uri $uri -Method Get -Headers $Headers -ErrorAction Stop
+            $batch = @($response.results)
+            if ($batch.Count -eq 0) { break }
+            $added = Add-UniquePages -Items $batch
+            $searchTotal += $added
+            Write-Host ("  cql-search start={0,4} got={1,3} added={2,3} total={3}" -f $start, $batch.Count, $added, $byId.Count) -ForegroundColor DarkGray
+            $start += $batch.Count
+            if (-not $response._links.next) { break }
+        }
+    } catch {
+        Write-Host ("  cql-search unavailable: {0}" -f $_.Exception.Message) -ForegroundColor DarkYellow
+    }
+
+    $descTotal = 0
+    if (-not [string]::IsNullOrWhiteSpace($HomePageId)) {
+        try {
+            $start = 0
+            while ($true) {
+                $uri = "$ApiBase/content/$HomePageId/descendant/page?expand=ancestors,version&limit=$BatchSize&start=$start"
+                $response = Invoke-RestMethod -Uri $uri -Method Get -Headers $Headers -ErrorAction Stop
+                $batch = @($response.results)
+                if ($batch.Count -eq 0) { break }
+                $added = Add-UniquePages -Items $batch
+                $descTotal += $added
+                Write-Host ("  descendants start={0,4} got={1,3} added={2,3} total={3}" -f $start, $batch.Count, $added, $byId.Count) -ForegroundColor DarkGray
+                $start += $batch.Count
+                if (-not $response._links.next) { break }
+            }
+        } catch {
+            Write-Host ("  descendants unavailable: {0}" -f $_.Exception.Message) -ForegroundColor DarkYellow
+        }
+
+        if (-not $byId.ContainsKey($HomePageId)) {
+            try {
+                $homeUri = "$ApiBase/content/$HomePageId?expand=ancestors,version"
+                $homePage = Invoke-RestMethod -Uri $homeUri -Method Get -Headers $Headers -ErrorAction Stop
+                $null = Add-UniquePages -Items @($homePage)
+            } catch {
+            }
+        }
+    }
+
+    Write-Host ("  discovery totals -> content:{0} cql:{1} descendants:{2} unique:{3}" -f $contentTotal, $searchTotal, $descTotal, $byId.Count) -ForegroundColor DarkGray
+
+    if ($byId.Count -eq 0) { return @() }
+    return @($byId.Values | Sort-Object -Property @{ Expression = { [string]$_.title } }, @{ Expression = { [string]$_.id } })
 }
 
 function Get-PageFolder {
@@ -365,7 +440,7 @@ if ($ExportMode -eq 'Incremental') {
 
 Write-Host ''
 Write-Host "Fetching pages from '$SpaceKey'..." -ForegroundColor Yellow
-$pages = @(Get-AllPages -ApiBase $apiBase -Key $SpaceKey -Headers $headers -BatchSize $PageSize)
+$pages = @(Get-AllPages -ApiBase $apiBase -Key $SpaceKey -Headers $headers -BatchSize $PageSize -HomePageId $homePageId)
 if ($pages.Count -eq 0) {
     Write-Host "No pages found for space '$SpaceKey'." -ForegroundColor Yellow
     exit 0
