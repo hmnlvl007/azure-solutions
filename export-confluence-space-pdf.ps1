@@ -241,7 +241,9 @@ function Get-ResolvedAncestors {
 
     $inlineAncestors = $null
     try { $inlineAncestors = $Page.ancestors } catch { $inlineAncestors = $null }
-    if ($null -ne $inlineAncestors -and $null -ne $inlineAncestors.results) {
+    # Confluence API v1 returns ancestors as a plain array, never wrapped in {results:[]}.
+    # Only unwrap if it is genuinely a PSCustomObject envelope (defensive guard).
+    if ($inlineAncestors -is [System.Management.Automation.PSCustomObject] -and $null -ne $inlineAncestors.results) {
         $inlineAncestors = $inlineAncestors.results
     }
 
@@ -249,7 +251,8 @@ function Get-ResolvedAncestors {
         $uri = "$ApiBase/content/$pageId?expand=ancestors"
         $fullPage = Invoke-RestMethod -Uri $uri -Method Get -Headers $Headers -ErrorAction Stop
         $resolved = $fullPage.ancestors
-        if ($null -ne $resolved -and $null -ne $resolved.results) {
+        # Same guard: only unwrap if wrapped in a results envelope, not already a plain array.
+        if ($resolved -is [System.Management.Automation.PSCustomObject] -and $null -ne $resolved.results) {
             $resolved = $resolved.results
         }
         $resolvedArray = @($resolved)
