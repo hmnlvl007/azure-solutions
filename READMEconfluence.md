@@ -1,6 +1,6 @@
-# Confluence Space Export to OneDrive / SharePoint
+﻿# Confluence Space Export to OneDrive / SharePoint
 
-Exports every page from a Confluence Cloud space as individual **Word (.doc)** files — with automatic **HTML fallback** — into a OneDrive for Business folder that syncs to SharePoint. Designed for M365 Copilot indexing, SharePoint search, and document library browsing.
+Exports every page from a Confluence Cloud space as individual **Word (.doc)** files — with automatic **HTML fallback** — plus page **attachments**, into a OneDrive for Business folder that syncs to SharePoint. Designed for M365 Copilot indexing, SharePoint search, and document library browsing.
 
 ## How it works
 
@@ -11,6 +11,8 @@ Confluence Cloud REST API
         │
         └─ body.export_view ──▶  .html  (fallback – always works with API tokens)
         │
+        ├─ /child/attachment ──▶  <file>-attachments/  (downloaded alongside each page)
+        │
         ▼
   OneDrive for Business (local sync folder)
         │
@@ -20,231 +22,263 @@ Confluence Cloud REST API
 
 1. Authenticates against Confluence Cloud with Basic auth (email + API token).
 2. Establishes a cookie-based session (required by the `/exportword` action URL).
-3. Fetches all pages in the target space, including their ancestor chains.
+3. Fetches all pages via three complementary API calls (content list, CQL search, descendants) and deduplicates results.
 4. Mirrors the Confluence page tree as a local folder hierarchy.
-5. For each page: tries **Word export** first; if that fails, falls back to **styled HTML**.
-6. If Word returns 401/403, or fails 3 times in a row, the script switches to HTML-only for all remaining pages.
-7. Empty container pages (no body content) are logged as `SKIP` rather than `FAIL`.
-8. Only **one file per page** is ever written — never both `.doc` and `.html` for the same page.
-9. Writes a JSON summary file (`export-summary-<timestamp>.json`) with run stats.
-
-## Why Word (.doc) as the primary format
-
-| Feature | Word (.doc) | HTML | PDF |
-|---|---|---|---|
-| Preserves hyperlinks | Yes | Yes | Partial |
-| Opens in Word Online | Yes (native) | No | No |
-| SharePoint preview | Yes | Yes | Yes |
-| M365 Copilot indexing | Deep | Good | Limited |
-| SharePoint co-authoring | Yes | No | No |
-| Formatting fidelity | High | High | Highest |
-| Confluence Cloud API support | `/exportword` | REST API | Blocked (403) |
-
-> **Note:** Confluence Cloud blocks the legacy `flyingpdf` PDF endpoint for API token auth. Word is the best available format that is natively supported across the M365 ecosystem.
+5. For each page: tries **Word export** first; falls back to **styled HTML** if Word fails.
+6. If Word returns HTTP 401/403, or fails 3 times in a row, the script switches to HTML-only for all remaining pages.
+7. Downloads all page **attachments** into a `<filename>-attachments/` subfolder next to each exported file.
+8. Long file/folder names are automatically truncated with a hash suffix to stay within the 235-character Windows path limit.
+9. Writes a JSON state file (`export-state.json`) and a timestamped summary file after every run.
+10. Default mode is **Incremental**: unchanged pages (same version + same path) are skipped. **Full** mode wipes and rebuilds from scratch.
 
 ## Files
 
 | File | Purpose |
 |---|---|
-| `scripts/export-confluence-space-pdf.ps1` | Main export script — handles auth, pagination, hierarchy, Word+HTML export, progress, and summary |
-| `scripts/run-confluence-export.ps1` | Config wrapper — auto-detects OneDrive path, sets credentials, calls the main script |
+| `scripts/export-confluence-space-pdf.ps1` | Main export engine — auth, pagination, hierarchy, Word + HTML export, attachments, summary |
+| `scripts/run-confluence-export.ps1` | Launcher — auto-detects OneDrive path, holds your credentials, calls the main script |
 
 ## Prerequisites
 
 1. **Confluence Cloud** account with read access to the target space.
 2. **Atlassian API token** — create one at: https://id.atlassian.com/manage-profile/security/api-tokens
-3. **OneDrive for Business** sync client installed and signed in (syncs to SharePoint).
-4. **PowerShell 5.1+** (built into Windows).
+3. **OneDrive for Business** sync client installed and signed in (syncs to SharePoint automatically).
+4. **PowerShell 5.1+** (built into Windows — no additional installs required).
+
+---
 
 ## One-time setup
 
-### 1. Set the API token as an environment variable
+### Step 1 — Store your API token as an environment variable
+
+Open PowerShell and run:
 
 ```powershell
-[Environment]::SetEnvironmentVariable('CONFLUENCE_API_TOKEN', 'paste-token-here', 'User')
+[Environment]::SetEnvironmentVariable('CONFLUENCE_API_TOKEN', 'your-token-here', 'User')
 ```
 
-Restart your terminal after setting this so the variable is picked up.
+**Close and reopen your terminal** after running this so the variable is loaded.
 
-### 2. Edit the wrapper script
+To verify it is set:
+```powershell
+$env:CONFLUENCE_API_TOKEN
+```
 
-Open `scripts/run-confluence-export.ps1` and update the `$config` hashtable:
+### Step 2 — Edit the launcher script
+
+Open `scripts\run-confluence-export.ps1` and update the default parameter values at the top of the file:
 
 ```powershell
-$config = @{
-    ConfluenceBaseUrl = 'https://your-company.atlassian.net'   # your Confluence Cloud URL
-    SpaceKey          = 'DBA'                                   # space key to export
-    Email             = 'you@your-company.com'                  # your Atlassian account email
-    ApiToken          = $env:CONFLUENCE_API_TOKEN               # leave as-is (reads from env)
-    OutputPath        = $resolvedOutputPath                     # auto-resolved OneDrive path
-    PageSize          = 100                                     # pages per API request (max 100)
-}
+param(
+    [string]$ConfluenceBaseUrl = 'https://your-company.atlassian.net',  # ← your Confluence URL
+    [string]$SpaceKey          = 'DBA',                                  # ← space key to export
+    [string]$Email             = 'you@your-company.com',                 # ← your Atlassian email
+    [string]$ApiToken          = $env:CONFLUENCE_API_TOKEN,              # leave as-is
+    [string]$ExportSubFolder   = 'ConfluenceExports',                    # OneDrive subfolder name
+    [string]$ExportMode        = 'Incremental',                          # Incremental or Full
+    [int]   $PageSize          = 100                                      # max 100
+)
 ```
 
-### 3. (Optional) Change the OneDrive sub-folder
+The script auto-detects your OneDrive for Business root from `$env:OneDriveCommercial` (falls back to `$env:OneDrive`). Files are exported to:
 
-The wrapper auto-detects your OneDrive for Business root via `$env:OneDriveCommercial` (falls back to `$env:OneDrive`). Files are placed in a sub-folder — edit this line in the wrapper if needed:
-
-```powershell
-$exportSubFolder = 'ConfluenceExports'
 ```
+<OneDrive root>\<ExportSubFolder>\<SpaceKey>\
+```
+
+---
 
 ## Running the export
 
-### Manual run
+### Standard run
+
+```powershell
+cd C:\PHP_MCP
+.\scripts\run-confluence-export.ps1
+```
+
+### Override parameters inline (without editing the file)
+
+```powershell
+.\scripts\run-confluence-export.ps1 -SpaceKey 'PROD' -ExportMode Full
+```
+
+### Full refresh (wipe and rebuild everything)
+
+```powershell
+.\scripts\run-confluence-export.ps1 -ExportMode Full
+```
+
+### If execution policy blocks the script
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File .\scripts\run-confluence-export.ps1
 ```
 
-### What you'll see
+---
+
+## What you will see
 
 ```
-Verifying Confluence credentials...
-Authenticated as: Julie Ozmolski (julie.ozmolski@providence.org)
+OneDrive root : C:\Users\JulieOzmolski.adm\OneDrive - Providence St. Joseph Health
+Export target : C:\Users\JulieOzmolski.adm\OneDrive - ...\ConfluenceExports
+Space key     : DBA
+Mode          : Incremental
+
+Verifying credentials...
+Authenticated as: Julie Ozmolski
 Establishing session...
 Session established.
 
-Fetching pages from space 'DBA'...
-Found 42 pages. Exporting to: C:\Users\...\ConfluenceExports\DBA
-Strategy: Word (.doc) primary, HTML fallback
+Fetching pages from 'DBA'...
+Found 18 pages.
+Strategy: Word (.doc) primary, HTML fallback + attachments
 
-[1/42 2% | ETA 00:03:12] Database Backup Procedures
-  OK  DOC  | 45 KB | 1.2s | Documentation
-[2/42 5% | ETA 00:02:58] SQL Server Monitoring
-  OK  DOC  | 38 KB | 0.9s | Documentation\Monitoring
-[3/42 7% | ETA 00:02:50] How-to articles
-  SKIP  empty page (124256289) | 0.8s
-...
-  --- 10 exported (DOC:9 HTML:0) | 1 failed | 412 KB | 00:00:14 ---
+[1/18] Export Infrastructure Architecture
+  OK DOC | 6 KB
+[2/18] Export 2008 Upgrades For 2021 - Archive
+  OK DOC | 40 KB
+[3/18] Export Adding Tables to SQL Server Replication
+  OK DOC | 10 KB
+     + 2 attachment(s)
 ...
 
 --- EXPORT COMPLETE ---
   Space    : DBA
-  Pages    : 42
-  Exported : 42  (DOC: 42 | HTML: 0)
+  Mode     : Incremental
+  Pages    : 18
+  Exported : 17 (DOC: 17 | HTML: 0)
+  Kept     : 1 unchanged
   Failed   : 0
-  Size     : 1.8 MB
-  Duration : 00:01:23
+  Attach.  : 3 files
+  Duration : 00:01:04
   Output   : C:\Users\...\ConfluenceExports\DBA
-  Summary  : C:\Users\...\ConfluenceExports\DBA\export-summary-2026-04-02_14-30-00.json
+  Summary  : C:\Users\...\ConfluenceExports\DBA\export-summary-2026-05-05_13-00-00.json
 ```
+
+---
 
 ## Output structure
 
-The script mirrors the Confluence page hierarchy as folders. Files are numbered for stable sort order.
+The script mirrors the Confluence page hierarchy as a folder tree. Each file is named `<page-title>-<pageId>.doc`. The page ID suffix keeps names stable across Confluence title changes and moves. Long names are automatically shortened with a short hash to avoid Windows path length limits.
+
+Attachments are saved in a `<filename>-attachments/` folder next to the exported page file.
 
 ```
 ConfluenceExports/
 └── DBA/
-    ├── 0001-Knowledge Base.doc
-    ├── Documentation/
-    │   ├── 0005-Database Backup Procedures.doc
-    │   ├── 0006-Restore Runbook.doc
-    │   └── Monitoring/
-    │       └── 0010-SQL Server Monitoring.doc
-    ├── How-To/
-    │   ├── 0015-Create New Database.doc
-    │   └── 0016-Grant Permissions.doc
-    └── export-summary-2026-04-02_14-30-00.json
+    ├── Infrastructure Architecture-75364662.doc
+    ├── Database Administration-75333649.doc
+    ├── Projects/
+    │   ├── Replication Assessment-17846791.doc
+    │   └── Replication Assessment-17846791-attachments/
+    │       └── current-state.xlsx
+    ├── Test Plans - Archive this entire section/
+    │   ├── Backup options Test Plan-75364938.doc
+    │   └── Load Testing on Facets AGs-75364741.doc
+    ├── export-state.json
+    └── export-summary-2026-05-05_13-00-00.json
 ```
 
-The **space home page** is excluded from the folder path (exported at the space root, not in a redundant subfolder).
+---
+
+## Incremental vs Full mode
+
+| Behaviour | Incremental (default) | Full |
+|---|---|---|
+| Unchanged pages (same version + path) | Kept, skipped | Re-exported |
+| Renamed or moved pages | Old file deleted, new file written | All rebuilt |
+| Deleted Confluence pages | Stale file removed | All rebuilt |
+| Output folder wiped on start | No | Yes |
+| State file reset | No | Yes |
+
+---
 
 ## Summary JSON
 
-Each run writes a summary file with details about the export:
+Each run writes a timestamped summary file (`export-summary-<timestamp>.json`):
 
 ```json
 {
-  "runAtUtc": "2026-04-02T21:30:00.0000000Z",
-  "durationSec": 83,
+  "runAtUtc": "2026-05-05T13:00:00.0000000Z",
+  "durationSec": 64,
+  "exportMode": "Incremental",
   "spaceKey": "DBA",
-  "confluence": "https://your-company.atlassian.net/wiki",
-  "totalPages": 42,
-  "exported": { "doc": 42, "html": 0 },
-  "exportedCount": 42,
-  "totalSizeBytes": 1887436,
+  "confluence": "https://providencehealthplans.atlassian.net/wiki",
+  "totalPages": 18,
+  "exported": { "doc": 17, "html": 0 },
+  "exportedCount": 17,
+  "unchangedCount": 1,
+  "attachments": { "count": 3, "bytes": 204800 },
+  "totalSizeBytes": 1245184,
   "failedCount": 0,
   "failures": [],
   "outputFolder": "C:\\Users\\...\\ConfluenceExports\\DBA"
 }
 ```
 
+If `failedCount > 0`, check the `failures` array for page IDs and error reasons.
+
+---
+
 ## Schedule nightly export (Windows Task Scheduler)
 
 ```powershell
 $action  = New-ScheduledTaskAction `
-    -Execute 'powershell.exe' `
-    -Argument '-NoProfile -ExecutionPolicy Bypass -File "c:\PHP_MCP\scripts\run-confluence-export.ps1"'
+    -Execute   'powershell.exe' `
+    -Argument  '-NoProfile -ExecutionPolicy Bypass -File "C:\PHP_MCP\scripts\run-confluence-export.ps1"'
 
-$trigger = New-ScheduledTaskTrigger -Daily -At 1:00am
+$trigger = New-ScheduledTaskTrigger -Daily -At 2:00am
 
 Register-ScheduledTask `
     -TaskName    'Confluence-DBA-Export' `
     -Action      $action `
     -Trigger     $trigger `
-    -Description 'Export Confluence DBA space to OneDrive (Word + HTML fallback)'
+    -Description 'Nightly Confluence DBA space export to OneDrive'
 ```
 
-> The task runs under your user account so it inherits your `CONFLUENCE_API_TOKEN` environment variable and OneDrive paths.
+> The task runs under your user account and automatically inherits `CONFLUENCE_API_TOKEN` and your OneDrive path.
+
+---
 
 ## Script parameters
 
+### run-confluence-export.ps1
+
+| Parameter | Default | Description |
+|---|---|---|
+| `ConfluenceBaseUrl` | *(edit required)* | Confluence Cloud URL, e.g. `https://company.atlassian.net` |
+| `SpaceKey` | *(edit required)* | Space key to export, e.g. `DBA` |
+| `Email` | *(edit required)* | Your Atlassian account email |
+| `ApiToken` | `$env:CONFLUENCE_API_TOKEN` | Leave as-is — reads from environment variable |
+| `ExportSubFolder` | `ConfluenceExports` | Subfolder name inside your OneDrive root |
+| `ExportMode` | `Incremental` | `Incremental` or `Full` |
+| `PageSize` | `100` | Pages per API request (max 100) |
+
 ### export-confluence-space-pdf.ps1
 
-| Parameter | Required | Default | Description |
-|---|---|---|---|
-| `ConfluenceBaseUrl` | Yes | — | Confluence Cloud URL (e.g. `https://company.atlassian.net`) |
-| `SpaceKey` | Yes | — | Confluence space key to export |
-| `Email` | Yes | — | Atlassian account email for API auth |
-| `ApiToken` | Yes | — | Atlassian API token |
-| `OutputPath` | Yes | — | Local folder for exported files (e.g. OneDrive sync folder) |
-| `PageSize` | No | `100` | Pages per API request (max 100) |
+| Parameter | Required | Description |
+|---|---|---|
+| `ConfluenceBaseUrl` | Yes | Confluence Cloud URL |
+| `SpaceKey` | Yes | Space key to export |
+| `Email` | Yes | Atlassian account email |
+| `ApiToken` | Yes | Atlassian API token |
+| `OutputPath` | Yes | Local output folder (your OneDrive sync path) |
+| `PageSize` | No (default `100`) | API page batch size |
+| `ExportMode` | No (default `Incremental`) | `Incremental` or `Full` |
 
-## Export strategy details
-
-### Word export (primary)
-
-- Uses Confluence's `/exportword?pageId=<id>&os_authType=basic` action URL.
-- The `os_authType=basic` parameter is required so the legacy web endpoint accepts Basic auth from API tokens.
-- Requires a cookie-based session established via `Invoke-WebRequest -SessionVariable`.
-- Produces a `.doc` file (HTML-in-Word wrapper) that Word, Word Online, and SharePoint handle natively.
-- Internal Confluence links and external URLs are preserved as clickable hyperlinks.
-- Atomic writes: downloads to a `.part` temp file, then renames on success.
-
-### HTML export (fallback)
-
-- Uses the Confluence REST API `body.export_view` endpoint — always works with API tokens.
-- Produces a self-contained `.html` file with:
-  - Inline CSS styling (Confluence-inspired theme)
-  - `<meta>` tags for source page ID and URL
-  - "View in Confluence" source link
-  - Responsive layout, print-friendly styles
-- Falls back automatically if Word export fails for a specific page.
-- If Word returns HTTP 401 or 403, the script immediately switches to HTML-only for all remaining pages.
-- If Word fails 3 times in a row for any reason (timeouts, redirects, etc.), the script also switches to HTML-only.
-
-### Empty / container pages
-
-- Some Confluence pages (e.g. "How-to articles") are just parent containers with no body content.
-- These are logged as `SKIP` (dark yellow) rather than `FAIL` (red) in the progress output.
-- They still appear in the `failures` array in the summary JSON for visibility.
-
-### One file per page
-
-- The script writes exactly **one** file per page — `.doc` if Word succeeds, `.html` if it falls back.
-- You will never see both formats for the same page, so M365 Copilot won't index duplicate content.
+---
 
 ## Troubleshooting
 
-| Symptom | Cause | Fix |
+| Symptom | Likely cause | Fix |
 |---|---|---|
-| `Authentication failed` | Wrong email or API token | Verify at https://id.atlassian.com/manage-profile/security/api-tokens |
-| `CONFLUENCE_API_TOKEN is empty` | Env var not set | Run the `SetEnvironmentVariable` command above and restart terminal |
-| `Cannot locate a synced OneDrive folder` | OneDrive not signed in | Sign into OneDrive for Business; or set `$env:OneDriveCommercial` manually |
-| All pages export as HTML (0 DOC) | `/exportword` blocked (401/403) | This is expected on some Confluence Cloud tenants — HTML is the automatic fallback |
-| Word fails after first 3 pages then stops | Consecutive failure detection | After 3 Word failures in a row, script auto-switches to HTML — check summary JSON for the reason |
-| Many pages show `SKIP` | Empty body (container pages) | Normal — these are parent pages with no content, just used for hierarchy |
-| `No pages found` | Wrong space key | Check the space key in Confluence URL (`/wiki/spaces/KEY/...`) |
-| Exit code 2 | Some pages failed | Check the `failures` array in the summary JSON for page IDs and reasons |
+| `Authentication failed` | Wrong email or API token | Verify token at https://id.atlassian.com/manage-profile/security/api-tokens |
+| `ApiToken is required` | Env var not set or terminal not restarted | Re-run `SetEnvironmentVariable` and restart terminal |
+| `Cannot locate OneDrive root` | OneDrive for Business not signed in | Sign into OneDrive for Business, or set `$env:OneDriveCommercial` manually |
+| `ConfluenceBaseUrl is still the placeholder` | Launcher script not edited | Update the default values in `run-confluence-export.ps1` |
+| All pages export as HTML (0 DOC) | `/exportword` blocked by tenant (401/403) | Normal — HTML fallback is automatic and produces full content |
+| Word fails then switches to HTML after a few pages | 3 consecutive Word failures triggers auto-switch | Check summary JSON `failures` array for the root cause |
+| `No pages found` | Wrong space key | Confirm the key from your Confluence URL: `/wiki/spaces/KEY/` |
+| Exit code `2` | One or more pages failed | Review the `failures` array in the summary JSON |
+| Path-too-long errors on deeply nested pages | Long title + deep ancestor chain nears 260 chars | Script auto-truncates; if it persists, shorten the `ExportSubFolder` name |
