@@ -267,6 +267,7 @@ $allSubscriptions    = [System.Collections.Generic.List[PSObject]]::new()
 $allDistributors     = [System.Collections.Generic.List[PSObject]]::new()
 $allReplSchedules    = [System.Collections.Generic.List[PSObject]]::new()
 $allReplDistMap      = [System.Collections.Generic.List[PSObject]]::new()
+$allPublisherDistMap = [System.Collections.Generic.List[PSObject]]::new()
 $allCDCDatabases     = [System.Collections.Generic.List[PSObject]]::new()
 $allCDCTables        = [System.Collections.Generic.List[PSObject]]::new()
 $allCDCJobs          = [System.Collections.Generic.List[PSObject]]::new()
@@ -758,6 +759,49 @@ WHERE s.subscriber_db IS NOT NULL
         } # end if ($distDbName)
     }
 
+    # Publisher-side distributor mapping (works even if distributor isn't scanned)
+    $pubDistQuery = @"
+BEGIN TRY
+    CREATE TABLE #dist (
+        distributor NVARCHAR(256),
+        [distribution database] NVARCHAR(256),
+        [working directory] NVARCHAR(512),
+        [account] NVARCHAR(256),
+        [security mode] INT
+    );
+
+    INSERT INTO #dist EXEC master.dbo.sp_helpdistributor;
+
+    SELECT
+        CONVERT(NVARCHAR(256), SERVERPROPERTY('ServerName')) AS PublisherServer,
+        distributor AS DistributorServer,
+        [distribution database] AS DistributionDB
+    FROM #dist;
+END TRY
+BEGIN CATCH
+    -- If not configured for replication, sp_helpdistributor can throw; ignore.
+END CATCH
+
+IF OBJECT_ID('tempdb..#dist') IS NOT NULL
+    DROP TABLE #dist;
+"@
+    $pubDistData = Invoke-SqlQuerySafe -ServerInstance $server -Query $pubDistQuery
+    $currentPublisherDistributor = $null
+    if ($pubDistData) {
+        foreach ($row in $pubDistData) {
+            if (-not [string]::IsNullOrWhiteSpace($row.DistributorServer)) {
+                [void]$allPublisherDistMap.Add([PSCustomObject]@{
+                    PublisherServer   = $row.PublisherServer
+                    DistributorServer = $row.DistributorServer
+                    DistributionDB    = $row.DistributionDB
+                })
+                if (-not $currentPublisherDistributor) {
+                    $currentPublisherDistributor = $row.DistributorServer
+                }
+            }
+        }
+    }
+
     # Get publications (if this server is a publisher)
     $pubQuery = @"
 DECLARE @hasRepl INT = 0;
@@ -822,6 +866,7 @@ END
         $hasRepl = $true
         foreach ($row in $pubData) {
             [void]$allPublications.Add([PSCustomObject]@{
+                DistributorServer = $currentPublisherDistributor
                 PublisherServer   = $row.PublisherServer
                 PublisherDB       = $row.PublisherDB
                 PublicationName   = $row.PublicationName
@@ -953,6 +998,7 @@ DROP TABLE #subs;
         $hasRepl = $true
         foreach ($row in $subData) {
             [void]$allSubscriptions.Add([PSCustomObject]@{
+                DistributorServer  = $currentPublisherDistributor
                 PublisherServer    = $row.PublisherServer
                 PublisherDB        = $row.PublisherDB
                 PublicationName    = $row.PublicationName
@@ -1199,6 +1245,11 @@ if (-not $InventoryOnly) {
             Sort-Object DistributorServer, PublisherServer, PublisherDB, PublicationName -Unique
         Write-Host "  Distributor mappings: $($allReplDistMap.Count) unique" -ForegroundColor DarkGray
     }
+    if ($allPublisherDistMap.Count -gt 0) {
+        $allPublisherDistMap = $allPublisherDistMap |
+            Sort-Object PublisherServer, DistributorServer, DistributionDB -Unique
+        Write-Host "  Publisher distributor mappings: $($allPublisherDistMap.Count) unique" -ForegroundColor DarkGray
+    }
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1233,6 +1284,12 @@ if (-not $InventoryOnly -and $allSubscriptions.Count -gt 0) {
         if (-not $distByFullPubLookup.ContainsKey($key)) { $distByFullPubLookup[$key] = $m.DistributorServer }
     }
 
+    $distByPublisherLookup = @{}
+    foreach ($m in $allPublisherDistMap) {
+        $key = "$($m.PublisherServer)"
+        if (-not $distByPublisherLookup.ContainsKey($key)) { $distByPublisherLookup[$key] = $m.DistributorServer }
+    }
+
     # Secondary lookup: distributor by publication only (2-part key).
     # Used when the 4-part schedule key misses due to subscriber name format differences
     # (e.g. publisher-side s.srvname vs distributor-side master.sys.servers.name).
@@ -1262,9 +1319,11 @@ if (-not $InventoryOnly -and $allSubscriptions.Count -gt 0) {
 
         # Find distributor: prefer direct distributor-side publication mapping,
         # then exact schedule match, then publication-level lookup.
-        $distServer = if ($distByFullPubLookup.ContainsKey($pubKey)) { $distByFullPubLookup[$pubKey] }
+        $distServer = if (-not [string]::IsNullOrWhiteSpace($sub.DistributorServer)) { $sub.DistributorServer }
+                  elseif ($distByFullPubLookup.ContainsKey($pubKey)) { $distByFullPubLookup[$pubKey] }
                   elseif ($sched) { $sched.DistributorServer }
                   elseif ($distByPubLookup.ContainsKey($distPubKey)) { $distByPubLookup[$distPubKey] }
+                      elseif ($distByPublisherLookup.ContainsKey($sub.PublisherServer)) { $distByPublisherLookup[$sub.PublisherServer] }
                   elseif (-not [string]::IsNullOrWhiteSpace($singleDistributorServer)) { $singleDistributorServer }
                   else { 'Unknown' }
 
