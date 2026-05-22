@@ -266,6 +266,7 @@ $allArticles         = [System.Collections.Generic.List[PSObject]]::new()
 $allSubscriptions    = [System.Collections.Generic.List[PSObject]]::new()
 $allDistributors     = [System.Collections.Generic.List[PSObject]]::new()
 $allReplSchedules    = [System.Collections.Generic.List[PSObject]]::new()
+$allReplDistMap      = [System.Collections.Generic.List[PSObject]]::new()
 $allCDCDatabases     = [System.Collections.Generic.List[PSObject]]::new()
 $allCDCTables        = [System.Collections.Generic.List[PSObject]]::new()
 $allCDCJobs          = [System.Collections.Generic.List[PSObject]]::new()
@@ -553,6 +554,7 @@ IF @distDb IS NOT NULL AND EXISTS (SELECT 1 FROM sys.databases WHERE name = @dis
         # ── Distributor-side: publications from distribution DB ────────────
         $distPubQuery = @"
 SELECT DISTINCT
+    CONVERT(NVARCHAR(256), SERVERPROPERTY('ServerName')) AS DistributorServer,
     ISNULL(srv.name, CAST(pub.publisher_id AS VARCHAR(20))) AS PublisherServer,
     pub.publisher_db                  AS PublisherDB,
     pub.publication                   AS PublicationName,
@@ -575,7 +577,15 @@ LEFT JOIN master.sys.servers srv ON pub.publisher_id = srv.server_id
         if ($distPubData) {
             $hasRepl = $true
             foreach ($row in $distPubData) {
+                [void]$allReplDistMap.Add([PSCustomObject]@{
+                    DistributorServer = $row.DistributorServer
+                    PublisherServer   = $row.PublisherServer
+                    PublisherDB       = $row.PublisherDB
+                    PublicationName   = $row.PublicationName
+                })
+
                 [void]$allPublications.Add([PSCustomObject]@{
+                    DistributorServer = $row.DistributorServer
                     PublisherServer   = $row.PublisherServer
                     PublisherDB       = $row.PublisherDB
                     PublicationName   = $row.PublicationName
@@ -626,6 +636,7 @@ LEFT JOIN master.sys.servers srv ON a.publisher_id = srv.server_id
         # ── Distributor-side: subscriptions from distribution DB ──────────
         $distSubQuery = @"
 SELECT DISTINCT
+    CONVERT(NVARCHAR(256), SERVERPROPERTY('ServerName')) AS DistributorServer,
     ISNULL(srv_pub.name, CAST(da.publisher_id AS VARCHAR(20))) AS PublisherServer,
     da.publisher_db                   AS PublisherDB,
     da.publication                    AS PublicationName,
@@ -652,7 +663,15 @@ WHERE s.subscriber_db IS NOT NULL
         if ($distSubData) {
             $hasRepl = $true
             foreach ($row in $distSubData) {
+                [void]$allReplDistMap.Add([PSCustomObject]@{
+                    DistributorServer = $row.DistributorServer
+                    PublisherServer   = $row.PublisherServer
+                    PublisherDB       = $row.PublisherDB
+                    PublicationName   = $row.PublicationName
+                })
+
                 [void]$allSubscriptions.Add([PSCustomObject]@{
+                    DistributorServer  = $row.DistributorServer
                     PublisherServer    = $row.PublisherServer
                     PublisherDB        = $row.PublisherDB
                     PublicationName    = $row.PublicationName
@@ -1175,6 +1194,11 @@ if (-not $InventoryOnly) {
             Sort-Object ServerName, DistributionDB -Unique
         Write-Host "  Distributors: $($allDistributors.Count) unique" -ForegroundColor DarkGray
     }
+    if ($allReplDistMap.Count -gt 0) {
+        $allReplDistMap = $allReplDistMap |
+            Sort-Object DistributorServer, PublisherServer, PublisherDB, PublicationName -Unique
+        Write-Host "  Distributor mappings: $($allReplDistMap.Count) unique" -ForegroundColor DarkGray
+    }
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1203,6 +1227,12 @@ if (-not $InventoryOnly -and $allSubscriptions.Count -gt 0) {
         if (-not $schedLookup.ContainsKey($key)) { $schedLookup[$key] = $s }
     }
 
+    $distByFullPubLookup = @{}
+    foreach ($m in $allReplDistMap) {
+        $key = "$($m.PublisherServer)|$($m.PublisherDB)|$($m.PublicationName)"
+        if (-not $distByFullPubLookup.ContainsKey($key)) { $distByFullPubLookup[$key] = $m.DistributorServer }
+    }
+
     # Secondary lookup: distributor by publication only (2-part key).
     # Used when the 4-part schedule key misses due to subscriber name format differences
     # (e.g. publisher-side s.srvname vs distributor-side master.sys.servers.name).
@@ -1210,6 +1240,15 @@ if (-not $InventoryOnly -and $allSubscriptions.Count -gt 0) {
     foreach ($s in $allReplSchedules) {
         $key = "$($s.PublisherDB)|$($s.PublicationName)"
         if (-not $distByPubLookup.ContainsKey($key)) { $distByPubLookup[$key] = $s.DistributorServer }
+    }
+    foreach ($m in $allReplDistMap) {
+        $key = "$($m.PublisherDB)|$($m.PublicationName)"
+        if (-not $distByPubLookup.ContainsKey($key)) { $distByPubLookup[$key] = $m.DistributorServer }
+    }
+
+    $singleDistributorServer = $null
+    if ($allDistributors.Count -eq 1) {
+        $singleDistributorServer = $allDistributors[0].ServerName
     }
 
     foreach ($sub in $allSubscriptions) {
@@ -1221,10 +1260,13 @@ if (-not $InventoryOnly -and $allSubscriptions.Count -gt 0) {
         $artCt = if ($artCountLookup.ContainsKey($pubKey)) { $artCountLookup[$pubKey] } else { 0 }
         $sched = $schedLookup[$schedKey]
 
-        # Find distributor: prefer exact schedule match, fall back to publication-level lookup
-        $distServer = if ($sched) { $sched.DistributorServer }
-                      elseif ($distByPubLookup.ContainsKey($distPubKey)) { $distByPubLookup[$distPubKey] }
-                      else { 'Unknown' }
+        # Find distributor: prefer direct distributor-side publication mapping,
+        # then exact schedule match, then publication-level lookup.
+        $distServer = if ($distByFullPubLookup.ContainsKey($pubKey)) { $distByFullPubLookup[$pubKey] }
+                  elseif ($sched) { $sched.DistributorServer }
+                  elseif ($distByPubLookup.ContainsKey($distPubKey)) { $distByPubLookup[$distPubKey] }
+                  elseif (-not [string]::IsNullOrWhiteSpace($singleDistributorServer)) { $singleDistributorServer }
+                  else { 'Unknown' }
 
         [void]$allReplTopology.Add([PSCustomObject]@{
             DistributorServer  = $distServer
