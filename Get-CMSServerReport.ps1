@@ -759,31 +759,24 @@ WHERE s.subscriber_db IS NOT NULL
         } # end if ($distDbName)
     }
 
-    # Publisher-side distributor mapping (works even if distributor isn't scanned)
+    # Publisher-side distributor mapping via OUTPUT params (reliable across all SQL Server versions)
     $pubDistQuery = @"
+DECLARE @dist  NVARCHAR(256);
+DECLARE @distdb NVARCHAR(128);
 BEGIN TRY
-    CREATE TABLE #dist (
-        distributor NVARCHAR(256),
-        [distribution database] NVARCHAR(256),
-        [working directory] NVARCHAR(512),
-        [account] NVARCHAR(256),
-        [security mode] INT
-    );
-
-    INSERT INTO #dist EXEC master.dbo.sp_helpdistributor;
-
-    SELECT
-        CONVERT(NVARCHAR(256), SERVERPROPERTY('ServerName')) AS PublisherServer,
-        distributor AS DistributorServer,
-        [distribution database] AS DistributionDB
-    FROM #dist;
+    EXEC master.dbo.sp_helpdistributor
+        @distributor = @dist    OUTPUT,
+        @distribdb   = @distdb  OUTPUT;
 END TRY
 BEGIN CATCH
-    -- If not configured for replication, sp_helpdistributor can throw; ignore.
-END CATCH
-
-IF OBJECT_ID('tempdb..#dist') IS NOT NULL
-    DROP TABLE #dist;
+    -- Server not configured as publisher/distributor – return nothing.
+    SELECT NULL AS PublisherServer, NULL AS DistributorServer, NULL AS DistributionDB WHERE 1=0;
+END CATCH;
+IF @dist IS NOT NULL
+    SELECT
+        CONVERT(NVARCHAR(256), SERVERPROPERTY('ServerName')) AS PublisherServer,
+        @dist   AS DistributorServer,
+        @distdb AS DistributionDB;
 "@
     $pubDistData = Invoke-SqlQuerySafe -ServerInstance $server -Query $pubDistQuery
     $currentPublisherDistributor = $null
@@ -1231,8 +1224,17 @@ if (-not $InventoryOnly) {
         Write-Host "  Articles: $($allArticles.Count) unique" -ForegroundColor DarkGray
     }
     if ($allSubscriptions.Count -gt 0) {
+        # Group by logical key and keep the row that has DistributorServer populated;
+        # this handles the case where both distributor-side and publisher-side rows
+        # exist for the same subscription and only one carries the distributor name.
         $allSubscriptions = $allSubscriptions |
-            Sort-Object PublisherServer, PublisherDB, PublicationName, SubscriberServer, SubscriberDB -Unique
+            Group-Object PublisherServer, PublisherDB, PublicationName, SubscriberServer, SubscriberDB |
+            ForEach-Object {
+                # Prefer the row with a non-blank DistributorServer
+                $best = $_.Group | Where-Object { -not [string]::IsNullOrWhiteSpace($_.DistributorServer) } | Select-Object -First 1
+                if (-not $best) { $best = $_.Group | Select-Object -First 1 }
+                $best
+            }
         Write-Host "  Subscriptions: $($allSubscriptions.Count) unique" -ForegroundColor DarkGray
     }
     if ($allDistributors.Count -gt 0) {
