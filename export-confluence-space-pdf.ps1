@@ -111,6 +111,7 @@ function Get-AllPages {
     )
 
     $byId = @{}
+    $discoveryMode = 'strict'
 
     function Get-ApiResultItems {
         param([object]$Response)
@@ -170,19 +171,37 @@ function Get-AllPages {
     }
 
     $contentTotal = 0
-    $start = 0
-    while ($true) {
-        $uri = "$ApiBase/content?spaceKey=$([Uri]::EscapeDataString($Key))&type=page&status=current&expand=ancestors,version&limit=$BatchSize&start=$start"
-        $response = Invoke-RestMethod -Uri $uri -Method Get -Headers $Headers -ErrorAction Stop
-        $batch = @(Get-ApiResultItems -Response $response)
-        if ($batch.Count -eq 0) { break }
-        $added = Add-UniquePages -Items $batch
-        $contentTotal += $added
-        Write-Host ("  content    start={0,4} got={1,3} added={2,3} total={3}" -f $start, $batch.Count, $added, $byId.Count) -ForegroundColor DarkGray
-        Write-BatchDiagnostics -Label 'content' -Start $start -Returned $batch.Count -Response $response -Added $added -Unique $byId.Count
-        $start += $batch.Count
-        if (-not $response._links.next) { break }
+
+    function Invoke-ContentDiscovery {
+        param([switch]$Relaxed)
+
+        $addedTotal = 0
+        $start = 0
+        while ($true) {
+            if ($Relaxed) {
+                $uri = "$ApiBase/content?spaceKey=$([Uri]::EscapeDataString($Key))&type=page&expand=ancestors,version&limit=$BatchSize&start=$start"
+            }
+            else {
+                $uri = "$ApiBase/content?spaceKey=$([Uri]::EscapeDataString($Key))&type=page&status=current&expand=ancestors,version&limit=$BatchSize&start=$start"
+            }
+
+            $response = Invoke-RestMethod -Uri $uri -Method Get -Headers $Headers -ErrorAction Stop
+            $batch = @(Get-ApiResultItems -Response $response)
+            if ($batch.Count -eq 0) { break }
+
+            $added = Add-UniquePages -Items $batch
+            $addedTotal += $added
+            $label = if ($Relaxed) { 'content-relaxed' } else { 'content' }
+            Write-Host ("  {0,-12} start={1,4} got={2,3} added={3,3} total={4}" -f $label, $start, $batch.Count, $added, $byId.Count) -ForegroundColor DarkGray
+            Write-BatchDiagnostics -Label $label -Start $start -Returned $batch.Count -Response $response -Added $added -Unique $byId.Count
+            $start += $batch.Count
+            if (-not $response._links.next) { break }
+        }
+
+        return $addedTotal
     }
+
+    $contentTotal += (Invoke-ContentDiscovery)
 
     $searchTotal = 0
     try {
@@ -230,11 +249,34 @@ function Get-AllPages {
                 $homePage = Invoke-RestMethod -Uri $homeUri -Method Get -Headers $Headers -ErrorAction Stop
                 $null = Add-UniquePages -Items @($homePage)
             } catch {
+                if ($Diagnostics) {
+                    Write-Host ("  diag home-page fetch failed: {0}" -f $_.Exception.Message) -ForegroundColor DarkYellow
+                }
             }
         }
     }
 
-    Write-Host ("  discovery totals -> content:{0} cql:{1} descendants:{2} unique:{3}" -f $contentTotal, $searchTotal, $descTotal, $byId.Count) -ForegroundColor DarkGray
+    if ($byId.Count -eq 0) {
+        Write-Host '  strict discovery returned zero pages. Trying relaxed content discovery...' -ForegroundColor DarkYellow
+        $discoveryMode = 'relaxed'
+        $contentTotal += (Invoke-ContentDiscovery -Relaxed)
+
+        if (-not [string]::IsNullOrWhiteSpace($HomePageId) -and -not $byId.ContainsKey($HomePageId)) {
+            try {
+                $homeUri = "$ApiBase/content/$HomePageId?expand=ancestors,version"
+                $homePage = Invoke-RestMethod -Uri $homeUri -Method Get -Headers $Headers -ErrorAction Stop
+                $null = Add-UniquePages -Items @($homePage)
+                Write-Host '  relaxed mode recovered home page directly by ID.' -ForegroundColor DarkGray
+            }
+            catch {
+                if ($Diagnostics) {
+                    Write-Host ("  diag relaxed home-page fetch failed: {0}" -f $_.Exception.Message) -ForegroundColor DarkYellow
+                }
+            }
+        }
+    }
+
+    Write-Host ("  discovery totals -> mode:{0} content:{1} cql:{2} descendants:{3} unique:{4}" -f $discoveryMode, $contentTotal, $searchTotal, $descTotal, $byId.Count) -ForegroundColor DarkGray
 
     if ($Diagnostics -and $byId.Count -gt 0) {
         $typeCounts = @{}
