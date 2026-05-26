@@ -424,6 +424,40 @@ function Get-PageBodyHtml {
     return [string]$response.body.export_view.value
 }
 
+function Resolve-ConfluenceUrl {
+    param(
+        [Parameter(Mandatory)][string]$BaseUrl,
+        [Parameter(Mandatory)][string]$PathOrUrl
+    )
+
+    if ([string]::IsNullOrWhiteSpace($PathOrUrl)) { return $null }
+    if ($PathOrUrl -match '^https?://') { return $PathOrUrl }
+
+    try {
+        $baseUri = [Uri]$BaseUrl
+        return ([Uri]::new($baseUri, $PathOrUrl)).AbsoluteUri
+    }
+    catch {
+        return ($BaseUrl.TrimEnd('/') + '/' + $PathOrUrl.TrimStart('/'))
+    }
+}
+
+function Normalize-Ancestors {
+    param([object]$AncestorsValue)
+
+    if ($null -eq $AncestorsValue) { return @() }
+
+    $candidate = $AncestorsValue
+    if ($candidate -is [System.Collections.IDictionary] -and $candidate.Contains('results')) {
+        $candidate = $candidate['results']
+    }
+    elseif ($candidate -is [System.Management.Automation.PSCustomObject] -and $null -ne $candidate.results) {
+        $candidate = $candidate.results
+    }
+
+    return @($candidate)
+}
+
 function Get-ResolvedAncestors {
     param(
         [object]$Page,
@@ -445,29 +479,38 @@ function Get-ResolvedAncestors {
 
     $inlineAncestors = $null
     try { $inlineAncestors = $Page.ancestors } catch { $inlineAncestors = $null }
-    # Confluence API v1 returns ancestors as a plain array, never wrapped in {results:[]}.
-    # Only unwrap if it is genuinely a PSCustomObject envelope (defensive guard).
-    if ($inlineAncestors -is [System.Management.Automation.PSCustomObject] -and $null -ne $inlineAncestors.results) {
-        $inlineAncestors = $inlineAncestors.results
+    $inlineAncestors = Normalize-Ancestors -AncestorsValue $inlineAncestors
+
+    $uri = "$ApiBase/content/$pageId?expand=ancestors"
+    for ($attempt = 1; $attempt -le 3; $attempt++) {
+        try {
+            $fullPage = Invoke-RestMethod -Uri $uri -Method Get -Headers $Headers -ErrorAction Stop
+            $resolvedArray = Normalize-Ancestors -AncestorsValue $fullPage.ancestors
+            if ($resolvedArray.Count -eq 0 -and $inlineAncestors.Count -gt 0) {
+                $resolvedArray = $inlineAncestors
+            }
+            $AncestorCache[$pageId] = $resolvedArray
+            return $resolvedArray
+        }
+        catch {
+            $statusCode = 0
+            if ($null -ne $_.Exception.Response) {
+                try { $statusCode = [int]$_.Exception.Response.StatusCode } catch { $statusCode = 0 }
+            }
+
+            $message = [string]$_.Exception.Message
+            $isTransient = ($statusCode -in @(429, 500, 502, 503, 504)) -or ($message -match 'timed out|timeout|temporar')
+            if ($attempt -lt 3 -and $isTransient) {
+                Start-Sleep -Milliseconds (300 * $attempt)
+                continue
+            }
+
+            break
+        }
     }
 
-    try {
-        $uri = "$ApiBase/content/$pageId?expand=ancestors"
-        $fullPage = Invoke-RestMethod -Uri $uri -Method Get -Headers $Headers -ErrorAction Stop
-        $resolved = $fullPage.ancestors
-        # Same guard: only unwrap if wrapped in a results envelope, not already a plain array.
-        if ($resolved -is [System.Management.Automation.PSCustomObject] -and $null -ne $resolved.results) {
-            $resolved = $resolved.results
-        }
-        $resolvedArray = @($resolved)
-        $AncestorCache[$pageId] = $resolvedArray
-        return $resolvedArray
-    }
-    catch {
-        $fallback = @($inlineAncestors)
-        $AncestorCache[$pageId] = $fallback
-        return $fallback
-    }
+    $AncestorCache[$pageId] = $inlineAncestors
+    return $inlineAncestors
 }
 
 function Save-WordExport {
@@ -617,15 +660,34 @@ function Save-Attachments {
     $baseName = [IO.Path]::GetFileNameWithoutExtension($BaseFilePath)
     $attachmentFolder = Join-Path -Path $PageFolder -ChildPath ($baseName + '-attachments')
 
-    try {
-        $uri = "$ApiBase/content/$PageId/child/attachment?limit=200"
-        $response = Invoke-RestMethod -Uri $uri -Method Get -Headers $Headers -ErrorAction Stop
-    }
-    catch {
-        return [PSCustomObject]@{ Count = 0; Bytes = [long]0; Path = $null }
+    $items = [System.Collections.Generic.List[object]]::new()
+    $nextUri = "$ApiBase/content/$PageId/child/attachment?limit=200"
+
+    while (-not [string]::IsNullOrWhiteSpace($nextUri)) {
+        try {
+            $response = Invoke-RestMethod -Uri $nextUri -Method Get -Headers $Headers -ErrorAction Stop
+        }
+        catch {
+            if ($items.Count -eq 0) {
+                return [PSCustomObject]@{ Count = 0; Bytes = [long]0; Path = $null }
+            }
+            break
+        }
+
+        foreach ($entry in @($response.results)) {
+            if ($null -ne $entry) { $items.Add($entry) }
+        }
+
+        $rawNext = $null
+        try { $rawNext = [string]$response._links.next } catch { $rawNext = $null }
+        if ([string]::IsNullOrWhiteSpace($rawNext)) {
+            $nextUri = $null
+        }
+        else {
+            $nextUri = Resolve-ConfluenceUrl -BaseUrl $ApiBase -PathOrUrl $rawNext
+        }
     }
 
-    $items = @($response.results)
     if ($items.Count -eq 0) {
         return [PSCustomObject]@{ Count = 0; Bytes = [long]0; Path = $null }
     }
@@ -644,7 +706,8 @@ function Save-Attachments {
         $tempFile = Join-Path -Path ([IO.Path]::GetTempPath()) -ChildPath ("cf-att-$([Guid]::NewGuid().ToString('N')).tmp")
 
         try {
-            $url = "$WikiBase$downloadPath"
+            $url = Resolve-ConfluenceUrl -BaseUrl $WikiBase -PathOrUrl $downloadPath
+            if ([string]::IsNullOrWhiteSpace($url)) { continue }
             Invoke-WebRequest -Uri $url -Method Get -OutFile $tempFile -UseBasicParsing -Headers @{ Authorization = $Headers.Authorization } -ErrorAction Stop | Out-Null
             [IO.File]::Move($tempFile, $filePath)
             $size = (Get-Item -LiteralPath $filePath).Length
