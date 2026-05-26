@@ -458,12 +458,59 @@ function Normalize-Ancestors {
     return @($candidate)
 }
 
+function Build-PageParentMap {
+    # Returns a hashtable: pageId -> PSCustomObject with .id and .title
+    # Built from the inline ancestors already pulled from the discovery API calls.
+    param([object[]]$Pages)
+
+    $map = @{}   # pageId -> direct-parent PSCustomObject (id + title)
+
+    foreach ($p in @($Pages)) {
+        $pid = [string]$p.id
+        if ([string]::IsNullOrWhiteSpace($pid)) { continue }
+
+        $ancs = Normalize-Ancestors -AncestorsValue $p.ancestors
+        if ($ancs.Count -gt 0) {
+            # The last ancestor is the direct parent
+            $parent = $ancs[$ancs.Count - 1]
+            if ($null -ne $parent -and -not [string]::IsNullOrWhiteSpace([string]$parent.id)) {
+                $map[$pid] = $parent
+            }
+        }
+    }
+
+    return $map
+}
+
+function Get-AncestorsFromParentMap {
+    # Walks the parent map upward from $pageId, returning ancestors ordered
+    # root-first (same order as Confluence's ancestors array).
+    param(
+        [string]$PageId,
+        [hashtable]$ParentMap
+    )
+
+    $chain = [System.Collections.Generic.List[object]]::new()
+    $current = $PageId
+    $visited  = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
+
+    while (-not [string]::IsNullOrWhiteSpace($current) -and $ParentMap.ContainsKey($current)) {
+        if (-not $visited.Add($current)) { break }  # cycle guard
+        $parent = $ParentMap[$current]
+        $chain.Insert(0, $parent)
+        $current = [string]$parent.id
+    }
+
+    return @($chain)
+}
+
 function Get-ResolvedAncestors {
     param(
         [object]$Page,
         [string]$ApiBase,
         [hashtable]$Headers,
-        [hashtable]$AncestorCache
+        [hashtable]$AncestorCache,
+        [hashtable]$ParentMap      # pre-built from all pages; may be $null
     )
 
     $pageId = ''
@@ -473,44 +520,35 @@ function Get-ResolvedAncestors {
         return @($AncestorCache[$pageId])
     }
 
-    if ([string]::IsNullOrWhiteSpace($pageId)) {
-        return @()
+    if ([string]::IsNullOrWhiteSpace($pageId)) { return @() }
+
+    # ── 1. Inline ancestors from the discovery payload (fastest, no extra call) ──
+    $inlineAncestors = Normalize-Ancestors -AncestorsValue $Page.ancestors
+    if ($inlineAncestors.Count -gt 0) {
+        $AncestorCache[$pageId] = $inlineAncestors
+        return $inlineAncestors
     }
 
-    $inlineAncestors = $null
-    try { $inlineAncestors = $Page.ancestors } catch { $inlineAncestors = $null }
-    $inlineAncestors = Normalize-Ancestors -AncestorsValue $inlineAncestors
-
-    $uri = "$ApiBase/content/$pageId?expand=ancestors"
-    for ($attempt = 1; $attempt -le 3; $attempt++) {
-        try {
-            $fullPage = Invoke-RestMethod -Uri $uri -Method Get -Headers $Headers -ErrorAction Stop
-            $resolvedArray = Normalize-Ancestors -AncestorsValue $fullPage.ancestors
-            if ($resolvedArray.Count -eq 0 -and $inlineAncestors.Count -gt 0) {
-                $resolvedArray = $inlineAncestors
-            }
-            $AncestorCache[$pageId] = $resolvedArray
-            return $resolvedArray
-        }
-        catch {
-            $statusCode = 0
-            if ($null -ne $_.Exception.Response) {
-                try { $statusCode = [int]$_.Exception.Response.StatusCode } catch { $statusCode = 0 }
-            }
-
-            $message = [string]$_.Exception.Message
-            $isTransient = ($statusCode -in @(429, 500, 502, 503, 504)) -or ($message -match 'timed out|timeout|temporar')
-            if ($attempt -lt 3 -and $isTransient) {
-                Start-Sleep -Milliseconds (300 * $attempt)
-                continue
-            }
-
-            break
+    # ── 2. Walk the pre-built parent map (handles v2 pages with no ancestors) ────
+    if ($null -ne $ParentMap -and $ParentMap.Count -gt 0) {
+        $fromMap = Get-AncestorsFromParentMap -PageId $pageId -ParentMap $ParentMap
+        if ($fromMap.Count -gt 0) {
+            $AncestorCache[$pageId] = $fromMap
+            return $fromMap
         }
     }
 
-    $AncestorCache[$pageId] = $inlineAncestors
-    return $inlineAncestors
+    # ── 3. Last resort: single REST call for this page's ancestors ───────────────
+    try {
+        $fullPage = Invoke-RestMethod -Uri "$ApiBase/content/$pageId?expand=ancestors" -Method Get -Headers $Headers -ErrorAction Stop
+        $resolved = Normalize-Ancestors -AncestorsValue $fullPage.ancestors
+        $AncestorCache[$pageId] = $resolved
+        return $resolved
+    }
+    catch {}
+
+    $AncestorCache[$pageId] = @()
+    return @()
 }
 
 function Save-WordExport {
@@ -653,6 +691,7 @@ function Save-Attachments {
         [string]$WikiBase,
         [string]$PageId,
         [hashtable]$Headers,
+        [Microsoft.PowerShell.Commands.WebRequestSession]$Session,
         [string]$PageFolder,
         [string]$BaseFilePath
     )
@@ -708,7 +747,16 @@ function Save-Attachments {
         try {
             $url = Resolve-ConfluenceUrl -BaseUrl $WikiBase -PathOrUrl $downloadPath
             if ([string]::IsNullOrWhiteSpace($url)) { continue }
-            Invoke-WebRequest -Uri $url -Method Get -OutFile $tempFile -UseBasicParsing -Headers @{ Authorization = $Headers.Authorization } -ErrorAction Stop | Out-Null
+            $attParams = @{
+                Uri             = $url
+                Method          = 'Get'
+                OutFile         = $tempFile
+                UseBasicParsing = $true
+                Headers         = @{ Authorization = $Headers.Authorization }
+                ErrorAction     = 'Stop'
+            }
+            if ($null -ne $Session) { $attParams.WebSession = $Session }
+            Invoke-WebRequest @attParams | Out-Null
             [IO.File]::Move($tempFile, $filePath)
             $size = (Get-Item -LiteralPath $filePath).Length
             $count++
@@ -795,6 +843,10 @@ Write-Host "Found $($pages.Count) pages." -ForegroundColor Green
 Write-Host 'Strategy: Word (.doc) primary, HTML fallback + attachments' -ForegroundColor Green
 Write-Host ''
 
+# Build parent map from inline discovery data for fast, reliable hierarchy resolution
+$pageParentMap = Build-PageParentMap -Pages $pages
+Write-Host ("Parent map built: {0} entries." -f $pageParentMap.Count) -ForegroundColor DarkGray
+
 $started = [DateTime]::UtcNow
 $failed = [System.Collections.Generic.List[object]]::new()
 $formats = @{ doc = 0; html = 0 }
@@ -822,7 +874,7 @@ foreach ($page in $pages) {
 
     $null = $currentIds.Add($pageId)
 
-    $ancestors = Get-ResolvedAncestors -Page $page -ApiBase $apiBase -Headers $headers -AncestorCache $ancestorCache
+    $ancestors = Get-ResolvedAncestors -Page $page -ApiBase $apiBase -Headers $headers -AncestorCache $ancestorCache -ParentMap $pageParentMap
 
     $folder = Get-PageFolder -Ancestors @($ancestors) -HomePageId $homePageId -Root $spaceRoot
     Ensure-Directory -Path $folder
@@ -906,7 +958,7 @@ foreach ($page in $pages) {
     $totalBytes += $fileSize
     Write-Host ("  OK {0} | {1:N0} KB" -f $format.ToUpper(), ($fileSize / 1KB)) -ForegroundColor Green
 
-    $attachmentInfo = Save-Attachments -ApiBase $apiBase -WikiBase $wikiBase -PageId $pageId -Headers $headers -PageFolder $folder -BaseFilePath $destPath
+    $attachmentInfo = Save-Attachments -ApiBase $apiBase -WikiBase $wikiBase -PageId $pageId -Headers $headers -Session $session -PageFolder $folder -BaseFilePath $destPath
     if ($attachmentInfo.Count -gt 0) {
         $attachmentsCount += $attachmentInfo.Count
         $attachmentsBytes += $attachmentInfo.Bytes
