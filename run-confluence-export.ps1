@@ -6,7 +6,8 @@ param(
     [Parameter(Mandatory = $false)][string]$ApiToken = $env:CONFLUENCE_API_TOKEN,
     [Parameter(Mandatory = $false)][string]$ExportSubFolder = 'ConfluenceExports',
     [Parameter(Mandatory = $false)][ValidateSet('Incremental','Full')][string]$ExportMode = 'Incremental',
-    [Parameter(Mandatory = $false)][ValidateRange(1,100)][int]$PageSize = 100
+    [Parameter(Mandatory = $false)][ValidateRange(1,100)][int]$PageSize = 100,
+    [Parameter(Mandatory = $false)][switch]$DiagnosticMode
 )
 
 $ErrorActionPreference = 'Stop'
@@ -59,6 +60,7 @@ try {
     Write-Host "Export target : $outputRoot"
     Write-Host "Space key     : $SpaceKey"
     Write-Host "Mode          : $ExportMode"
+    Write-Host "Diagnostic    : $DiagnosticMode"
 
     $params = @{
         ConfluenceBaseUrl = $ConfluenceBaseUrl
@@ -68,6 +70,7 @@ try {
         OutputPath        = $outputRoot
         PageSize          = $PageSize
         ExportMode        = $ExportMode
+        DiagnosticMode    = $DiagnosticMode
     }
 
     & $exporterPath @params

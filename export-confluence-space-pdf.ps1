@@ -6,7 +6,8 @@ param(
     [Parameter(Mandatory)][string]$ApiToken,
     [Parameter(Mandatory)][string]$OutputPath,
     [Parameter(Mandatory = $false)][ValidateRange(1,100)][int]$PageSize = 100,
-    [Parameter(Mandatory = $false)][ValidateSet('Incremental','Full')][string]$ExportMode = 'Incremental'
+    [Parameter(Mandatory = $false)][ValidateSet('Incremental','Full')][string]$ExportMode = 'Incremental',
+    [Parameter(Mandatory = $false)][switch]$DiagnosticMode
 )
 
 $ErrorActionPreference = 'Stop'
@@ -105,10 +106,55 @@ function Get-AllPages {
         [string]$Key,
         [hashtable]$Headers,
         [int]$BatchSize,
-        [string]$HomePageId
+        [string]$HomePageId,
+        [switch]$Diagnostics
     )
 
     $byId = @{}
+
+    function Get-ApiResultItems {
+        param([object]$Response)
+
+        if ($null -eq $Response) { return @() }
+
+        $raw = $null
+        try { $raw = $Response.results } catch { $raw = $null }
+        if ($null -eq $raw) { return @() }
+
+        $items = [System.Collections.Generic.List[object]]::new()
+        foreach ($entry in @($raw)) {
+            if ($null -ne $entry) { $items.Add($entry) }
+        }
+
+        return @($items)
+    }
+
+    function Write-BatchDiagnostics {
+        param(
+            [string]$Label,
+            [int]$Start,
+            [int]$Returned,
+            [object]$Response,
+            [int]$Added,
+            [int]$Unique
+        )
+
+        if (-not $Diagnostics) { return }
+
+        $apiSize = '?'
+        $apiLimit = '?'
+        $apiTotal = '?'
+        $hasNext = $false
+        try { if ($null -ne $Response.size) { $apiSize = [string][int]$Response.size } } catch {}
+        try { if ($null -ne $Response.limit) { $apiLimit = [string][int]$Response.limit } } catch {}
+        try { if ($null -ne $Response.totalSize) { $apiTotal = [string][int]$Response.totalSize } } catch {}
+        try { $hasNext = -not [string]::IsNullOrWhiteSpace([string]$Response._links.next) } catch { $hasNext = $false }
+
+        Write-Host (
+            "    diag({0}) start={1} returned={2} api.size={3} api.limit={4} api.totalSize={5} added={6} unique={7} next={8}" -f \
+            $Label, $Start, $Returned, $apiSize, $apiLimit, $apiTotal, $Added, $Unique, $hasNext
+        ) -ForegroundColor DarkCyan
+    }
 
     function Add-UniquePages {
         param([object[]]$Items)
@@ -128,11 +174,12 @@ function Get-AllPages {
     while ($true) {
         $uri = "$ApiBase/content?spaceKey=$([Uri]::EscapeDataString($Key))&type=page&status=current&expand=ancestors,version&limit=$BatchSize&start=$start"
         $response = Invoke-RestMethod -Uri $uri -Method Get -Headers $Headers -ErrorAction Stop
-        $batch = @($response.results)
+        $batch = @(Get-ApiResultItems -Response $response)
         if ($batch.Count -eq 0) { break }
         $added = Add-UniquePages -Items $batch
         $contentTotal += $added
         Write-Host ("  content    start={0,4} got={1,3} added={2,3} total={3}" -f $start, $batch.Count, $added, $byId.Count) -ForegroundColor DarkGray
+        Write-BatchDiagnostics -Label 'content' -Start $start -Returned $batch.Count -Response $response -Added $added -Unique $byId.Count
         $start += $batch.Count
         if (-not $response._links.next) { break }
     }
@@ -144,11 +191,12 @@ function Get-AllPages {
         while ($true) {
             $uri = "$ApiBase/content/search?cql=$cql&expand=ancestors,version&limit=$BatchSize&start=$start"
             $response = Invoke-RestMethod -Uri $uri -Method Get -Headers $Headers -ErrorAction Stop
-            $batch = @($response.results)
+            $batch = @(Get-ApiResultItems -Response $response)
             if ($batch.Count -eq 0) { break }
             $added = Add-UniquePages -Items $batch
             $searchTotal += $added
             Write-Host ("  cql-search start={0,4} got={1,3} added={2,3} total={3}" -f $start, $batch.Count, $added, $byId.Count) -ForegroundColor DarkGray
+            Write-BatchDiagnostics -Label 'cql' -Start $start -Returned $batch.Count -Response $response -Added $added -Unique $byId.Count
             $start += $batch.Count
             if (-not $response._links.next) { break }
         }
@@ -163,11 +211,12 @@ function Get-AllPages {
             while ($true) {
                 $uri = "$ApiBase/content/$HomePageId/descendant/page?expand=ancestors,version&limit=$BatchSize&start=$start"
                 $response = Invoke-RestMethod -Uri $uri -Method Get -Headers $Headers -ErrorAction Stop
-                $batch = @($response.results)
+                $batch = @(Get-ApiResultItems -Response $response)
                 if ($batch.Count -eq 0) { break }
                 $added = Add-UniquePages -Items $batch
                 $descTotal += $added
                 Write-Host ("  descendants start={0,4} got={1,3} added={2,3} total={3}" -f $start, $batch.Count, $added, $byId.Count) -ForegroundColor DarkGray
+                Write-BatchDiagnostics -Label 'descendants' -Start $start -Returned $batch.Count -Response $response -Added $added -Unique $byId.Count
                 $start += $batch.Count
                 if (-not $response._links.next) { break }
             }
@@ -186,6 +235,29 @@ function Get-AllPages {
     }
 
     Write-Host ("  discovery totals -> content:{0} cql:{1} descendants:{2} unique:{3}" -f $contentTotal, $searchTotal, $descTotal, $byId.Count) -ForegroundColor DarkGray
+
+    if ($Diagnostics -and $byId.Count -gt 0) {
+        $typeCounts = @{}
+        $statusCounts = @{}
+        foreach ($row in $byId.Values) {
+            $type = ''
+            $status = ''
+            try { $type = [string]$row.type } catch { $type = '' }
+            try { $status = [string]$row.status } catch { $status = '' }
+            if ([string]::IsNullOrWhiteSpace($type)) { $type = '(blank)' }
+            if ([string]::IsNullOrWhiteSpace($status)) { $status = '(blank)' }
+
+            if (-not $typeCounts.ContainsKey($type)) { $typeCounts[$type] = 0 }
+            if (-not $statusCounts.ContainsKey($status)) { $statusCounts[$status] = 0 }
+            $typeCounts[$type]++
+            $statusCounts[$status]++
+        }
+
+        $typeSummary = ($typeCounts.GetEnumerator() | Sort-Object Name | ForEach-Object { "{0}:{1}" -f $_.Key, $_.Value }) -join ', '
+        $statusSummary = ($statusCounts.GetEnumerator() | Sort-Object Name | ForEach-Object { "{0}:{1}" -f $_.Key, $_.Value }) -join ', '
+        Write-Host ("  diag type counts   -> {0}" -f $typeSummary) -ForegroundColor DarkCyan
+        Write-Host ("  diag status counts -> {0}" -f $statusSummary) -ForegroundColor DarkCyan
+    }
 
     if ($byId.Count -eq 0) { return @() }
     return @($byId.Values | Sort-Object -Property @{ Expression = { [string]$_.title } }, @{ Expression = { [string]$_.id } })
@@ -518,9 +590,12 @@ if ($ExportMode -eq 'Incremental') {
 
 Write-Host ''
 Write-Host "Fetching pages from '$SpaceKey'..." -ForegroundColor Yellow
-$pages = @(Get-AllPages -ApiBase $apiBase -Key $SpaceKey -Headers $headers -BatchSize $PageSize -HomePageId $homePageId)
+$pages = @(Get-AllPages -ApiBase $apiBase -Key $SpaceKey -Headers $headers -BatchSize $PageSize -HomePageId $homePageId -Diagnostics:$DiagnosticMode)
 if ($pages.Count -eq 0) {
     Write-Host "No pages found for space '$SpaceKey'." -ForegroundColor Yellow
+    if ($DiagnosticMode) {
+        Write-Host "Diagnostic hint: this usually means API-visible current pages are zero (restrictions, status/type mismatch, or policy filters)." -ForegroundColor DarkYellow
+    }
     exit 0
 }
 Write-Host "Found $($pages.Count) pages." -ForegroundColor Green
