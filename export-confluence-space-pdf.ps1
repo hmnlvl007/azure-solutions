@@ -171,7 +171,19 @@ function Get-AllPages {
         foreach ($item in @($Items)) {
             $id = [string]$item.id
             if ([string]::IsNullOrWhiteSpace($id)) { continue }
-            if ($byId.ContainsKey($id)) { continue }
+            if ($byId.ContainsKey($id)) {
+                $existing = $byId[$id]
+                $existingAncestors = @()
+                $incomingAncestors = @()
+
+                try { $existingAncestors = @(Normalize-Ancestors -AncestorsValue $existing.ancestors) } catch { $existingAncestors = @() }
+                try { $incomingAncestors = @(Normalize-Ancestors -AncestorsValue $item.ancestors) } catch { $incomingAncestors = @() }
+
+                if ($existingAncestors.Count -eq 0 -and $incomingAncestors.Count -gt 0) {
+                    $byId[$id] = $item
+                }
+                continue
+            }
             $byId[$id] = $item
             $added++
         }
@@ -460,22 +472,68 @@ function Normalize-Ancestors {
 
 function Build-PageParentMap {
     # Returns a hashtable: pageId -> PSCustomObject with .id and .title
-    # Built from the inline ancestors already pulled from the discovery API calls.
+    # Built from inline ancestors and v2-style parent fields in discovery payloads.
     param([object[]]$Pages)
 
     $map = @{}   # pageId -> direct-parent PSCustomObject (id + title)
+    $titleById = @{}
+
+    foreach ($p in @($Pages)) {
+        $id = [string]$p.id
+        if ([string]::IsNullOrWhiteSpace($id)) { continue }
+        $title = ''
+        try { $title = [string]$p.title } catch { $title = '' }
+        if (-not [string]::IsNullOrWhiteSpace($title)) {
+            $titleById[$id] = $title
+        }
+    }
 
     foreach ($p in @($Pages)) {
         $pageId = [string]$p.id
         if ([string]::IsNullOrWhiteSpace($pageId)) { continue }
+
+        $parentId = ''
+        $parentTitle = ''
 
         $ancs = Normalize-Ancestors -AncestorsValue $p.ancestors
         if ($ancs.Count -gt 0) {
             # The last ancestor is the direct parent
             $parent = $ancs[$ancs.Count - 1]
             if ($null -ne $parent -and -not [string]::IsNullOrWhiteSpace([string]$parent.id)) {
-                $map[$pageId] = $parent
+                $parentId = [string]$parent.id
+                try { $parentTitle = [string]$parent.title } catch { $parentTitle = '' }
             }
+        }
+
+        if ([string]::IsNullOrWhiteSpace($parentId)) {
+            try { $parentId = [string]$p.parentId } catch { $parentId = '' }
+        }
+
+        if ([string]::IsNullOrWhiteSpace($parentId)) {
+            try { $parentId = [string]$p.parent.id } catch { $parentId = '' }
+        }
+
+        if ([string]::IsNullOrWhiteSpace($parentId)) {
+            $parentPath = ''
+            try { $parentPath = [string]$p._expandable.parent } catch { $parentPath = '' }
+            if (-not [string]::IsNullOrWhiteSpace($parentPath)) {
+                $m = [regex]::Match($parentPath, '/content/([^/?]+)')
+                if ($m.Success) {
+                    $parentId = [string]$m.Groups[1].Value
+                }
+            }
+        }
+
+        if ([string]::IsNullOrWhiteSpace($parentId)) { continue }
+        if ($parentId -eq $pageId) { continue }
+
+        if ([string]::IsNullOrWhiteSpace($parentTitle) -and $titleById.ContainsKey($parentId)) {
+            $parentTitle = [string]$titleById[$parentId]
+        }
+
+        $map[$pageId] = [PSCustomObject]@{
+            id    = $parentId
+            title = $parentTitle
         }
     }
 
@@ -510,7 +568,8 @@ function Get-ResolvedAncestors {
         [string]$ApiBase,
         [hashtable]$Headers,
         [hashtable]$AncestorCache,
-        [hashtable]$ParentMap      # pre-built from all pages; may be $null
+        [hashtable]$ParentMap,      # pre-built from all pages; may be $null
+        [switch]$Diagnostics
     )
 
     $pageId = ''
@@ -538,14 +597,49 @@ function Get-ResolvedAncestors {
         }
     }
 
-    # ── 3. Last resort: single REST call for this page's ancestors ───────────────
+    # ── 3. Last resort: REST calls for this page's ancestors ─────────────────────
+    $resolved = @()
     try {
         $fullPage = Invoke-RestMethod -Uri "$ApiBase/content/$pageId?expand=ancestors" -Method Get -Headers $Headers -ErrorAction Stop
-        $resolved = Normalize-Ancestors -AncestorsValue $fullPage.ancestors
+        $resolved = @(Normalize-Ancestors -AncestorsValue $fullPage.ancestors)
+    }
+    catch {
+        if ($Diagnostics) {
+            Write-Host ("  diag ancestors expand call failed for {0}: {1}" -f $pageId, $_.Exception.Message) -ForegroundColor DarkYellow
+        }
+    }
+
+    if ($resolved.Count -eq 0) {
+        $ancestorsUri = $null
+        try { $ancestorsUri = [string]$Page._expandable.ancestors } catch { $ancestorsUri = $null }
+
+        if ([string]::IsNullOrWhiteSpace($ancestorsUri)) {
+            $ancestorsUri = "$ApiBase/content/$pageId/ancestors"
+        }
+        elseif ($ancestorsUri -notmatch '^https?://') {
+            $ancestorsUri = Resolve-ConfluenceUrl -BaseUrl $ApiBase -PathOrUrl $ancestorsUri
+        }
+
+        try {
+            $ancestorsResponse = Invoke-RestMethod -Uri $ancestorsUri -Method Get -Headers $Headers -ErrorAction Stop
+            if ($ancestorsResponse -is [System.Array]) {
+                $resolved = @($ancestorsResponse)
+            }
+            else {
+                $resolved = @(Normalize-Ancestors -AncestorsValue $ancestorsResponse)
+            }
+        }
+        catch {
+            if ($Diagnostics) {
+                Write-Host ("  diag ancestors endpoint failed for {0}: {1}" -f $pageId, $_.Exception.Message) -ForegroundColor DarkYellow
+            }
+        }
+    }
+
+    if ($resolved.Count -gt 0) {
         $AncestorCache[$pageId] = $resolved
         return $resolved
     }
-    catch {}
 
     $AncestorCache[$pageId] = @()
     return @()
@@ -874,7 +968,7 @@ foreach ($page in $pages) {
 
     $null = $currentIds.Add($pageId)
 
-    $ancestors = Get-ResolvedAncestors -Page $page -ApiBase $apiBase -Headers $headers -AncestorCache $ancestorCache -ParentMap $pageParentMap
+    $ancestors = Get-ResolvedAncestors -Page $page -ApiBase $apiBase -Headers $headers -AncestorCache $ancestorCache -ParentMap $pageParentMap -Diagnostics:$DiagnosticMode
 
     $folder = Get-PageFolder -Ancestors @($ancestors) -HomePageId $homePageId -Root $spaceRoot
     Ensure-Directory -Path $folder
