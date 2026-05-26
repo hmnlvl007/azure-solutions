@@ -113,6 +113,14 @@ function Get-AllPages {
     $byId = @{}
     $discoveryMode = 'strict'
 
+    function Get-WikiRootFromApiBase {
+        param([string]$Base)
+        if ($Base -match '/rest/api/?$') {
+            return ($Base -replace '/rest/api/?$', '')
+        }
+        return $Base.TrimEnd('/')
+    }
+
     function Get-ApiResultItems {
         param([object]$Response)
 
@@ -168,6 +176,70 @@ function Get-AllPages {
             $added++
         }
         return $added
+    }
+
+    function Invoke-V2PageDiscovery {
+        param([switch]$RelaxedStatus)
+
+        $wikiRoot = Get-WikiRootFromApiBase -Base $ApiBase
+        $spaceId = $null
+        try {
+            $spacesUri = "$wikiRoot/api/v2/spaces?keys=$([Uri]::EscapeDataString($Key))&limit=1"
+            $spacesResponse = Invoke-RestMethod -Uri $spacesUri -Method Get -Headers $Headers -ErrorAction Stop
+            foreach ($candidate in @($spacesResponse.results)) {
+                $candidateId = [string]$candidate.id
+                if (-not [string]::IsNullOrWhiteSpace($candidateId)) {
+                    $spaceId = $candidateId
+                    break
+                }
+            }
+        }
+        catch {
+            if ($Diagnostics) {
+                Write-Host ("  diag v2 spaces lookup failed: {0}" -f $_.Exception.Message) -ForegroundColor DarkYellow
+            }
+            return 0
+        }
+
+        if ([string]::IsNullOrWhiteSpace($spaceId)) {
+            if ($Diagnostics) {
+                Write-Host '  diag v2 spaces lookup returned no matching space id.' -ForegroundColor DarkYellow
+            }
+            return 0
+        }
+
+        $addedTotal = 0
+        if ($RelaxedStatus) {
+            $nextUri = "$wikiRoot/api/v2/pages?space-id=$([Uri]::EscapeDataString($spaceId))&limit=$BatchSize"
+        }
+        else {
+            $nextUri = "$wikiRoot/api/v2/pages?space-id=$([Uri]::EscapeDataString($spaceId))&status=current&limit=$BatchSize"
+        }
+
+        while (-not [string]::IsNullOrWhiteSpace($nextUri)) {
+            $response = Invoke-RestMethod -Uri $nextUri -Method Get -Headers $Headers -ErrorAction Stop
+            $batch = @(Get-ApiResultItems -Response $response)
+            if ($batch.Count -eq 0) { break }
+
+            $added = Add-UniquePages -Items $batch
+            $addedTotal += $added
+            $label = if ($RelaxedStatus) { 'v2-relaxed' } else { 'v2' }
+            Write-Host ("  {0,-12} got={1,3} added={2,3} total={3}" -f $label, $batch.Count, $added, $byId.Count) -ForegroundColor DarkGray
+
+            $rawNext = $null
+            try { $rawNext = [string]$response._links.next } catch { $rawNext = $null }
+            if ([string]::IsNullOrWhiteSpace($rawNext)) {
+                $nextUri = $null
+            }
+            elseif ($rawNext -match '^https?://') {
+                $nextUri = $rawNext
+            }
+            else {
+                $nextUri = "$wikiRoot$rawNext"
+            }
+        }
+
+        return $addedTotal
     }
 
     $contentTotal = 0
@@ -273,6 +345,22 @@ function Get-AllPages {
                     Write-Host ("  diag relaxed home-page fetch failed: {0}" -f $_.Exception.Message) -ForegroundColor DarkYellow
                 }
             }
+        }
+    }
+
+    if ($byId.Count -eq 0) {
+        Write-Host '  v1 discovery returned zero pages. Trying Confluence API v2 discovery...' -ForegroundColor DarkYellow
+        $discoveryMode = 'v2'
+        try {
+            $v2Added = Invoke-V2PageDiscovery
+            if ($v2Added -eq 0) {
+                Write-Host '  v2 current-status discovery returned zero pages. Trying v2 relaxed status...' -ForegroundColor DarkYellow
+                $discoveryMode = 'v2-relaxed'
+                $null = Invoke-V2PageDiscovery -RelaxedStatus
+            }
+        }
+        catch {
+            Write-Host ("  v2 discovery unavailable: {0}" -f $_.Exception.Message) -ForegroundColor DarkYellow
         }
     }
 
