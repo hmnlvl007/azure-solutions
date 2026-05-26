@@ -466,15 +466,15 @@ function Build-PageParentMap {
     $map = @{}   # pageId -> direct-parent PSCustomObject (id + title)
 
     foreach ($p in @($Pages)) {
-        $pid = [string]$p.id
-        if ([string]::IsNullOrWhiteSpace($pid)) { continue }
+        $pageId = [string]$p.id
+        if ([string]::IsNullOrWhiteSpace($pageId)) { continue }
 
         $ancs = Normalize-Ancestors -AncestorsValue $p.ancestors
         if ($ancs.Count -gt 0) {
             # The last ancestor is the direct parent
             $parent = $ancs[$ancs.Count - 1]
             if ($null -ne $parent -and -not [string]::IsNullOrWhiteSpace([string]$parent.id)) {
-                $map[$pid] = $parent
+                $map[$pageId] = $parent
             }
         }
     }
