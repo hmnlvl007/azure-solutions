@@ -151,7 +151,7 @@ function Get-AllPages {
         try { $hasNext = -not [string]::IsNullOrWhiteSpace([string]$Response._links.next) } catch { $hasNext = $false }
 
         Write-Host (
-            "    diag({0}) start={1} returned={2} api.size={3} api.limit={4} api.totalSize={5} added={6} unique={7} next={8}" -f \
+            "    diag({0}) start={1} returned={2} api.size={3} api.limit={4} api.totalSize={5} added={6} unique={7} next={8}" -f
             $Label, $Start, $Returned, $apiSize, $apiLimit, $apiTotal, $Added, $Unique, $hasNext
         ) -ForegroundColor DarkCyan
     }
