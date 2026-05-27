@@ -548,69 +548,44 @@ function Invoke-FileDownload {
         [Microsoft.PowerShell.Commands.WebRequestSession]$Session
     )
 
-    $request = $null
-    $response = $null
     $statusCode = $null
     $location = $null
 
     try {
-        $request = [System.Net.HttpWebRequest]::Create($Url)
-        $request.Method = 'GET'
-        $request.AllowAutoRedirect = $false
-        $request.AutomaticDecompression = [System.Net.DecompressionMethods]::GZip -bor [System.Net.DecompressionMethods]::Deflate
-        $request.Timeout = 60000
-        $request.ReadWriteTimeout = 60000
-        $request.UserAgent = 'ConfluenceSpaceExporter/1.0'
-
-        # Use a fresh cookie container for each request.
-        # Re-using WebRequestSession cookies has caused intermittent invalid-object-state failures.
-        $request.CookieContainer = New-Object System.Net.CookieContainer
-
-        if ($null -ne $Headers) {
-            foreach ($key in $Headers.Keys) {
-                if ($key -ieq 'Accept') { continue }
-                if ($key -ieq 'User-Agent') { continue }
-                if ($key -ieq 'Host') { continue }
-
-                $value = [string]$Headers[$key]
-                if ([string]::IsNullOrWhiteSpace($value)) { continue }
-
-                if ($key -ieq 'Authorization') {
-                    $request.Headers[[System.Net.HttpRequestHeader]::Authorization] = $value
-                }
-                else {
-                    $request.Headers[$key] = $value
-                }
-            }
+        if (Test-Path -LiteralPath $OutFile) {
+            Remove-Item -LiteralPath $OutFile -Force -ErrorAction SilentlyContinue
         }
-        $request.Accept = '*/*'
 
-        $response = [System.Net.HttpWebResponse]$request.GetResponse()
-        $statusCode = [int]$response.StatusCode
+        $iwrParams = @{
+            Uri = $Url
+            Method = 'Get'
+            OutFile = $OutFile
+            UseBasicParsing = $true
+            MaximumRedirection = 0
+            TimeoutSec = 120
+            ErrorAction = 'Stop'
+        }
+        if ($null -ne $Headers) {
+            $iwrParams.Headers = $Headers
+        }
+        if ($null -ne $Session) {
+            $iwrParams.WebSession = $Session
+        }
+
+        $iwrResponse = Invoke-WebRequest @iwrParams
+        try { $statusCode = [int]$iwrResponse.StatusCode } catch { $statusCode = 200 }
 
         if ($statusCode -ge 200 -and $statusCode -lt 300) {
-            $outStream = $null
-            $inStream = $null
-            try {
-                $inStream = $response.GetResponseStream()
-                $outStream = [System.IO.File]::Create($OutFile)
-                $inStream.CopyTo($outStream)
-            }
-            finally {
-                if ($null -ne $outStream) { $outStream.Dispose() }
-                if ($null -ne $inStream) { $inStream.Dispose() }
-            }
-
             return [PSCustomObject]@{ Success = $true; StatusCode = $statusCode; Location = $null; Error = $null }
         }
 
-        try { $location = [string]$response.Headers['Location'] } catch { $location = $null }
+        try { $location = [string]$iwrResponse.Headers['Location'] } catch { $location = $null }
         return [PSCustomObject]@{ Success = $false; StatusCode = $statusCode; Location = $location; Error = [System.Exception]::new("HTTP $statusCode") }
     }
-    catch [System.Net.WebException] {
+    catch {
         $err = $_
         $webResp = $null
-        try { $webResp = [System.Net.HttpWebResponse]$err.Exception.Response } catch { $webResp = $null }
+        try { $webResp = $err.Exception.Response } catch { $webResp = $null }
 
         if ($null -ne $webResp) {
             try { $statusCode = [int]$webResp.StatusCode } catch { $statusCode = $null }
@@ -618,14 +593,6 @@ function Invoke-FileDownload {
         }
 
         return [PSCustomObject]@{ Success = $false; StatusCode = $statusCode; Location = $location; Error = $err; Message = $err.Exception.Message }
-    }
-    catch {
-        return [PSCustomObject]@{ Success = $false; StatusCode = $null; Location = $null; Error = $_; Message = $_.Exception.Message }
-    }
-    finally {
-        if ($null -ne $response) {
-            try { $response.Close() } catch {}
-        }
     }
 }
 
@@ -1109,7 +1076,13 @@ function Save-Attachments {
                     Remove-Item -LiteralPath $tempFile -Force -ErrorAction SilentlyContinue
                 }
 
-                Invoke-RestMethod -Uri $directApiUrl -Method Get -Headers $Headers -OutFile $tempFile -ErrorAction Stop
+                $directResult = Invoke-FileDownload -Url $directApiUrl -OutFile $tempFile -Headers $Headers -Session $Session
+                if (-not $directResult.Success) {
+                    if ($null -ne $directResult.Error) {
+                        throw $directResult.Error
+                    }
+                    throw [System.Exception]::new("Direct API attachment request failed with status $($directResult.StatusCode)")
+                }
 
                 if (Test-Path -LiteralPath $tempFile) {
                     $directSize = (Get-Item -LiteralPath $tempFile).Length
@@ -1194,6 +1167,8 @@ function Save-Attachments {
             try {
                 $authModes = @(
                     @{ Headers = $Headers; Session = $null },
+                    @{ Headers = $Headers; Session = $Session },
+                    @{ Headers = $null; Session = $Session },
                     @{ Headers = $null; Session = $null }
                 )
 
