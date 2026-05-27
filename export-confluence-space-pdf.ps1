@@ -255,11 +255,8 @@ function Get-AllPages {
             if ([string]::IsNullOrWhiteSpace($rawNext)) {
                 $nextUri = $null
             }
-            elseif ($rawNext -match '^https?://') {
-                $nextUri = $rawNext
-            }
             else {
-                $nextUri = "$wikiRoot$rawNext"
+                $nextUri = Resolve-ConfluenceUrl -BaseUrl $wikiRoot -PathOrUrl $rawNext
             }
         }
 
@@ -637,6 +634,7 @@ function Get-ResolvedAncestors {
         [hashtable]$Headers,
         [hashtable]$AncestorCache,
         [hashtable]$ParentMap,      # pre-built from all pages; may be $null
+        [string]$HomePageId,
         [switch]$Diagnostics
     )
 
@@ -649,19 +647,40 @@ function Get-ResolvedAncestors {
 
     if ([string]::IsNullOrWhiteSpace($pageId)) { return @() }
 
+    $fromMap = @()
+
     # ── 1. Inline ancestors from the discovery payload (fastest, no extra call) ──
     $inlineAncestors = Normalize-Ancestors -AncestorsValue $Page.ancestors
     if ($inlineAncestors.Count -gt 0) {
-        $AncestorCache[$pageId] = $inlineAncestors
-        return $inlineAncestors
+        $hasHome = $false
+        if (-not [string]::IsNullOrWhiteSpace($HomePageId)) {
+            foreach ($a in $inlineAncestors) {
+                if ([string]$a.id -eq $HomePageId) { $hasHome = $true; break }
+            }
+        }
+
+        if ($hasHome -or [string]::IsNullOrWhiteSpace($HomePageId)) {
+            $AncestorCache[$pageId] = $inlineAncestors
+            return $inlineAncestors
+        }
+        # If the inline list is missing the home page, fall through to fetch a full chain.
     }
 
     # ── 2. Walk the pre-built parent map (handles v2 pages with no ancestors) ────
     if ($null -ne $ParentMap -and $ParentMap.Count -gt 0) {
         $fromMap = Get-AncestorsFromParentMap -PageId $pageId -ParentMap $ParentMap
         if ($fromMap.Count -gt 0) {
-            $AncestorCache[$pageId] = $fromMap
-            return $fromMap
+            $hasHome = $false
+            if (-not [string]::IsNullOrWhiteSpace($HomePageId)) {
+                foreach ($a in $fromMap) {
+                    if ([string]$a.id -eq $HomePageId) { $hasHome = $true; break }
+                }
+            }
+            if ($hasHome -or [string]::IsNullOrWhiteSpace($HomePageId)) {
+                $AncestorCache[$pageId] = $fromMap
+                return $fromMap
+            }
+            # If the parent map chain is missing the home page, fall through.
         }
     }
 
@@ -707,6 +726,16 @@ function Get-ResolvedAncestors {
     if ($resolved.Count -gt 0) {
         $AncestorCache[$pageId] = $resolved
         return $resolved
+    }
+
+    if ($inlineAncestors.Count -gt 0) {
+        $AncestorCache[$pageId] = $inlineAncestors
+        return $inlineAncestors
+    }
+
+    if ($fromMap.Count -gt 0) {
+        $AncestorCache[$pageId] = $fromMap
+        return $fromMap
     }
 
     $AncestorCache[$pageId] = @()
@@ -918,17 +947,42 @@ function Save-Attachments {
 
         $downloaded = $false
         $lastError  = $null
-        # Use the root Confluence URL for resolving _links.download
+        # Build candidate download URLs; some tenants return paths without /wiki
         $confluenceRoot = $WikiBase -replace '/wiki$', ''
-        $downloadUrl = Resolve-ConfluenceUrl -BaseUrl $confluenceRoot -PathOrUrl $downloadPath
+        $candidates = [System.Collections.Generic.List[string]]::new()
+
+        if ($downloadPath -match '^https?://') {
+            $candidates.Add($downloadPath)
+        }
+        else {
+            $raw = $downloadPath
+            if (-not [string]::IsNullOrWhiteSpace($raw)) {
+                $candidates.Add((Resolve-ConfluenceUrl -BaseUrl $confluenceRoot -PathOrUrl $raw))
+
+                if ($raw -match '^/download/') {
+                    $raw = "/wiki$raw"
+                }
+                elseif ($raw -match '^download/') {
+                    $raw = "/wiki/$raw"
+                }
+
+                if ($raw -ne $downloadPath) {
+                    $candidates.Add((Resolve-ConfluenceUrl -BaseUrl $confluenceRoot -PathOrUrl $raw))
+                }
+            }
+        }
         
-        if (-not [string]::IsNullOrWhiteSpace($downloadUrl)) {
+        foreach ($candidateUrl in $candidates) {
+            if ($downloaded) { break }
+            if ([string]::IsNullOrWhiteSpace($candidateUrl)) { continue }
+
             if (Test-Path -LiteralPath $tempFile) {
                 Remove-Item -LiteralPath $tempFile -Force -ErrorAction SilentlyContinue
             }
+
             try {
                 $attParams = @{
-                    Uri             = $downloadUrl
+                    Uri             = $candidateUrl
                     Method          = 'Get'
                     OutFile         = $tempFile
                     UseBasicParsing = $true
@@ -1074,7 +1128,7 @@ foreach ($page in $pages) {
 
     $null = $currentIds.Add($pageId)
 
-    $ancestors = Get-ResolvedAncestors -Page $page -ApiBase $apiBase -Headers $headers -AncestorCache $ancestorCache -ParentMap $pageParentMap -Diagnostics:$DiagnosticMode
+    $ancestors = Get-ResolvedAncestors -Page $page -ApiBase $apiBase -Headers $headers -AncestorCache $ancestorCache -ParentMap $pageParentMap -HomePageId $homePageId -Diagnostics:$DiagnosticMode
 
     $folder = Get-PageFolder -Ancestors @($ancestors) -HomePageId $homePageId -Root $spaceRoot
     Ensure-Directory -Path $folder
