@@ -579,6 +579,10 @@ function Invoke-FileDownload {
             }
         }
 
+        # Binary downloads should not inherit JSON-oriented Accept headers.
+        $request.Headers.Accept.Clear()
+        $null = $request.Headers.TryAddWithoutValidation('Accept', '*/*')
+
         if ($null -ne $Session -and $null -ne $Session.Cookies) {
             try {
                 $cookieHeader = $Session.Cookies.GetCookieHeader([Uri]$Url)
@@ -607,7 +611,7 @@ function Invoke-FileDownload {
         }
         catch { $location = $null }
 
-        return [PSCustomObject]@{ Success = $false; StatusCode = $statusCode; Location = $location; Error = [System.Exception]::new("HTTP $statusCode") }
+        return [PSCustomObject]@{ Success = $false; StatusCode = $statusCode; Location = $location; Error = [System.Exception]::new("HTTP $statusCode for $Url") }
     }
     catch {
         $err = $_
@@ -1139,10 +1143,19 @@ function Save-Attachments {
         $candidates = [System.Collections.Generic.List[string]]::new()
 
         if (-not [string]::IsNullOrWhiteSpace($attId)) {
+            $wikiRoot = $WikiBase
+            if ($wikiRoot -match '/wiki$') { $wikiRoot = $wikiRoot.TrimEnd('/') }
+            else { $wikiRoot = ($WikiBase.TrimEnd('/') + '/wiki') }
+
             $apiDownload = "$ApiBase/content/$PageId/child/attachment/$attId/download"
             $candidates.Add($apiDownload)
-            $withAuth = Add-OsAuthTypeBasic -Url $apiDownload
-            if ($withAuth -ne $apiDownload) { $candidates.Add($withAuth) }
+
+            # Confluence Cloud v2 download endpoint fallback (often avoids v1 attachment 403s).
+            $v2Download = "$wikiRoot/api/v2/attachments/$attId/download"
+            $candidates.Add($v2Download)
+
+            $withAuth = Add-OsAuthTypeBasic -Url $v2Download
+            if ($withAuth -ne $v2Download) { $candidates.Add($withAuth) }
         }
 
         if ($downloadPath -match '^https?://') {
