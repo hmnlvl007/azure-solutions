@@ -50,6 +50,27 @@ function Get-ShortHash {
     }
 }
 
+function Add-OsAuthTypeBasic {
+    param([string]$Url)
+    if ([string]::IsNullOrWhiteSpace($Url)) { return $Url }
+    if ($Url -match '(^|[?&])os_authType=basic([&#]|$)') { return $Url }
+    try {
+        $builder = [System.UriBuilder]::new($Url)
+    }
+    catch {
+        return $Url
+    }
+
+    $query = $builder.Query.TrimStart('?')
+    if ([string]::IsNullOrWhiteSpace($query)) {
+        $builder.Query = 'os_authType=basic'
+    }
+    else {
+        $builder.Query = $query + '&os_authType=basic'
+    }
+    return $builder.Uri.AbsoluteUri
+}
+
 function Get-CompactName {
     param([string]$Name, [int]$MaxLength = 64)
     $safe = Get-SafeFileName -Name $Name
@@ -953,11 +974,16 @@ function Save-Attachments {
 
         if ($downloadPath -match '^https?://') {
             $candidates.Add($downloadPath)
+            $withAuth = Add-OsAuthTypeBasic -Url $downloadPath
+            if ($withAuth -ne $downloadPath) { $candidates.Add($withAuth) }
         }
         else {
             $raw = $downloadPath
             if (-not [string]::IsNullOrWhiteSpace($raw)) {
-                $candidates.Add((Resolve-ConfluenceUrl -BaseUrl $confluenceRoot -PathOrUrl $raw))
+                $resolved = Resolve-ConfluenceUrl -BaseUrl $confluenceRoot -PathOrUrl $raw
+                $candidates.Add($resolved)
+                $withAuth = Add-OsAuthTypeBasic -Url $resolved
+                if ($withAuth -ne $resolved) { $candidates.Add($withAuth) }
 
                 if ($raw -match '^/download/') {
                     $raw = "/wiki$raw"
@@ -967,7 +993,10 @@ function Save-Attachments {
                 }
 
                 if ($raw -ne $downloadPath) {
-                    $candidates.Add((Resolve-ConfluenceUrl -BaseUrl $confluenceRoot -PathOrUrl $raw))
+                    $resolved = Resolve-ConfluenceUrl -BaseUrl $confluenceRoot -PathOrUrl $raw
+                    $candidates.Add($resolved)
+                    $withAuth = Add-OsAuthTypeBasic -Url $resolved
+                    if ($withAuth -ne $resolved) { $candidates.Add($withAuth) }
                 }
             }
         }
