@@ -1052,16 +1052,6 @@ function Save-Attachments {
             $candidates.Add($apiDownload)
             $withAuth = Add-OsAuthTypeBasic -Url $apiDownload
             if ($withAuth -ne $apiDownload) { $candidates.Add($withAuth) }
-
-            $apiV2Download = "$WikiBase/api/v2/attachments/$attId/download"
-            $candidates.Add($apiV2Download)
-            $withAuth = Add-OsAuthTypeBasic -Url $apiV2Download
-            if ($withAuth -ne $apiV2Download) { $candidates.Add($withAuth) }
-
-            $contentDownload = "$ApiBase/content/$attId/download"
-            $candidates.Add($contentDownload)
-            $withAuth = Add-OsAuthTypeBasic -Url $contentDownload
-            if ($withAuth -ne $contentDownload) { $candidates.Add($withAuth) }
         }
 
         if ($downloadPath -match '^https?://') {
