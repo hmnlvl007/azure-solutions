@@ -550,49 +550,77 @@ function Invoke-FileDownload {
 
     $statusCode = $null
     $location = $null
+    $handler = $null
+    $client = $null
+    $request = $null
+    $response = $null
+    $contentStream = $null
+    $fileStream = $null
 
     try {
         if (Test-Path -LiteralPath $OutFile) {
             Remove-Item -LiteralPath $OutFile -Force -ErrorAction SilentlyContinue
         }
 
-        $iwrParams = @{
-            Uri = $Url
-            Method = 'Get'
-            OutFile = $OutFile
-            UseBasicParsing = $true
-            MaximumRedirection = 0
-            TimeoutSec = 120
-            ErrorAction = 'Stop'
-        }
+        $handler = [System.Net.Http.HttpClientHandler]::new()
+        $handler.AllowAutoRedirect = $false
+        $handler.AutomaticDecompression = [System.Net.DecompressionMethods]::GZip -bor [System.Net.DecompressionMethods]::Deflate
+
+        $client = [System.Net.Http.HttpClient]::new($handler)
+        $client.Timeout = [TimeSpan]::FromSeconds(120)
+
+        $request = [System.Net.Http.HttpRequestMessage]::new([System.Net.Http.HttpMethod]::Get, $Url)
+
         if ($null -ne $Headers) {
-            $iwrParams.Headers = $Headers
-        }
-        if ($null -ne $Session) {
-            $iwrParams.WebSession = $Session
+            foreach ($key in $Headers.Keys) {
+                $value = [string]$Headers[$key]
+                if ([string]::IsNullOrWhiteSpace($value)) { continue }
+                $null = $request.Headers.TryAddWithoutValidation([string]$key, $value)
+            }
         }
 
-        $iwrResponse = Invoke-WebRequest @iwrParams
-        try { $statusCode = [int]$iwrResponse.StatusCode } catch { $statusCode = 200 }
+        if ($null -ne $Session -and $null -ne $Session.Cookies) {
+            try {
+                $cookieHeader = $Session.Cookies.GetCookieHeader([Uri]$Url)
+                if (-not [string]::IsNullOrWhiteSpace($cookieHeader)) {
+                    $null = $request.Headers.TryAddWithoutValidation('Cookie', $cookieHeader)
+                }
+            }
+            catch {}
+        }
+
+        $response = $client.SendAsync($request, [System.Net.Http.HttpCompletionOption]::ResponseHeadersRead).GetAwaiter().GetResult()
+        $statusCode = [int]$response.StatusCode
 
         if ($statusCode -ge 200 -and $statusCode -lt 300) {
+            $contentStream = $response.Content.ReadAsStreamAsync().GetAwaiter().GetResult()
+            $fileStream = [System.IO.File]::Create($OutFile)
+            $contentStream.CopyTo($fileStream)
+            $fileStream.Flush()
             return [PSCustomObject]@{ Success = $true; StatusCode = $statusCode; Location = $null; Error = $null }
         }
 
-        try { $location = [string]$iwrResponse.Headers['Location'] } catch { $location = $null }
+        try {
+            if ($null -ne $response.Headers.Location) {
+                $location = [string]$response.Headers.Location.OriginalString
+            }
+        }
+        catch { $location = $null }
+
         return [PSCustomObject]@{ Success = $false; StatusCode = $statusCode; Location = $location; Error = [System.Exception]::new("HTTP $statusCode") }
     }
     catch {
         $err = $_
-        $webResp = $null
-        try { $webResp = $err.Exception.Response } catch { $webResp = $null }
-
-        if ($null -ne $webResp) {
-            try { $statusCode = [int]$webResp.StatusCode } catch { $statusCode = $null }
-            try { $location = [string]$webResp.Headers['Location'] } catch { $location = $null }
-        }
 
         return [PSCustomObject]@{ Success = $false; StatusCode = $statusCode; Location = $location; Error = $err; Message = $err.Exception.Message }
+    }
+    finally {
+        if ($null -ne $fileStream) { try { $fileStream.Dispose() } catch {} }
+        if ($null -ne $contentStream) { try { $contentStream.Dispose() } catch {} }
+        if ($null -ne $response) { try { $response.Dispose() } catch {} }
+        if ($null -ne $request) { try { $request.Dispose() } catch {} }
+        if ($null -ne $client) { try { $client.Dispose() } catch {} }
+        if ($null -ne $handler) { try { $handler.Dispose() } catch {} }
     }
 }
 
@@ -1293,6 +1321,10 @@ function Save-Attachments {
 $wikiBase = Get-WikiBaseUrl -BaseUrl $ConfluenceBaseUrl
 $apiBase = "$wikiBase/rest/api"
 $headers = Get-AuthHeaders -UserEmail $Email -Token $ApiToken
+
+$exporterVersion = '2026-05-27-httpclient-v2'
+Write-Host ("Exporter version: {0}" -f $exporterVersion) -ForegroundColor DarkCyan
+Write-Host ("Exporter script : {0}" -f $PSCommandPath) -ForegroundColor DarkCyan
 
 Write-Host 'Verifying credentials...'
 try {
