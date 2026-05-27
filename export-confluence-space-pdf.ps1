@@ -1059,7 +1059,7 @@ function Save-Attachments {
         }
         catch {
             if ($items.Count -eq 0) {
-                return [PSCustomObject]@{ Count = 0; Bytes = [long]0; Path = $null }
+                return [PSCustomObject]@{ Count = 0; Failed = 0; Attempted = 0; Bytes = [long]0; Path = $null }
             }
             break
         }
@@ -1079,7 +1079,7 @@ function Save-Attachments {
     }
 
     if ($items.Count -eq 0) {
-        return [PSCustomObject]@{ Count = 0; Bytes = [long]0; Path = $null }
+        return [PSCustomObject]@{ Count = 0; Failed = 0; Attempted = 0; Bytes = [long]0; Path = $null }
     }
 
     Ensure-Directory -Path $attachmentFolder
@@ -1540,7 +1540,14 @@ foreach ($page in $pages) {
     $totalBytes += $fileSize
     Write-Host ("  OK {0} | {1:N0} KB" -f $format.ToUpper(), ($fileSize / 1KB)) -ForegroundColor Green
 
-    $attachmentInfo = Save-Attachments -ApiBase $apiBase -WikiBase $wikiBase -PageId $pageId -Headers $headers -Session $session -PageFolder $folder -BaseFilePath $destPath
+    try {
+        $attachmentInfo = Save-Attachments -ApiBase $apiBase -WikiBase $wikiBase -PageId $pageId -Headers $headers -Session $session -PageFolder $folder -BaseFilePath $destPath
+    }
+    catch {
+        $attachmentInfo = [PSCustomObject]@{ Count = 0; Failed = 1; Attempted = 1; Bytes = [long]0; Path = $null }
+        $attachErr = $_.Exception.Message
+        Write-Host ("     ! Attachment processing failed: {0}" -f $attachErr) -ForegroundColor Yellow
+    }
     $attachmentsAttempted += $attachmentInfo.Attempted
     $attachmentsFailed    += $attachmentInfo.Failed
     if ($attachmentInfo.Count -gt 0) {
