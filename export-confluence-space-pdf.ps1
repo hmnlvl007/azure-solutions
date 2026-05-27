@@ -556,7 +556,12 @@ function Invoke-FileDownload {
         ErrorAction        = 'Stop'
         MaximumRedirection = 0
     }
-    if ($null -ne $Headers) { $params.Headers = $Headers }
+    if ($null -ne $Headers) {
+        $downloadHeaders = @{}
+        foreach ($key in $Headers.Keys) { $downloadHeaders[$key] = $Headers[$key] }
+        $downloadHeaders['Accept'] = '*/*'
+        $params.Headers = $downloadHeaders
+    }
     if ($null -ne $Session) { $params.WebSession = $Session }
 
     try {
@@ -579,6 +584,35 @@ function Invoke-FileDownload {
 
         return [PSCustomObject]@{ Success = $false; StatusCode = $statusCode; Location = $location; Error = $_ }
     }
+}
+
+function Test-DownloadLooksValid {
+    param(
+        [Parameter(Mandatory)][string]$Path,
+        [string]$ExpectedExtension
+    )
+
+    if (-not (Test-Path -LiteralPath $Path)) { return $false }
+    $size = (Get-Item -LiteralPath $Path).Length
+    if ($size -le 0) { return $false }
+
+    if ($ExpectedExtension -match '\.(html|htm)$') { return $true }
+    if ($size -ge 2048) { return $true }
+
+    try {
+        $bytes = [IO.File]::ReadAllBytes($Path)
+        $len = [Math]::Min(512, $bytes.Length)
+        $text = [Text.Encoding]::UTF8.GetString($bytes, 0, $len)
+    }
+    catch {
+        return $true
+    }
+
+    if ($text -match '<html|<head|<body|login|unauthorized|atlassian|confluence') {
+        return $false
+    }
+
+    return $true
 }
 
 function Normalize-Ancestors {
@@ -1013,6 +1047,13 @@ function Save-Attachments {
         $confluenceRoot = $WikiBase -replace '/wiki$', ''
         $candidates = [System.Collections.Generic.List[string]]::new()
 
+        if (-not [string]::IsNullOrWhiteSpace($attId)) {
+            $apiDownload = "$ApiBase/content/$PageId/child/attachment/$attId/download"
+            $candidates.Add($apiDownload)
+            $withAuth = Add-OsAuthTypeBasic -Url $apiDownload
+            if ($withAuth -ne $apiDownload) { $candidates.Add($withAuth) }
+        }
+
         if ($downloadPath -match '^https?://') {
             $candidates.Add($downloadPath)
             $withAuth = Add-OsAuthTypeBasic -Url $downloadPath
@@ -1051,23 +1092,47 @@ function Save-Attachments {
             }
 
             try {
-                # Manually handle redirects so auth headers are not dropped.
-                $downloadResult = Invoke-FileDownload -Url $candidateUrl -OutFile $tempFile -Headers $Headers -Session $Session
-                if (-not $downloadResult.Success -and -not [string]::IsNullOrWhiteSpace($downloadResult.Location)) {
-                    $redirectUrl = Resolve-ConfluenceUrl -BaseUrl $candidateUrl -PathOrUrl $downloadResult.Location
-                    $downloadResult = Invoke-FileDownload -Url $redirectUrl -OutFile $tempFile -Headers $null -Session $null
+                $downloadUrl = $candidateUrl
+                $headersToUse = $Headers
+                $sessionToUse = $Session
+                $downloadResult = $null
+
+                for ($redirects = 0; $redirects -lt 3; $redirects++) {
+                    $downloadResult = Invoke-FileDownload -Url $downloadUrl -OutFile $tempFile -Headers $headersToUse -Session $sessionToUse
+                    if ($downloadResult.Success) { break }
+                    if ([string]::IsNullOrWhiteSpace($downloadResult.Location)) { break }
+
+                    $nextUrl = Resolve-ConfluenceUrl -BaseUrl $downloadUrl -PathOrUrl $downloadResult.Location
+                    $sameHost = $false
+                    try {
+                        $sameHost = ([Uri]$nextUrl).Host -eq ([Uri]$candidateUrl).Host
+                    }
+                    catch {
+                        $sameHost = $false
+                    }
+
+                    if (-not $sameHost) {
+                        $headersToUse = $null
+                        $sessionToUse = $null
+                    }
+
+                    $downloadUrl = $nextUrl
                 }
 
-                if (-not $downloadResult.Success) {
+                if ($null -eq $downloadResult -or -not $downloadResult.Success) {
                     throw $downloadResult.Error
                 }
+
                 if (Test-Path -LiteralPath $tempFile) {
                     $size = (Get-Item -LiteralPath $tempFile).Length
-                    if ($size -gt 0) {
+                    if ($size -gt 0 -and (Test-DownloadLooksValid -Path $tempFile -ExpectedExtension $ext)) {
                         [IO.File]::Move($tempFile, $filePath)
                         $count++
                         $totalBytes += $size
                         $downloaded = $true
+                    }
+                    elseif ($size -gt 0) {
+                        $lastError = [System.Exception]::new('Downloaded content appears to be HTML or unauthorized response.')
                     }
                 }
             }
