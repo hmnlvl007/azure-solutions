@@ -13,12 +13,29 @@ param(
 $ErrorActionPreference = 'Stop'
 
 function Resolve-OneDriveRoot {
-    if (-not [string]::IsNullOrWhiteSpace($env:OneDriveCommercial) -and (Test-Path -LiteralPath $env:OneDriveCommercial)) {
-        return $env:OneDriveCommercial
+    # \\tsclient\X\some\path is an RDP client-drive redirect.
+    # CreateDirectory fails on it even when Test-Path returns $true.
+    # Always convert to the equivalent local path X:\some\path.
+    function ConvertFrom-TsClientPath {
+        param([string]$Path)
+        if ([string]::IsNullOrWhiteSpace($Path)) { return $Path }
+        $value = $Path.Trim()
+        if ($value -match '^[\\]{2}tsclient\\([A-Za-z])\\(.*)$') {
+            return ('{0}:\{1}' -f $matches[1].ToUpperInvariant(), $matches[2])
+        }
+        return $value
     }
-    if (-not [string]::IsNullOrWhiteSpace($env:OneDrive) -and (Test-Path -LiteralPath $env:OneDrive)) {
-        return $env:OneDrive
+
+    foreach ($raw in @($env:OneDriveCommercial, $env:OneDrive)) {
+        if ([string]::IsNullOrWhiteSpace($raw)) { continue }
+        $resolved = ConvertFrom-TsClientPath -Path $raw
+        # Only require the drive root to exist — the OneDrive subfolder may not yet
+        $driveRoot = [IO.Path]::GetPathRoot($resolved)
+        if (-not [string]::IsNullOrWhiteSpace($driveRoot) -and (Test-Path -LiteralPath $driveRoot)) {
+            return $resolved
+        }
     }
+
     throw 'Cannot locate OneDrive root. Sign into OneDrive for Business or set $env:OneDriveCommercial.'
 }
 
