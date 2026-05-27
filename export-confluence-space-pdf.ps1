@@ -234,7 +234,12 @@ function Get-AllPages {
                 $response = Invoke-RestMethod -Uri $nextUri -Method Get -Headers $Headers -ErrorAction Stop
             }
             catch {
-                Write-Host ("  v2 pagination error (non-fatal): {0}" -f $_.Exception.Message) -ForegroundColor DarkYellow
+                $errMsg = $_.Exception.Message
+                if ($errMsg -match '404|Not Found') {
+                    Write-Host ("  v2 pagination: reached end (404 Not Found)" ) -ForegroundColor DarkGray
+                } else {
+                    Write-Host ("  v2 pagination error (non-fatal): {0}" -f $errMsg) -ForegroundColor DarkYellow
+                }
                 break
             }
             $batch = @(Get-ApiResultItems -Response $response)
@@ -348,11 +353,12 @@ function Get-AllPages {
     }
 
     if ($byId.Count -eq 0) {
-        Write-Host '  strict discovery returned zero pages. Trying relaxed content discovery...' -ForegroundColor DarkYellow
         $discoveryMode = 'relaxed'
         $contentTotal += (Invoke-ContentDiscovery -Relaxed)
-
-        if (-not [string]::IsNullOrWhiteSpace($HomePageId) -and -not $byId.ContainsKey($HomePageId)) {
+        
+        if ($byId.Count -eq 0) {
+            Write-Host '  strict and relaxed discovery returned zero pages.' -ForegroundColor DarkYellow
+        } elseif (-not [string]::IsNullOrWhiteSpace($HomePageId) -and -not $byId.ContainsKey($HomePageId)) {
             try {
                 $homeUri = "$ApiBase/content/$HomePageId?expand=ancestors,version"
                 $homePage = Invoke-RestMethod -Uri $homeUri -Method Get -Headers $Headers -ErrorAction Stop
@@ -910,75 +916,56 @@ function Save-Attachments {
         $filePath = Join-Path -Path $attachmentFolder -ChildPath $fileName
         $tempFile = Join-Path -Path ([IO.Path]::GetTempPath()) -ChildPath ("cf-att-$([Guid]::NewGuid().ToString('N')).tmp")
 
-        try {
-            # Build candidate URLs in priority order:
-            #   1. REST API download endpoint (most reliable with Basic auth + redirects)
-            #   2. _links.download resolved against ConfluenceBaseUrl (strip /wiki to avoid double-segment)
-            #   3. _links.download resolved against WikiBase
-            $baseForAtt = $WikiBase -replace '/wiki$', ''
-            $candidateUrls = [System.Collections.Generic.List[string]]::new()
-            if (-not [string]::IsNullOrWhiteSpace($attId)) {
-                $candidateUrls.Add("$ApiBase/content/$attId/download")
-            }
-            $urlFromBase = Resolve-ConfluenceUrl -BaseUrl $baseForAtt -PathOrUrl $downloadPath
-            if (-not [string]::IsNullOrWhiteSpace($urlFromBase)) { $candidateUrls.Add($urlFromBase) }
-            $urlFromWiki = Resolve-ConfluenceUrl -BaseUrl $WikiBase -PathOrUrl $downloadPath
-            if (-not [string]::IsNullOrWhiteSpace($urlFromWiki) -and $urlFromWiki -ne $urlFromBase) {
-                $candidateUrls.Add($urlFromWiki)
-            }
-
-            $downloaded = $false
-            $lastError  = $null
-            foreach ($url in $candidateUrls) {
-                if ($downloaded) { break }
-                if (Test-Path -LiteralPath $tempFile) {
-                    Remove-Item -LiteralPath $tempFile -Force -ErrorAction SilentlyContinue
-                }
-                try {
-                    $attParams = @{
-                        Uri             = $url
-                        Method          = 'Get'
-                        OutFile         = $tempFile
-                        UseBasicParsing = $true
-                        Headers         = @{ Authorization = $Headers.Authorization }
-                        ErrorAction     = 'Stop'
-                    }
-                    if ($null -ne $Session) { $attParams.WebSession = $Session }
-                    Invoke-WebRequest @attParams | Out-Null
-                    if (Test-Path -LiteralPath $tempFile) {
-                        $size = (Get-Item -LiteralPath $tempFile).Length
-                        if ($size -gt 0) {
-                            [IO.File]::Move($tempFile, $filePath)
-                            $count++
-                            $totalBytes += $size
-                            $downloaded = $true
-                        }
-                    }
-                }
-                catch {
-                    $lastError = $_
-                }
-            }
-            if (-not $downloaded) {
-                $failCount++
-                if ($null -ne $lastError) {
-                    $msg = $lastError.Exception.Message
-                    if ($msg -match '404|Not Found') {
-                        Write-Host ("     ! Attachment 404 [{0}]: {1}" -f $attTitle, $msg) -ForegroundColor DarkGray
-                    } else {
-                        Write-Host ("     ! Attachment download failed [{0}]: {1}" -f $attTitle, $msg) -ForegroundColor DarkYellow
-                    }
-                }
-            }
-        }
-        catch {
-            $failCount++
-            Write-Host ("     ! Attachment download failed [{0}]: {1}" -f ([string]$item.title), $_.Exception.Message) -ForegroundColor DarkYellow
-        }
-        finally {
+        $downloaded = $false
+        $lastError  = $null
+        # Use the root Confluence URL for resolving _links.download
+        $confluenceRoot = $WikiBase -replace '/wiki$', ''
+        $downloadUrl = Resolve-ConfluenceUrl -BaseUrl $confluenceRoot -PathOrUrl $downloadPath
+        
+        if (-not [string]::IsNullOrWhiteSpace($downloadUrl)) {
             if (Test-Path -LiteralPath $tempFile) {
                 Remove-Item -LiteralPath $tempFile -Force -ErrorAction SilentlyContinue
             }
+            try {
+                $attParams = @{
+                    Uri             = $downloadUrl
+                    Method          = 'Get'
+                    OutFile         = $tempFile
+                    UseBasicParsing = $true
+                    Headers         = @{ Authorization = $Headers.Authorization }
+                    ErrorAction     = 'Stop'
+                }
+                if ($null -ne $Session) { $attParams.WebSession = $Session }
+                Invoke-WebRequest @attParams | Out-Null
+                if (Test-Path -LiteralPath $tempFile) {
+                    $size = (Get-Item -LiteralPath $tempFile).Length
+                    if ($size -gt 0) {
+                        [IO.File]::Move($tempFile, $filePath)
+                        $count++
+                        $totalBytes += $size
+                        $downloaded = $true
+                    }
+                }
+            }
+            catch {
+                $lastError = $_
+            }
+        }
+        
+        if (-not $downloaded) {
+            $failCount++
+            if ($null -ne $lastError) {
+                $msg = $lastError.Exception.Message
+                if ($msg -match '404|Not Found') {
+                    Write-Host ("     ! Attachment 404 [{0}]: {1}" -f $attTitle, $msg) -ForegroundColor DarkGray
+                } else {
+                    Write-Host ("     ! Attachment download failed [{0}]: {1}" -f $attTitle, $msg) -ForegroundColor DarkYellow
+                }
+            }
+        }
+        
+        if (Test-Path -LiteralPath $tempFile) {
+            Remove-Item -LiteralPath $tempFile -Force -ErrorAction SilentlyContinue
         }
     }
 
