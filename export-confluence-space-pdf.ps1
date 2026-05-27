@@ -421,16 +421,16 @@ function Get-AllPages {
         $enriched = 0
         $enrichFailed = 0
         foreach ($p in $needsEnrichment) {
-            $pid = [string]$p.id
+            $enrichPageId = [string]$p.id
             try {
-                $full = Invoke-RestMethod -Uri "$ApiBase/content/$pid`?expand=ancestors,version" -Method Get -Headers $Headers -ErrorAction Stop
-                $byId[$pid] = $full
+                $full = Invoke-RestMethod -Uri "$ApiBase/content/$enrichPageId`?expand=ancestors,version" -Method Get -Headers $Headers -ErrorAction Stop
+                $byId[$enrichPageId] = $full
                 $enriched++
             }
             catch {
                 $enrichFailed++
                 if ($Diagnostics) {
-                    Write-Host ("  diag enrich failed for {0}: {1}" -f $pid, $_.Exception.Message) -ForegroundColor DarkYellow
+                    Write-Host ("  diag enrich failed for {0}: {1}" -f $enrichPageId, $_.Exception.Message) -ForegroundColor DarkYellow
                 }
             }
         }
