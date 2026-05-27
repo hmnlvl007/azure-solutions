@@ -540,6 +540,47 @@ function Resolve-ConfluenceUrl {
     }
 }
 
+function Invoke-FileDownload {
+    param(
+        [Parameter(Mandatory)][string]$Url,
+        [Parameter(Mandatory)][string]$OutFile,
+        [hashtable]$Headers,
+        [Microsoft.PowerShell.Commands.WebRequestSession]$Session
+    )
+
+    $params = @{
+        Uri                = $Url
+        Method             = 'Get'
+        OutFile            = $OutFile
+        UseBasicParsing    = $true
+        ErrorAction        = 'Stop'
+        MaximumRedirection = 0
+    }
+    if ($null -ne $Headers) { $params.Headers = $Headers }
+    if ($null -ne $Session) { $params.WebSession = $Session }
+
+    try {
+        Invoke-WebRequest @params | Out-Null
+        return [PSCustomObject]@{ Success = $true; StatusCode = 200; Location = $null; Error = $null }
+    }
+    catch {
+        $statusCode = $null
+        $location = $null
+        try {
+            if ($_.Exception.Response) {
+                $statusCode = [int]$_.Exception.Response.StatusCode
+                $location = [string]$_.Exception.Response.Headers['Location']
+            }
+        }
+        catch {
+            $statusCode = $null
+            $location = $null
+        }
+
+        return [PSCustomObject]@{ Success = $false; StatusCode = $statusCode; Location = $location; Error = $_ }
+    }
+}
+
 function Normalize-Ancestors {
     param([object]$AncestorsValue)
 
@@ -1010,16 +1051,16 @@ function Save-Attachments {
             }
 
             try {
-                $attParams = @{
-                    Uri             = $candidateUrl
-                    Method          = 'Get'
-                    OutFile         = $tempFile
-                    UseBasicParsing = $true
-                    Headers         = @{ Authorization = $Headers.Authorization }
-                    ErrorAction     = 'Stop'
+                # Manually handle redirects so auth headers are not dropped.
+                $downloadResult = Invoke-FileDownload -Url $candidateUrl -OutFile $tempFile -Headers $Headers -Session $Session
+                if (-not $downloadResult.Success -and -not [string]::IsNullOrWhiteSpace($downloadResult.Location)) {
+                    $redirectUrl = Resolve-ConfluenceUrl -BaseUrl $candidateUrl -PathOrUrl $downloadResult.Location
+                    $downloadResult = Invoke-FileDownload -Url $redirectUrl -OutFile $tempFile -Headers $null -Session $null
                 }
-                if ($null -ne $Session) { $attParams.WebSession = $Session }
-                Invoke-WebRequest @attParams | Out-Null
+
+                if (-not $downloadResult.Success) {
+                    throw $downloadResult.Error
+                }
                 if (Test-Path -LiteralPath $tempFile) {
                     $size = (Get-Item -LiteralPath $tempFile).Length
                     if ($size -gt 0) {
