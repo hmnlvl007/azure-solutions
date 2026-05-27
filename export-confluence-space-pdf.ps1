@@ -548,44 +548,89 @@ function Invoke-FileDownload {
         [Microsoft.PowerShell.Commands.WebRequestSession]$Session
     )
 
-    $params = @{
-        Uri                = $Url
-        Method             = 'Get'
-        OutFile            = $OutFile
-        UseBasicParsing    = $true
-        ErrorAction        = 'Stop'
-        MaximumRedirection = 0
-    }
-    if ($null -ne $Headers) {
-        $downloadHeaders = @{}
-        foreach ($key in $Headers.Keys) { $downloadHeaders[$key] = $Headers[$key] }
-        $downloadHeaders['Accept'] = '*/*'
-        $params.Headers = $downloadHeaders
-    }
-    if ($null -ne $Session) { $params.WebSession = $Session }
+    $request = $null
+    $response = $null
+    $statusCode = $null
+    $location = $null
 
     try {
-        Invoke-WebRequest @params | Out-Null
-        return [PSCustomObject]@{ Success = $true; StatusCode = 200; Location = $null; Error = $null }
-    }
-    catch {
-        $statusCode = $null
-        $location = $null
-        $errorMessage = $_.Exception.Message
-        try {
-            $response = $null
-            try { $response = $_.Exception.Response } catch { $response = $null }
-            if ($null -ne $response) {
-                try { $statusCode = [int]$response.StatusCode } catch { $statusCode = $null }
-                try { $location = [string]$response.Headers['Location'] } catch { $location = $null }
+        $request = [System.Net.HttpWebRequest]::Create($Url)
+        $request.Method = 'GET'
+        $request.AllowAutoRedirect = $false
+        $request.AutomaticDecompression = [System.Net.DecompressionMethods]::GZip -bor [System.Net.DecompressionMethods]::Deflate
+        $request.Timeout = 60000
+        $request.ReadWriteTimeout = 60000
+        $request.UserAgent = 'ConfluenceSpaceExporter/1.0'
+
+        $cookieContainer = $null
+        if ($null -ne $Session) {
+            try { $cookieContainer = $Session.Cookies } catch { $cookieContainer = $null }
+        }
+        if ($null -eq $cookieContainer) {
+            $cookieContainer = New-Object System.Net.CookieContainer
+        }
+        $request.CookieContainer = $cookieContainer
+
+        if ($null -ne $Headers) {
+            foreach ($key in $Headers.Keys) {
+                if ($key -ieq 'Accept') { continue }
+                if ($key -ieq 'User-Agent') { continue }
+                if ($key -ieq 'Host') { continue }
+
+                $value = [string]$Headers[$key]
+                if ([string]::IsNullOrWhiteSpace($value)) { continue }
+
+                if ($key -ieq 'Authorization') {
+                    $request.Headers[[System.Net.HttpRequestHeader]::Authorization] = $value
+                }
+                else {
+                    $request.Headers[$key] = $value
+                }
             }
         }
-        catch {
-            $statusCode = $null
-            $location = $null
+        $request.Accept = '*/*'
+
+        $response = [System.Net.HttpWebResponse]$request.GetResponse()
+        $statusCode = [int]$response.StatusCode
+
+        if ($statusCode -ge 200 -and $statusCode -lt 300) {
+            $outStream = $null
+            $inStream = $null
+            try {
+                $inStream = $response.GetResponseStream()
+                $outStream = [System.IO.File]::Create($OutFile)
+                $inStream.CopyTo($outStream)
+            }
+            finally {
+                if ($null -ne $outStream) { $outStream.Dispose() }
+                if ($null -ne $inStream) { $inStream.Dispose() }
+            }
+
+            return [PSCustomObject]@{ Success = $true; StatusCode = $statusCode; Location = $null; Error = $null }
         }
 
-        return [PSCustomObject]@{ Success = $false; StatusCode = $statusCode; Location = $location; Error = $_; Message = $errorMessage }
+        try { $location = [string]$response.Headers['Location'] } catch { $location = $null }
+        return [PSCustomObject]@{ Success = $false; StatusCode = $statusCode; Location = $location; Error = [System.Exception]::new("HTTP $statusCode") }
+    }
+    catch [System.Net.WebException] {
+        $err = $_
+        $webResp = $null
+        try { $webResp = [System.Net.HttpWebResponse]$err.Exception.Response } catch { $webResp = $null }
+
+        if ($null -ne $webResp) {
+            try { $statusCode = [int]$webResp.StatusCode } catch { $statusCode = $null }
+            try { $location = [string]$webResp.Headers['Location'] } catch { $location = $null }
+        }
+
+        return [PSCustomObject]@{ Success = $false; StatusCode = $statusCode; Location = $location; Error = $err; Message = $err.Exception.Message }
+    }
+    catch {
+        return [PSCustomObject]@{ Success = $false; StatusCode = $null; Location = $null; Error = $_; Message = $_.Exception.Message }
+    }
+    finally {
+        if ($null -ne $response) {
+            try { $response.Close() } catch {}
+        }
     }
 }
 
