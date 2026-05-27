@@ -1052,6 +1052,16 @@ function Save-Attachments {
             $candidates.Add($apiDownload)
             $withAuth = Add-OsAuthTypeBasic -Url $apiDownload
             if ($withAuth -ne $apiDownload) { $candidates.Add($withAuth) }
+
+            $apiV2Download = "$WikiBase/api/v2/attachments/$attId/download"
+            $candidates.Add($apiV2Download)
+            $withAuth = Add-OsAuthTypeBasic -Url $apiV2Download
+            if ($withAuth -ne $apiV2Download) { $candidates.Add($withAuth) }
+
+            $contentDownload = "$ApiBase/content/$attId/download"
+            $candidates.Add($contentDownload)
+            $withAuth = Add-OsAuthTypeBasic -Url $contentDownload
+            if ($withAuth -ne $contentDownload) { $candidates.Add($withAuth) }
         }
 
         if ($downloadPath -match '^https?://') {
@@ -1083,7 +1093,17 @@ function Save-Attachments {
             }
         }
         
-        foreach ($candidateUrl in $candidates) {
+        $uniqueCandidates = [System.Collections.Generic.List[string]]::new()
+        $seenCandidates = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
+        foreach ($candidate in $candidates) {
+            if ([string]::IsNullOrWhiteSpace($candidate)) { continue }
+            $normalized = $candidate.Trim()
+            if ($seenCandidates.Add($normalized)) {
+                $uniqueCandidates.Add($normalized)
+            }
+        }
+
+        foreach ($candidateUrl in $uniqueCandidates) {
             if ($downloaded) { break }
             if ([string]::IsNullOrWhiteSpace($candidateUrl)) { continue }
 
@@ -1092,35 +1112,56 @@ function Save-Attachments {
             }
 
             try {
-                $downloadUrl = $candidateUrl
-                $headersToUse = $Headers
-                $sessionToUse = $Session
+                $authModes = @(
+                    @{ Headers = $Headers; Session = $Session },
+                    @{ Headers = $Headers; Session = $null },
+                    @{ Headers = $null; Session = $Session },
+                    @{ Headers = $null; Session = $null }
+                )
+
                 $downloadResult = $null
+                foreach ($mode in $authModes) {
+                    $downloadUrl = $candidateUrl
+                    $headersToUse = $mode.Headers
+                    $sessionToUse = $mode.Session
 
-                for ($redirects = 0; $redirects -lt 3; $redirects++) {
-                    $downloadResult = Invoke-FileDownload -Url $downloadUrl -OutFile $tempFile -Headers $headersToUse -Session $sessionToUse
-                    if ($downloadResult.Success) { break }
-                    if ([string]::IsNullOrWhiteSpace($downloadResult.Location)) { break }
+                    for ($redirects = 0; $redirects -lt 5; $redirects++) {
+                        $downloadResult = Invoke-FileDownload -Url $downloadUrl -OutFile $tempFile -Headers $headersToUse -Session $sessionToUse
+                        if ($downloadResult.Success) { break }
 
-                    $nextUrl = Resolve-ConfluenceUrl -BaseUrl $downloadUrl -PathOrUrl $downloadResult.Location
-                    $sameHost = $false
-                    try {
-                        $sameHost = ([Uri]$nextUrl).Host -eq ([Uri]$candidateUrl).Host
-                    }
-                    catch {
+                        if ($downloadResult.StatusCode -in @(401, 403) -and [string]::IsNullOrWhiteSpace($downloadResult.Location)) {
+                            break
+                        }
+
+                        if ([string]::IsNullOrWhiteSpace($downloadResult.Location)) { break }
+
+                        $nextUrl = Resolve-ConfluenceUrl -BaseUrl $downloadUrl -PathOrUrl $downloadResult.Location
                         $sameHost = $false
+                        try {
+                            $sameHost = ([Uri]$nextUrl).Host -eq ([Uri]$candidateUrl).Host
+                        }
+                        catch {
+                            $sameHost = $false
+                        }
+
+                        if (-not $sameHost) {
+                            $headersToUse = $null
+                            $sessionToUse = $null
+                        }
+
+                        $downloadUrl = $nextUrl
                     }
 
-                    if (-not $sameHost) {
-                        $headersToUse = $null
-                        $sessionToUse = $null
+                    if ($null -ne $downloadResult -and $downloadResult.Success) {
+                        break
                     }
-
-                    $downloadUrl = $nextUrl
                 }
 
                 if ($null -eq $downloadResult -or -not $downloadResult.Success) {
-                    throw $downloadResult.Error
+                    if ($null -ne $downloadResult -and $null -ne $downloadResult.Error) {
+                        throw $downloadResult.Error
+                    }
+                    throw [System.Exception]::new('Attachment request failed without a response payload.')
                 }
 
                 if (Test-Path -LiteralPath $tempFile) {
@@ -1144,7 +1185,16 @@ function Save-Attachments {
         if (-not $downloaded) {
             $failCount++
             if ($null -ne $lastError) {
-                $msg = $lastError.Exception.Message
+                $msg = ''
+                if ($lastError -is [System.Management.Automation.ErrorRecord]) {
+                    $msg = $lastError.Exception.Message
+                }
+                elseif ($lastError -is [System.Exception]) {
+                    $msg = $lastError.Message
+                }
+                else {
+                    $msg = [string]$lastError
+                }
                 if ($msg -match '404|Not Found') {
                     Write-Host ("     ! Attachment 404 [{0}]: {1}" -f $attTitle, $msg) -ForegroundColor DarkGray
                 } else {
