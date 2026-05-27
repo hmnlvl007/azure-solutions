@@ -583,7 +583,16 @@ function Invoke-FileDownload {
         $request.Headers.Accept.Clear()
         $null = $request.Headers.TryAddWithoutValidation('Accept', '*/*')
 
-        if ($null -ne $Session -and $null -ne $Session.Cookies) {
+        $hasAuthorizationHeader = $false
+        if ($null -ne $Headers) {
+            try {
+                $authValue = [string]$Headers['Authorization']
+                if (-not [string]::IsNullOrWhiteSpace($authValue)) { $hasAuthorizationHeader = $true }
+            }
+            catch { $hasAuthorizationHeader = $false }
+        }
+
+        if (-not $hasAuthorizationHeader -and $null -ne $Session -and $null -ne $Session.Cookies) {
             try {
                 $cookieHeader = $Session.Cookies.GetCookieHeader([Uri]$Url)
                 if (-not [string]::IsNullOrWhiteSpace($cookieHeader)) {
@@ -1149,6 +1158,8 @@ function Save-Attachments {
 
             $apiDownload = "$ApiBase/content/$PageId/child/attachment/$attId/download"
             $candidates.Add($apiDownload)
+            $apiWithAuth = Add-OsAuthTypeBasic -Url $apiDownload
+            if ($apiWithAuth -ne $apiDownload) { $candidates.Add($apiWithAuth) }
 
             # Confluence Cloud v2 download endpoint fallback (often avoids v1 attachment 403s).
             $v2Download = "$wikiRoot/api/v2/attachments/$attId/download"
@@ -1230,6 +1241,19 @@ function Save-Attachments {
                         if ([string]::IsNullOrWhiteSpace($downloadResult.Location)) { break }
 
                         $nextUrl = Resolve-ConfluenceUrl -BaseUrl $downloadUrl -PathOrUrl $downloadResult.Location
+                        $isLoginHost = $false
+                        try {
+                            $nextHost = ([Uri]$nextUrl).Host
+                            if ($nextHost -ieq 'id.atlassian.com') { $isLoginHost = $true }
+                        }
+                        catch {
+                            $isLoginHost = $false
+                        }
+
+                        if ($isLoginHost) {
+                            break
+                        }
+
                         $sameHost = $false
                         try {
                             $sameHost = ([Uri]$nextUrl).Host -eq ([Uri]$candidateUrl).Host
