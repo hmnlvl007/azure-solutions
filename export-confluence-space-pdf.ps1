@@ -910,24 +910,59 @@ function Save-Attachments {
         $tempFile = Join-Path -Path ([IO.Path]::GetTempPath()) -ChildPath ("cf-att-$([Guid]::NewGuid().ToString('N')).tmp")
 
         try {
-            $url = Resolve-ConfluenceUrl -BaseUrl $WikiBase -PathOrUrl $downloadPath
-            if ([string]::IsNullOrWhiteSpace($url)) { continue }
-            $attParams = @{
-                Uri             = $url
-                Method          = 'Get'
-                OutFile         = $tempFile
-                UseBasicParsing = $true
-                Headers         = @{ Authorization = $Headers.Authorization }
-                ErrorAction     = 'Stop'
+            # Build candidate URLs in priority order:
+            #   1. REST API download endpoint (most reliable with Basic auth + redirects)
+            #   2. _links.download resolved against ConfluenceBaseUrl (strip /wiki to avoid double-segment)
+            #   3. _links.download resolved against WikiBase
+            $baseForAtt = $WikiBase -replace '/wiki$', ''
+            $candidateUrls = [System.Collections.Generic.List[string]]::new()
+            if (-not [string]::IsNullOrWhiteSpace($attId)) {
+                $candidateUrls.Add("$ApiBase/content/$attId/download")
             }
-            if ($null -ne $Session) { $attParams.WebSession = $Session }
-            Invoke-WebRequest @attParams | Out-Null
-            if (Test-Path -LiteralPath $tempFile) {
-                $size = (Get-Item -LiteralPath $tempFile).Length
-                if ($size -gt 0) {
-                    [IO.File]::Move($tempFile, $filePath)
-                    $count++
-                    $totalBytes += $size
+            $urlFromBase = Resolve-ConfluenceUrl -BaseUrl $baseForAtt -PathOrUrl $downloadPath
+            if (-not [string]::IsNullOrWhiteSpace($urlFromBase)) { $candidateUrls.Add($urlFromBase) }
+            $urlFromWiki = Resolve-ConfluenceUrl -BaseUrl $WikiBase -PathOrUrl $downloadPath
+            if (-not [string]::IsNullOrWhiteSpace($urlFromWiki) -and $urlFromWiki -ne $urlFromBase) {
+                $candidateUrls.Add($urlFromWiki)
+            }
+
+            $downloaded = $false
+            $lastError  = $null
+            foreach ($url in $candidateUrls) {
+                if ($downloaded) { break }
+                if (Test-Path -LiteralPath $tempFile) {
+                    Remove-Item -LiteralPath $tempFile -Force -ErrorAction SilentlyContinue
+                }
+                try {
+                    $attParams = @{
+                        Uri             = $url
+                        Method          = 'Get'
+                        OutFile         = $tempFile
+                        UseBasicParsing = $true
+                        Headers         = @{ Authorization = $Headers.Authorization }
+                        ErrorAction     = 'Stop'
+                    }
+                    if ($null -ne $Session) { $attParams.WebSession = $Session }
+                    Invoke-WebRequest @attParams | Out-Null
+                    if (Test-Path -LiteralPath $tempFile) {
+                        $size = (Get-Item -LiteralPath $tempFile).Length
+                        if ($size -gt 0) {
+                            [IO.File]::Move($tempFile, $filePath)
+                            $count++
+                            $totalBytes += $size
+                            $downloaded = $true
+                        }
+                    }
+                }
+                catch {
+                    $lastError = $_
+                }
+            }
+            if (-not $downloaded -and $null -ne $lastError) {
+                # Suppress noise for 404s on inline images (they are often orphaned/CDN-hosted references)
+                $msg = $lastError.Exception.Message
+                if ($msg -notmatch '404|Not Found') {
+                    Write-Host ("     ! Attachment download failed [{0}]: {1}" -f $attTitle, $msg) -ForegroundColor DarkYellow
                 }
             }
         }
