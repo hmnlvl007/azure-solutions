@@ -408,10 +408,18 @@ function Get-AllPages {
 function Get-PageFolder {
     param([object[]]$Ancestors, [string]$HomePageId, [string]$Root)
     $folder = $Root
+    $pastHome = $false
     foreach ($ancestor in @($Ancestors)) {
         $ancestorId = [string]$ancestor.id
         if ([string]::IsNullOrWhiteSpace($ancestorId)) { continue }
-        if ($ancestorId -eq $HomePageId) { continue }
+        if ($ancestorId -eq $HomePageId) {
+            $pastHome = $true
+            continue  # skip the home page itself
+        }
+        if (-not $pastHome) {
+            # Ancestor is above the space home page (e.g. virtual space root) — skip it
+            continue
+        }
         $part = Get-CompactName -Name ([string]$ancestor.title) -MaxLength 60
         $folder = Join-Path -Path $folder -ChildPath $part
     }
@@ -834,7 +842,16 @@ function Save-Attachments {
         try { $downloadPath = [string]$item._links.download } catch { $downloadPath = $null }
         if ([string]::IsNullOrWhiteSpace($downloadPath)) { continue }
 
-        $fileName = Get-CompactName -Name ([string]$item.title) -MaxLength 80
+        $attTitle = [string]$item.title
+        $attId = ''
+        try { $attId = [string]$item.id } catch { $attId = '' }
+
+        # Preserve the file extension from the title so the saved file opens correctly
+        $ext = [IO.Path]::GetExtension($attTitle)   # e.g. ".pdf" or ""
+        $nameNoExt = [IO.Path]::GetFileNameWithoutExtension($attTitle)
+        $safeBase = Get-CompactName -Name $nameNoExt -MaxLength 60
+        # Append attachment ID to prevent collisions when two attachments share the same name
+        $fileName = if ([string]::IsNullOrWhiteSpace($attId)) { $safeBase + $ext } else { "$safeBase-$attId$ext" }
         $filePath = Join-Path -Path $attachmentFolder -ChildPath $fileName
         $tempFile = Join-Path -Path ([IO.Path]::GetTempPath()) -ChildPath ("cf-att-$([Guid]::NewGuid().ToString('N')).tmp")
 
