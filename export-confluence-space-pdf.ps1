@@ -562,14 +562,9 @@ function Invoke-FileDownload {
         $request.ReadWriteTimeout = 60000
         $request.UserAgent = 'ConfluenceSpaceExporter/1.0'
 
-        $cookieContainer = $null
-        if ($null -ne $Session) {
-            try { $cookieContainer = $Session.Cookies } catch { $cookieContainer = $null }
-        }
-        if ($null -eq $cookieContainer) {
-            $cookieContainer = New-Object System.Net.CookieContainer
-        }
-        $request.CookieContainer = $cookieContainer
+        # Use a fresh cookie container for each request.
+        # Re-using WebRequestSession cookies has caused intermittent invalid-object-state failures.
+        $request.CookieContainer = New-Object System.Net.CookieContainer
 
         if ($null -ne $Headers) {
             foreach ($key in $Headers.Keys) {
@@ -1104,6 +1099,40 @@ function Save-Attachments {
 
         $downloaded = $false
         $lastError  = $null
+
+        # Primary path: direct REST API binary download with Basic auth headers.
+        # This avoids session/cookie state issues seen with some attachments.
+        if (-not [string]::IsNullOrWhiteSpace($attId)) {
+            $directApiUrl = Add-OsAuthTypeBasic -Url "$ApiBase/content/$PageId/child/attachment/$attId/download"
+            try {
+                if (Test-Path -LiteralPath $tempFile) {
+                    Remove-Item -LiteralPath $tempFile -Force -ErrorAction SilentlyContinue
+                }
+
+                Invoke-RestMethod -Uri $directApiUrl -Method Get -Headers $Headers -OutFile $tempFile -ErrorAction Stop
+
+                if (Test-Path -LiteralPath $tempFile) {
+                    $directSize = (Get-Item -LiteralPath $tempFile).Length
+                    if ($directSize -gt 0 -and (Test-DownloadLooksValid -Path $tempFile -ExpectedExtension $ext)) {
+                        Finalize-DownloadedFile -TempPath $tempFile -DestinationPath $filePath
+                        $count++
+                        $totalBytes += $directSize
+                        $downloaded = $true
+                    }
+                    elseif ($directSize -gt 0) {
+                        $lastError = [System.Exception]::new('Direct API attachment response was non-empty but not a valid file payload.')
+                    }
+                }
+            }
+            catch {
+                $lastError = $_
+            }
+        }
+
+        if ($downloaded) {
+            continue
+        }
+
         # Build candidate download URLs; some tenants return paths without /wiki
         $confluenceRoot = $WikiBase -replace '/wiki$', ''
         $candidates = [System.Collections.Generic.List[string]]::new()
@@ -1164,9 +1193,7 @@ function Save-Attachments {
 
             try {
                 $authModes = @(
-                    @{ Headers = $Headers; Session = $Session },
                     @{ Headers = $Headers; Session = $null },
-                    @{ Headers = $null; Session = $Session },
                     @{ Headers = $null; Session = $null }
                 )
 
@@ -1246,10 +1273,31 @@ function Save-Attachments {
                 else {
                     $msg = [string]$lastError
                 }
+                if (-not [string]::IsNullOrWhiteSpace($msg)) {
+                    $msg = $msg.Trim()
+                }
                 if ($msg -match '404|Not Found') {
                     Write-Host ("     ! Attachment 404 [{0}]: {1}" -f $attTitle, $msg) -ForegroundColor DarkGray
                 } else {
-                    Write-Host ("     ! Attachment download failed [{0}]: {1}" -f $attTitle, $msg) -ForegroundColor DarkYellow
+                    $errType = ''
+                    try {
+                        if ($lastError -is [System.Management.Automation.ErrorRecord]) {
+                            $errType = $lastError.Exception.GetType().FullName
+                        }
+                        elseif ($lastError -is [System.Exception]) {
+                            $errType = $lastError.GetType().FullName
+                        }
+                    }
+                    catch {
+                        $errType = ''
+                    }
+
+                    if ([string]::IsNullOrWhiteSpace($errType)) {
+                        Write-Host ("     ! Attachment download failed [{0}]: {1}" -f $attTitle, $msg) -ForegroundColor DarkYellow
+                    }
+                    else {
+                        Write-Host ("     ! Attachment download failed [{0}] ({1}): {2}" -f $attTitle, $errType, $msg) -ForegroundColor DarkYellow
+                    }
                 }
             }
         }
