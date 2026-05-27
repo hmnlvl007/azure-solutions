@@ -889,6 +889,7 @@ function Save-Attachments {
 
     Ensure-Directory -Path $attachmentFolder
     $count = 0
+    $failCount = 0
     $totalBytes = [long]0
 
     foreach ($item in $items) {
@@ -958,15 +959,20 @@ function Save-Attachments {
                     $lastError = $_
                 }
             }
-            if (-not $downloaded -and $null -ne $lastError) {
-                # Suppress noise for 404s on inline images (they are often orphaned/CDN-hosted references)
-                $msg = $lastError.Exception.Message
-                if ($msg -notmatch '404|Not Found') {
-                    Write-Host ("     ! Attachment download failed [{0}]: {1}" -f $attTitle, $msg) -ForegroundColor DarkYellow
+            if (-not $downloaded) {
+                $failCount++
+                if ($null -ne $lastError) {
+                    $msg = $lastError.Exception.Message
+                    if ($msg -match '404|Not Found') {
+                        Write-Host ("     ! Attachment 404 [{0}]: {1}" -f $attTitle, $msg) -ForegroundColor DarkGray
+                    } else {
+                        Write-Host ("     ! Attachment download failed [{0}]: {1}" -f $attTitle, $msg) -ForegroundColor DarkYellow
+                    }
                 }
             }
         }
         catch {
+            $failCount++
             Write-Host ("     ! Attachment download failed [{0}]: {1}" -f ([string]$item.title), $_.Exception.Message) -ForegroundColor DarkYellow
         }
         finally {
@@ -978,10 +984,10 @@ function Save-Attachments {
 
     if ($count -eq 0) {
         Remove-Item -LiteralPath $attachmentFolder -Recurse -Force -ErrorAction SilentlyContinue
-        return [PSCustomObject]@{ Count = 0; Bytes = [long]0; Path = $null }
+        return [PSCustomObject]@{ Count = 0; Failed = $failCount; Attempted = ($count + $failCount); Bytes = [long]0; Path = $null }
     }
 
-    return [PSCustomObject]@{ Count = $count; Bytes = $totalBytes; Path = $attachmentFolder }
+    return [PSCustomObject]@{ Count = $count; Failed = $failCount; Attempted = ($count + $failCount); Bytes = $totalBytes; Path = $attachmentFolder }
 }
 
 $wikiBase = Get-WikiBaseUrl -BaseUrl $ConfluenceBaseUrl
@@ -1058,6 +1064,8 @@ $formats = @{ doc = 0; html = 0 }
 $unchanged = 0
 $attachmentsCount = 0
 $attachmentsBytes = [long]0
+$attachmentsFailed = 0
+$attachmentsAttempted = 0
 $totalBytes = [long]0
 $wordDisabled = $false
 $wordFailureStreak = 0
@@ -1164,11 +1172,15 @@ foreach ($page in $pages) {
     Write-Host ("  OK {0} | {1:N0} KB" -f $format.ToUpper(), ($fileSize / 1KB)) -ForegroundColor Green
 
     $attachmentInfo = Save-Attachments -ApiBase $apiBase -WikiBase $wikiBase -PageId $pageId -Headers $headers -Session $session -PageFolder $folder -BaseFilePath $destPath
+    $attachmentsAttempted += $attachmentInfo.Attempted
+    $attachmentsFailed    += $attachmentInfo.Failed
     if ($attachmentInfo.Count -gt 0) {
         $attachmentsCount += $attachmentInfo.Count
         $attachmentsBytes += $attachmentInfo.Bytes
         $totalBytes += $attachmentInfo.Bytes
-        Write-Host ("     + {0} attachment(s)" -f $attachmentInfo.Count) -ForegroundColor DarkCyan
+        Write-Host ("     + {0} attachment(s) saved" -f $attachmentInfo.Count) -ForegroundColor DarkCyan
+    } elseif ($attachmentInfo.Attempted -gt 0) {
+        Write-Host ("     ! {0} attachment(s) attempted, all failed" -f $attachmentInfo.Attempted) -ForegroundColor Yellow
     }
 
     if ($ExportMode -eq 'Incremental' -and $null -ne $previous) {
@@ -1232,7 +1244,7 @@ $summary = [PSCustomObject]@{
     exported = [PSCustomObject]@{ doc = $formats.doc; html = $formats.html }
     exportedCount = $exportedCount
     unchangedCount = $unchanged
-    attachments = [PSCustomObject]@{ count = $attachmentsCount; bytes = $attachmentsBytes }
+    attachments = [PSCustomObject]@{ count = $attachmentsCount; failed = $attachmentsFailed; attempted = $attachmentsAttempted; bytes = $attachmentsBytes }
     totalSizeBytes = $totalBytes
     failedCount = $failed.Count
     failures = $failed
@@ -1257,9 +1269,8 @@ Write-Host "  Pages    : $($pages.Count)"
 Write-Host "  Exported : $exportedCount (DOC: $($formats.doc) | HTML: $($formats.html))" -ForegroundColor Green
 Write-Host "  Kept     : $unchanged unchanged" -ForegroundColor DarkGreen
 Write-Host "  Failed   : $($failed.Count)" -ForegroundColor $(if ($failed.Count -gt 0) { 'Red' } else { 'Green' })
-if ($attachmentsCount -gt 0) {
-    Write-Host "  Attach.  : $attachmentsCount files" -ForegroundColor DarkCyan
-}
+$attColor = if ($attachmentsFailed -gt 0 -and $attachmentsCount -eq 0) { 'Red' } elseif ($attachmentsFailed -gt 0) { 'Yellow' } else { 'DarkCyan' }
+Write-Host ("  Attach.  : {0} saved, {1} failed of {2} attempted" -f $attachmentsCount, $attachmentsFailed, $attachmentsAttempted) -ForegroundColor $attColor
 Write-Host ("  Duration : {0:hh\:mm\:ss}" -f $elapsed)
 Write-Host "  Output   : $spaceRoot"
 Write-Host "  Summary  : $summaryPath"
