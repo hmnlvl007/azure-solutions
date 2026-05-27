@@ -409,17 +409,11 @@ SELECT
     CAST(ROUND(
         SUM(CASE WHEN mf.type = 1 THEN CAST(mf.size AS BIGINT) ELSE 0 END) * 8.0 / 1024, 2
     ) AS DECIMAL(18,2))                                   AS LogSizeMB,
-    MAX(bs.backup_finish_date)                            AS LastFullBackupDate,
-    MAX(CASE WHEN bs2.type = 'L' THEN bs2.backup_finish_date ELSE NULL END) AS LastLogBackupDate,
     ISNULL(ag.name, '')                                   AS AGName,
     ISNULL(ars.role_desc, '')                             AS AGRole,
     CASE WHEN d.database_id <= 4 THEN 'System' ELSE 'User' END AS DatabaseType
 FROM sys.databases d
 JOIN sys.master_files mf ON d.database_id = mf.database_id
-LEFT JOIN msdb.dbo.backupset bs
-    ON bs.database_name = d.name AND bs.type = 'D'
-LEFT JOIN msdb.dbo.backupset bs2
-    ON bs2.database_name = d.name AND bs2.type = 'L'
 LEFT JOIN sys.dm_hadr_database_replica_states hdrs
     ON hdrs.database_id = d.database_id AND hdrs.is_local = 1
 LEFT JOIN sys.availability_replicas ar
@@ -455,8 +449,6 @@ ORDER BY DatabaseType DESC, d.name
                 TotalSizeMB       = $row.TotalSizeMB
                 DataSizeMB        = $row.DataSizeMB
                 LogSizeMB         = $row.LogSizeMB
-                LastFullBackupDate= $row.LastFullBackupDate
-                LastLogBackupDate = $row.LastLogBackupDate
                 AGName            = $row.AGName
                 AGRole            = $row.AGRole
             })
