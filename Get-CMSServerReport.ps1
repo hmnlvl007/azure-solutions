@@ -268,6 +268,7 @@ $allDistributors     = [System.Collections.Generic.List[PSObject]]::new()
 $allReplSchedules    = [System.Collections.Generic.List[PSObject]]::new()
 $allReplDistMap      = [System.Collections.Generic.List[PSObject]]::new()
 $allPublisherDistMap = [System.Collections.Generic.List[PSObject]]::new()
+$allDatabaseInventory= [System.Collections.Generic.List[PSObject]]::new()
 $allCDCDatabases     = [System.Collections.Generic.List[PSObject]]::new()
 $allCDCTables        = [System.Collections.Generic.List[PSObject]]::new()
 $allCDCJobs          = [System.Collections.Generic.List[PSObject]]::new()
@@ -384,6 +385,82 @@ SELECT
             HasCDC                     = $false
         })
         continue
+    }
+
+    # ── Database inventory (all paths, including InventoryOnly) ──────────────
+    $dbInvQuery = @"
+SELECT
+    CONVERT(NVARCHAR(256), SERVERPROPERTY('ServerName'))  AS ServerName,
+    d.name                                                AS DatabaseName,
+    d.state_desc                                          AS [State],
+    d.recovery_model_desc                                 AS RecoveryModel,
+    d.compatibility_level                                 AS CompatibilityLevel,
+    CAST(d.is_read_only   AS INT)                         AS IsReadOnly,
+    CAST(d.is_published   AS INT)                         AS IsPublished,
+    CAST(d.is_subscribed  AS INT)                         AS IsSubscribed,
+    CAST(d.is_distributor AS INT)                         AS IsDistributor,
+    CAST(d.is_cdc_enabled AS INT)                         AS IsCDCEnabled,
+    SUSER_SNAME(d.owner_sid)                              AS DBOwner,
+    d.create_date                                         AS CreateDate,
+    CAST(ROUND(SUM(mf.size) * 8.0 / 1024, 2) AS DECIMAL(18,2)) AS TotalSizeMB,
+    CAST(ROUND(
+        SUM(CASE WHEN mf.type = 0 THEN mf.size ELSE 0 END) * 8.0 / 1024, 2
+    ) AS DECIMAL(18,2))                                   AS DataSizeMB,
+    CAST(ROUND(
+        SUM(CASE WHEN mf.type = 1 THEN mf.size ELSE 0 END) * 8.0 / 1024, 2
+    ) AS DECIMAL(18,2))                                   AS LogSizeMB,
+    MAX(bs.backup_finish_date)                            AS LastFullBackupDate,
+    MAX(CASE WHEN bs2.type = 'L' THEN bs2.backup_finish_date ELSE NULL END) AS LastLogBackupDate,
+    ISNULL(ag.name, '')                                   AS AGName,
+    ISNULL(ars.role_desc, '')                             AS AGRole,
+    CASE WHEN d.database_id <= 4 THEN 'System' ELSE 'User' END AS DatabaseType
+FROM sys.databases d
+JOIN sys.master_files mf ON d.database_id = mf.database_id
+LEFT JOIN msdb.dbo.backupset bs
+    ON bs.database_name = d.name AND bs.type = 'D'
+LEFT JOIN msdb.dbo.backupset bs2
+    ON bs2.database_name = d.name AND bs2.type = 'L'
+LEFT JOIN sys.dm_hadr_database_replica_states hdrs
+    ON hdrs.database_id = d.database_id AND hdrs.is_local = 1
+LEFT JOIN sys.availability_replicas ar
+    ON ar.replica_id = hdrs.replica_id
+LEFT JOIN sys.availability_groups ag
+    ON ag.group_id = ar.group_id
+LEFT JOIN sys.dm_hadr_availability_replica_states ars
+    ON ars.replica_id = ar.replica_id AND ars.is_local = 1
+GROUP BY
+    d.name, d.state_desc, d.recovery_model_desc, d.compatibility_level,
+    d.is_read_only, d.is_published, d.is_subscribed, d.is_distributor,
+    d.is_cdc_enabled, d.owner_sid, d.create_date, d.database_id,
+    ag.name, ars.role_desc
+ORDER BY DatabaseType DESC, d.name
+"@
+    $dbInvData = Invoke-SqlQuerySafe -ServerInstance $server -Query $dbInvQuery
+    if ($dbInvData) {
+        foreach ($row in $dbInvData) {
+            [void]$allDatabaseInventory.Add([PSCustomObject]@{
+                ServerName        = $row.ServerName
+                DatabaseName      = $row.DatabaseName
+                DatabaseType      = $row.DatabaseType
+                State             = $row.State
+                RecoveryModel     = $row.RecoveryModel
+                CompatibilityLevel= $row.CompatibilityLevel
+                IsReadOnly        = $row.IsReadOnly
+                IsPublished       = $row.IsPublished
+                IsSubscribed      = $row.IsSubscribed
+                IsDistributor     = $row.IsDistributor
+                IsCDCEnabled      = $row.IsCDCEnabled
+                DBOwner           = $row.DBOwner
+                CreateDate        = $row.CreateDate
+                TotalSizeMB       = $row.TotalSizeMB
+                DataSizeMB        = $row.DataSizeMB
+                LogSizeMB         = $row.LogSizeMB
+                LastFullBackupDate= $row.LastFullBackupDate
+                LastLogBackupDate = $row.LastLogBackupDate
+                AGName            = $row.AGName
+                AGRole            = $row.AGRole
+            })
+        }
     }
 
     if (-not $InventoryOnly) {
@@ -1581,6 +1658,69 @@ if (-not $InventoryOnly) {
 
 Write-Host "  CSV files exported to: $csvBase*.csv" -ForegroundColor Green
 Write-Host ""
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Export Database Inventory Excel workbook
+# ─────────────────────────────────────────────────────────────────────────────
+if ($allDatabaseInventory.Count -gt 0) {
+    # Ensure ImportExcel is available (may not be loaded if input was CMS, not Excel)
+    if (-not (Get-Module -Name ImportExcel)) {
+        if (Get-Module -ListAvailable -Name ImportExcel) {
+            Import-Module ImportExcel -ErrorAction SilentlyContinue
+        }
+    }
+
+    if (Get-Module -Name ImportExcel) {
+        $xlPath = Join-Path $OutputPath "CMS_DatabaseInventory_$reportSuffix.xlsx"
+
+        # Sheet 1 – Full database list (all servers, all databases)
+        $allDatabaseInventory |
+            Sort-Object ServerName, DatabaseType, DatabaseName |
+            Export-Excel -Path $xlPath -WorksheetName 'All Databases' `
+                -AutoFilter -AutoSize -FreezeTopRow -BoldTopRow `
+                -TableName 'AllDatabases' -TableStyle Medium2
+
+        # Sheet 2 – User databases only
+        $allDatabaseInventory | Where-Object { $_.DatabaseType -eq 'User' } |
+            Sort-Object ServerName, DatabaseName |
+            Export-Excel -Path $xlPath -WorksheetName 'User Databases' `
+                -AutoFilter -AutoSize -FreezeTopRow -BoldTopRow `
+                -TableName 'UserDatabases' -TableStyle Medium6
+
+        # Sheet 3 – Per-server summary (counts + sizes)
+        $allDatabaseInventory |
+            Group-Object ServerName |
+            ForEach-Object {
+                $rows = $_.Group
+                [PSCustomObject]@{
+                    ServerName          = $_.Name
+                    TotalDatabases      = $rows.Count
+                    UserDatabases       = ($rows | Where-Object { $_.DatabaseType -eq 'User' }).Count
+                    SystemDatabases     = ($rows | Where-Object { $_.DatabaseType -eq 'System' }).Count
+                    OnlineDatabases     = ($rows | Where-Object { $_.State -eq 'ONLINE' }).Count
+                    OfflineDatabases    = ($rows | Where-Object { $_.State -ne 'ONLINE' }).Count
+                    TotalSizeGB         = [math]::Round(($rows | Measure-Object TotalSizeMB -Sum).Sum / 1024, 2)
+                    DataSizeGB          = [math]::Round(($rows | Measure-Object DataSizeMB  -Sum).Sum / 1024, 2)
+                    LogSizeGB           = [math]::Round(($rows | Measure-Object LogSizeMB   -Sum).Sum / 1024, 2)
+                    PublishedDBs        = ($rows | Where-Object { $_.IsPublished -eq 1 }).Count
+                    CDCEnabledDBs       = ($rows | Where-Object { $_.IsCDCEnabled -eq 1 }).Count
+                    DBsInAG             = ($rows | Where-Object { $_.AGName -ne '' }).Count
+                }
+            } |
+            Sort-Object ServerName |
+            Export-Excel -Path $xlPath -WorksheetName 'Server Summary' `
+                -AutoFilter -AutoSize -FreezeTopRow -BoldTopRow `
+                -TableName 'ServerSummary' -TableStyle Medium9
+
+        Write-Host "  Database inventory Excel: $xlPath" -ForegroundColor Green
+    }
+    else {
+        Write-Warning "ImportExcel module not available. Exporting database inventory as CSV instead."
+        $allDatabaseInventory | Sort-Object ServerName, DatabaseType, DatabaseName |
+            Export-Csv "$($csvBase)_DatabaseInventory.csv" -NoTypeInformation
+        Write-Host "  Database inventory CSV: $($csvBase)_DatabaseInventory.csv" -ForegroundColor Green
+    }
+}
 
 # Optionally open the report
 if ($Host.Name -eq 'ConsoleHost') {
