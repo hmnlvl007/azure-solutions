@@ -229,7 +229,14 @@ function Get-AllPages {
         }
 
         while (-not [string]::IsNullOrWhiteSpace($nextUri)) {
-            $response = Invoke-RestMethod -Uri $nextUri -Method Get -Headers $Headers -ErrorAction Stop
+            $response = $null
+            try {
+                $response = Invoke-RestMethod -Uri $nextUri -Method Get -Headers $Headers -ErrorAction Stop
+            }
+            catch {
+                Write-Host ("  v2 pagination error (non-fatal): {0}" -f $_.Exception.Message) -ForegroundColor DarkYellow
+                break
+            }
             $batch = @(Get-ApiResultItems -Response $response)
             if ($batch.Count -eq 0) { break }
 
@@ -401,6 +408,35 @@ function Get-AllPages {
         Write-Host ("  diag status counts -> {0}" -f $statusSummary) -ForegroundColor DarkCyan
     }
 
+    # ── Post-discovery ancestry enrichment ────────────────────────────────────
+    # v2 API pages carry no 'ancestors' field. Fetch each page individually via
+    # v1 to get the full ancestor chain so folder hierarchy is correct.
+    $needsEnrichment = @($byId.Values | Where-Object {
+        $ancs = @()
+        try { $ancs = @(Normalize-Ancestors -AncestorsValue $_.ancestors) } catch { $ancs = @() }
+        return $ancs.Count -eq 0
+    })
+    if ($needsEnrichment.Count -gt 0) {
+        Write-Host ("  Enriching ancestry for {0} page(s) via v1 API..." -f $needsEnrichment.Count) -ForegroundColor DarkGray
+        $enriched = 0
+        $enrichFailed = 0
+        foreach ($p in $needsEnrichment) {
+            $pid = [string]$p.id
+            try {
+                $full = Invoke-RestMethod -Uri "$ApiBase/content/$pid`?expand=ancestors,version" -Method Get -Headers $Headers -ErrorAction Stop
+                $byId[$pid] = $full
+                $enriched++
+            }
+            catch {
+                $enrichFailed++
+                if ($Diagnostics) {
+                    Write-Host ("  diag enrich failed for {0}: {1}" -f $pid, $_.Exception.Message) -ForegroundColor DarkYellow
+                }
+            }
+        }
+        Write-Host ("  Ancestry enrichment: {0} ok, {1} failed." -f $enriched, $enrichFailed) -ForegroundColor DarkGray
+    }
+
     if ($byId.Count -eq 0) { return @() }
     return @($byId.Values | Sort-Object -Property @{ Expression = { [string]$_.title } }, @{ Expression = { [string]$_.id } })
 }
@@ -409,18 +445,36 @@ function Get-PageFolder {
     param([object[]]$Ancestors, [string]$HomePageId, [string]$Root)
     $folder = $Root
     $pastHome = $false
+    $parts = [System.Collections.Generic.List[string]]::new()
+
     foreach ($ancestor in @($Ancestors)) {
         $ancestorId = [string]$ancestor.id
         if ([string]::IsNullOrWhiteSpace($ancestorId)) { continue }
         if ($ancestorId -eq $HomePageId) {
             $pastHome = $true
-            continue  # skip the home page itself
+            continue  # skip the space home page itself
         }
         if (-not $pastHome) {
-            # Ancestor is above the space home page (e.g. virtual space root) — skip it
+            # Collect pre-home ancestors separately in case home is never found
             continue
         }
-        $part = Get-CompactName -Name ([string]$ancestor.title) -MaxLength 60
+        $parts.Add((Get-CompactName -Name ([string]$ancestor.title) -MaxLength 60))
+    }
+
+    # If home page was never matched (e.g. v2 parent map didn't include it),
+    # fall back: use the full ancestor list skipping only the very first entry
+    # (the Confluence space root), so we still get real subfolder structure.
+    if (-not $pastHome -and $Ancestors.Count -gt 0) {
+        $skip = 1   # skip virtual space root at index 0
+        for ($i = $skip; $i -lt $Ancestors.Count; $i++) {
+            $ancestorId = [string]$Ancestors[$i].id
+            if ([string]::IsNullOrWhiteSpace($ancestorId)) { continue }
+            if ($ancestorId -eq $HomePageId) { continue }  # skip home if encountered here
+            $parts.Add((Get-CompactName -Name ([string]$Ancestors[$i].title) -MaxLength 60))
+        }
+    }
+
+    foreach ($part in $parts) {
         $folder = Join-Path -Path $folder -ChildPath $part
     }
     return $folder
@@ -868,12 +922,17 @@ function Save-Attachments {
             }
             if ($null -ne $Session) { $attParams.WebSession = $Session }
             Invoke-WebRequest @attParams | Out-Null
-            [IO.File]::Move($tempFile, $filePath)
-            $size = (Get-Item -LiteralPath $filePath).Length
-            $count++
-            $totalBytes += $size
+            if (Test-Path -LiteralPath $tempFile) {
+                $size = (Get-Item -LiteralPath $tempFile).Length
+                if ($size -gt 0) {
+                    [IO.File]::Move($tempFile, $filePath)
+                    $count++
+                    $totalBytes += $size
+                }
+            }
         }
         catch {
+            Write-Host ("     ! Attachment download failed [{0}]: {1}" -f ([string]$item.title), $_.Exception.Message) -ForegroundColor DarkYellow
         }
         finally {
             if (Test-Path -LiteralPath $tempFile) {
