@@ -312,10 +312,10 @@ SELECT
     (SELECT CAST(value_in_use AS int) FROM sys.configurations WHERE name = 'clr enabled') AS SqlClrEnabled,
     (SELECT CAST(value_in_use AS int) FROM sys.configurations WHERE name = 'remote access') AS RemoteAccessAllowed,
     (SELECT CAST(value_in_use AS int) FROM sys.configurations WHERE name = 'xp_cmdshell') AS XpCmdShellEnabled,
-    (SELECT CAST(value_in_use AS int) FROM sys.configurations WHERE name = 'min server memory (MB)') AS MinSqlServerMemoryMB,
-    (SELECT CAST(value_in_use AS int) FROM sys.configurations WHERE name = 'max server memory (MB)') AS MaxSqlServerMemoryMB,
+    (SELECT CAST(value_in_use AS bigint) FROM sys.configurations WHERE name = 'min server memory (MB)') AS MinSqlServerMemoryMB,
+    (SELECT CAST(value_in_use AS bigint) FROM sys.configurations WHERE name = 'max server memory (MB)') AS MaxSqlServerMemoryMB,
     CASE 
-        WHEN (SELECT CAST(value_in_use AS int) FROM sys.configurations WHERE name = 'min server memory (MB)') = 0
+        WHEN (SELECT CAST(value_in_use AS bigint) FROM sys.configurations WHERE name = 'min server memory (MB)') = 0
          AND (SELECT CAST(value_in_use AS bigint) FROM sys.configurations WHERE name = 'max server memory (MB)') >= 2147483647
             THEN 'Dynamic/Default'
         ELSE 'Configured'
@@ -402,12 +402,12 @@ SELECT
     CAST(d.is_cdc_enabled AS INT)                         AS IsCDCEnabled,
     SUSER_SNAME(d.owner_sid)                              AS DBOwner,
     d.create_date                                         AS CreateDate,
-    CAST(ROUND(SUM(mf.size) * 8.0 / 1024, 2) AS DECIMAL(18,2)) AS TotalSizeMB,
+    CAST(ROUND(SUM(CAST(mf.size AS BIGINT)) * 8.0 / 1024, 2) AS DECIMAL(18,2)) AS TotalSizeMB,
     CAST(ROUND(
-        SUM(CASE WHEN mf.type = 0 THEN mf.size ELSE 0 END) * 8.0 / 1024, 2
+        SUM(CASE WHEN mf.type = 0 THEN CAST(mf.size AS BIGINT) ELSE 0 END) * 8.0 / 1024, 2
     ) AS DECIMAL(18,2))                                   AS DataSizeMB,
     CAST(ROUND(
-        SUM(CASE WHEN mf.type = 1 THEN mf.size ELSE 0 END) * 8.0 / 1024, 2
+        SUM(CASE WHEN mf.type = 1 THEN CAST(mf.size AS BIGINT) ELSE 0 END) * 8.0 / 1024, 2
     ) AS DECIMAL(18,2))                                   AS LogSizeMB,
     MAX(bs.backup_finish_date)                            AS LastFullBackupDate,
     MAX(CASE WHEN bs2.type = 'L' THEN bs2.backup_finish_date ELSE NULL END) AS LastLogBackupDate,
