@@ -571,10 +571,13 @@ function Invoke-FileDownload {
     catch {
         $statusCode = $null
         $location = $null
+        $errorMessage = $_.Exception.Message
         try {
-            if ($_.Exception.Response) {
-                $statusCode = [int]$_.Exception.Response.StatusCode
-                $location = [string]$_.Exception.Response.Headers['Location']
+            $response = $null
+            try { $response = $_.Exception.Response } catch { $response = $null }
+            if ($null -ne $response) {
+                try { $statusCode = [int]$response.StatusCode } catch { $statusCode = $null }
+                try { $location = [string]$response.Headers['Location'] } catch { $location = $null }
             }
         }
         catch {
@@ -582,8 +585,21 @@ function Invoke-FileDownload {
             $location = $null
         }
 
-        return [PSCustomObject]@{ Success = $false; StatusCode = $statusCode; Location = $location; Error = $_ }
+        return [PSCustomObject]@{ Success = $false; StatusCode = $statusCode; Location = $location; Error = $_; Message = $errorMessage }
     }
+}
+
+function Finalize-DownloadedFile {
+    param(
+        [Parameter(Mandatory)][string]$TempPath,
+        [Parameter(Mandatory)][string]$DestinationPath
+    )
+
+    $destDir = [IO.Path]::GetDirectoryName($DestinationPath)
+    if (-not [string]::IsNullOrWhiteSpace($destDir)) { Ensure-Directory -Path $destDir }
+
+    [IO.File]::Copy($TempPath, $DestinationPath, $true)
+    Remove-Item -LiteralPath $TempPath -Force -ErrorAction SilentlyContinue
 }
 
 function Test-DownloadLooksValid {
@@ -1157,7 +1173,7 @@ function Save-Attachments {
                 if (Test-Path -LiteralPath $tempFile) {
                     $size = (Get-Item -LiteralPath $tempFile).Length
                     if ($size -gt 0 -and (Test-DownloadLooksValid -Path $tempFile -ExpectedExtension $ext)) {
-                        [IO.File]::Move($tempFile, $filePath)
+                        Finalize-DownloadedFile -TempPath $tempFile -DestinationPath $filePath
                         $count++
                         $totalBytes += $size
                         $downloaded = $true
