@@ -11,6 +11,7 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
+$script:HttpClientReady = $false
 
 function Get-WikiBaseUrl {
     param([string]$BaseUrl)
@@ -567,6 +568,13 @@ function Invoke-FileDownload {
     $fileStream = $null
 
     try {
+        if (-not $script:HttpClientReady) {
+            if (-not ('System.Net.Http.HttpClientHandler' -as [type])) {
+                Add-Type -AssemblyName System.Net.Http -ErrorAction Stop
+            }
+            $script:HttpClientReady = $true
+        }
+
         if (Test-Path -LiteralPath $OutFile) {
             Remove-Item -LiteralPath $OutFile -Force -ErrorAction SilentlyContinue
         }
@@ -1060,6 +1068,10 @@ function Save-Attachments {
     $attachmentFolder = Join-Path -Path $PageFolder -ChildPath ($baseName + '-attachments')
 
     $items = [System.Collections.Generic.List[object]]::new()
+    $failures = [System.Collections.Generic.List[object]]::new()
+    $count = 0
+    $failCount = 0
+    $totalBytes = [long]0
     $nextUri = "$ApiBase/content/$PageId/child/attachment?limit=200"
 
     while (-not [string]::IsNullOrWhiteSpace($nextUri)) {
@@ -1067,9 +1079,18 @@ function Save-Attachments {
             $response = Invoke-RestMethod -Uri $nextUri -Method Get -Headers $Headers -ErrorAction Stop
         }
         catch {
+            $msg = $_.Exception.Message
             if ($items.Count -eq 0) {
-                return [PSCustomObject]@{ Count = 0; Failed = 0; Attempted = 0; Bytes = [long]0; Path = $null }
+                throw "Attachment list request failed for page ${PageId}: $msg"
             }
+            $failCount++
+            $failures.Add([PSCustomObject]@{
+                pageId = $PageId
+                attachmentId = ''
+                title = '(attachment list)'
+                download = $nextUri
+                reason = $msg
+            }) | Out-Null
             break
         }
 
@@ -1088,13 +1109,10 @@ function Save-Attachments {
     }
 
     if ($items.Count -eq 0) {
-        return [PSCustomObject]@{ Count = 0; Failed = 0; Attempted = 0; Bytes = [long]0; Path = $null }
+        return [PSCustomObject]@{ Count = 0; Failed = 0; Attempted = 0; Bytes = [long]0; Path = $null; Failures = @() }
     }
 
     Ensure-Directory -Path $attachmentFolder
-    $count = 0
-    $failCount = 0
-    $totalBytes = [long]0
 
     foreach ($item in $items) {
         $downloadPath = $null
@@ -1348,6 +1366,14 @@ function Save-Attachments {
                         Write-Host ("     ! Attachment download failed [{0}] ({1}): {2}" -f $attTitle, $errType, $msg) -ForegroundColor DarkYellow
                     }
                 }
+
+                $failures.Add([PSCustomObject]@{
+                    pageId = $PageId
+                    attachmentId = $attId
+                    title = $attTitle
+                    download = $downloadPath
+                    reason = $msg
+                }) | Out-Null
             }
         }
         
@@ -1358,10 +1384,10 @@ function Save-Attachments {
 
     if ($count -eq 0) {
         Remove-Item -LiteralPath $attachmentFolder -Recurse -Force -ErrorAction SilentlyContinue
-        return [PSCustomObject]@{ Count = 0; Failed = $failCount; Attempted = ($count + $failCount); Bytes = [long]0; Path = $null }
+        return [PSCustomObject]@{ Count = 0; Failed = $failCount; Attempted = ($count + $failCount); Bytes = [long]0; Path = $null; Failures = @($failures) }
     }
 
-    return [PSCustomObject]@{ Count = $count; Failed = $failCount; Attempted = ($count + $failCount); Bytes = $totalBytes; Path = $attachmentFolder }
+    return [PSCustomObject]@{ Count = $count; Failed = $failCount; Attempted = ($count + $failCount); Bytes = $totalBytes; Path = $attachmentFolder; Failures = @($failures) }
 }
 
 $wikiBase = Get-WikiBaseUrl -BaseUrl $ConfluenceBaseUrl
@@ -1444,6 +1470,7 @@ $attachmentsCount = 0
 $attachmentsBytes = [long]0
 $attachmentsFailed = 0
 $attachmentsAttempted = 0
+$attachmentFailures = [System.Collections.Generic.List[object]]::new()
 $totalBytes = [long]0
 $wordDisabled = $false
 $wordFailureStreak = 0
@@ -1553,12 +1580,16 @@ foreach ($page in $pages) {
         $attachmentInfo = Save-Attachments -ApiBase $apiBase -WikiBase $wikiBase -PageId $pageId -Headers $headers -Session $session -PageFolder $folder -BaseFilePath $destPath
     }
     catch {
-        $attachmentInfo = [PSCustomObject]@{ Count = 0; Failed = 1; Attempted = 1; Bytes = [long]0; Path = $null }
+        $attachmentInfo = [PSCustomObject]@{ Count = 0; Failed = 1; Attempted = 1; Bytes = [long]0; Path = $null; Failures = @() }
         $attachErr = $_.Exception.Message
+        $attachmentFailures.Add([PSCustomObject]@{ pageId = $pageId; attachmentId = ''; title = '(attachment list)'; download = ''; reason = $attachErr }) | Out-Null
         Write-Host ("     ! Attachment processing failed: {0}" -f $attachErr) -ForegroundColor Yellow
     }
     $attachmentsAttempted += $attachmentInfo.Attempted
     $attachmentsFailed    += $attachmentInfo.Failed
+    foreach ($failure in @($attachmentInfo.Failures)) {
+        if ($null -ne $failure) { $attachmentFailures.Add($failure) | Out-Null }
+    }
     if ($attachmentInfo.Count -gt 0) {
         $attachmentsCount += $attachmentInfo.Count
         $attachmentsBytes += $attachmentInfo.Bytes
@@ -1630,6 +1661,7 @@ $summary = [PSCustomObject]@{
     exportedCount = $exportedCount
     unchangedCount = $unchanged
     attachments = [PSCustomObject]@{ count = $attachmentsCount; failed = $attachmentsFailed; attempted = $attachmentsAttempted; bytes = $attachmentsBytes }
+    attachmentFailures = $attachmentFailures
     totalSizeBytes = $totalBytes
     failedCount = $failed.Count
     failures = $failed
@@ -1661,7 +1693,7 @@ Write-Host "  Output   : $spaceRoot"
 Write-Host "  Summary  : $summaryPath"
 Write-Host "  State    : $statePath"
 
-if ($failed.Count -gt 0) {
+if ($failed.Count -gt 0 -or $attachmentsFailed -gt 0) {
     exit 2
 }
 
