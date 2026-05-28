@@ -1150,7 +1150,7 @@ function Save-Attachments {
 
                 $directResult = Invoke-FileDownload -Url $directApiUrl -OutFile $tempFile -Headers $Headers -Session $Session
                 if (-not $directResult.Success) {
-                    # Detect login-redirect response: 302 to /login or id.atlassian.com — not a real file
+                    # Detect login-redirect response: 302 to /login or id.atlassian.com - not a real file
                     $isLoginRedirect = $false
                     if ($directResult.StatusCode -eq 302 -and -not [string]::IsNullOrWhiteSpace($directResult.Location)) {
                         try {
@@ -1163,7 +1163,7 @@ function Save-Attachments {
                         } catch {}
                     }
                     if ($isLoginRedirect) {
-                        $lastError = [System.Exception]::new("Direct API returned login redirect (HTTP 302) — auth not accepted for direct download")
+                        $lastError = [System.Exception]::new("Direct API returned login redirect (HTTP 302) - auth not accepted for direct download")
                     } elseif ($null -ne $directResult.Error) {
                         throw $directResult.Error
                     } else {
