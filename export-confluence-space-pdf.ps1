@@ -55,21 +55,25 @@ function Add-OsAuthTypeBasic {
     param([string]$Url)
     if ([string]::IsNullOrWhiteSpace($Url)) { return $Url }
     if ($Url -match '(^|[?&])os_authType=basic([&#]|$)') { return $Url }
-    try {
-        $builder = [System.UriBuilder]::new($Url)
-    }
-    catch {
-        return $Url
-    }
 
-    $query = $builder.Query.TrimStart('?')
-    if ([string]::IsNullOrWhiteSpace($query)) {
-        $builder.Query = 'os_authType=basic'
+    # Use plain string splitting to avoid UriBuilder/Uri round-tripping which
+    # double-encodes percent-encoded path characters (e.g. turns /wiki/download/...
+    # into /wiki%2Fdownload%2F...) causing Confluence to 302 to the login page.
+    $qIndex = $Url.IndexOf('?')
+    if ($qIndex -lt 0) {
+        return $Url + '?os_authType=basic'
     }
-    else {
-        $builder.Query = $query + '&os_authType=basic'
+    $fragment = ''
+    $hashIndex = $Url.IndexOf('#', $qIndex)
+    if ($hashIndex -ge 0) {
+        $fragment = $Url.Substring($hashIndex)
+        $Url = $Url.Substring(0, $hashIndex)
     }
-    return $builder.Uri.AbsoluteUri
+    $existing = $Url.Substring($qIndex + 1)
+    if ([string]::IsNullOrWhiteSpace($existing)) {
+        return $Url + 'os_authType=basic' + $fragment
+    }
+    return $Url + '&os_authType=basic' + $fragment
 }
 
 function Get-CompactName {
@@ -1146,10 +1150,25 @@ function Save-Attachments {
 
                 $directResult = Invoke-FileDownload -Url $directApiUrl -OutFile $tempFile -Headers $Headers -Session $Session
                 if (-not $directResult.Success) {
-                    if ($null -ne $directResult.Error) {
-                        throw $directResult.Error
+                    # Detect login-redirect response: 302 to /login or id.atlassian.com — not a real file
+                    $isLoginRedirect = $false
+                    if ($directResult.StatusCode -eq 302 -and -not [string]::IsNullOrWhiteSpace($directResult.Location)) {
+                        try {
+                            $locUri = [Uri](Resolve-ConfluenceUrl -BaseUrl $directApiUrl -PathOrUrl $directResult.Location)
+                            if ($locUri.Host -ieq 'id.atlassian.com' -or
+                                $locUri.AbsolutePath -match '^/login' -or
+                                $directResult.Location -match 'application=confluence') {
+                                $isLoginRedirect = $true
+                            }
+                        } catch {}
                     }
-                    throw [System.Exception]::new("Direct API attachment request failed with status $($directResult.StatusCode)")
+                    if ($isLoginRedirect) {
+                        $lastError = [System.Exception]::new("Direct API returned login redirect (HTTP 302) — auth not accepted for direct download")
+                    } elseif ($null -ne $directResult.Error) {
+                        throw $directResult.Error
+                    } else {
+                        throw [System.Exception]::new("Direct API attachment request failed with status $($directResult.StatusCode)")
+                    }
                 }
 
                 if (Test-Path -LiteralPath $tempFile) {
@@ -1268,16 +1287,17 @@ function Save-Attachments {
                         if ([string]::IsNullOrWhiteSpace($downloadResult.Location)) { break }
 
                         $nextUrl = Resolve-ConfluenceUrl -BaseUrl $downloadUrl -PathOrUrl $downloadResult.Location
-                        $isLoginHost = $false
+                        $isLoginRedirect = $false
                         try {
-                            $nextHost = ([Uri]$nextUrl).Host
-                            if ($nextHost -ieq 'id.atlassian.com') { $isLoginHost = $true }
+                            $nextUri2 = [Uri]$nextUrl
+                            if ($nextUri2.Host -ieq 'id.atlassian.com') { $isLoginRedirect = $true }
+                            if ($nextUri2.AbsolutePath -match '^/login' -or $nextUrl -match '[?&]application=confluence') { $isLoginRedirect = $true }
                         }
                         catch {
-                            $isLoginHost = $false
+                            $isLoginRedirect = $false
                         }
 
-                        if ($isLoginHost) {
+                        if ($isLoginRedirect) {
                             break
                         }
 
