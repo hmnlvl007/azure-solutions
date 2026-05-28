@@ -409,24 +409,28 @@ SELECT
     CAST(ROUND(
         SUM(CASE WHEN mf.type = 1 THEN CAST(mf.size AS BIGINT) ELSE 0 END) * 8.0 / 1024, 2
     ) AS DECIMAL(18,2))                                   AS LogSizeMB,
-    ISNULL(ag.name, '')                                   AS AGName,
-    ISNULL(ars.role_desc, '')                             AS AGRole,
+    ISNULL((
+        SELECT TOP 1 ag.name
+        FROM sys.dm_hadr_database_replica_states hdrs
+        JOIN sys.availability_replicas ar  ON ar.replica_id  = hdrs.replica_id
+        JOIN sys.availability_groups    ag ON ag.group_id    = ar.group_id
+        WHERE hdrs.database_id = d.database_id AND hdrs.is_local = 1
+    ), '')                                                AS AGName,
+    ISNULL((
+        SELECT TOP 1 ars.role_desc
+        FROM sys.dm_hadr_database_replica_states hdrs
+        JOIN sys.availability_replicas ar   ON ar.replica_id  = hdrs.replica_id
+        JOIN sys.dm_hadr_availability_replica_states ars
+                                            ON ars.replica_id = ar.replica_id AND ars.is_local = 1
+        WHERE hdrs.database_id = d.database_id AND hdrs.is_local = 1
+    ), '')                                                AS AGRole,
     CASE WHEN d.database_id <= 4 THEN 'System' ELSE 'User' END AS DatabaseType
 FROM sys.databases d
 JOIN sys.master_files mf ON d.database_id = mf.database_id
-LEFT JOIN sys.dm_hadr_database_replica_states hdrs
-    ON hdrs.database_id = d.database_id AND hdrs.is_local = 1
-LEFT JOIN sys.availability_replicas ar
-    ON ar.replica_id = hdrs.replica_id
-LEFT JOIN sys.availability_groups ag
-    ON ag.group_id = ar.group_id
-LEFT JOIN sys.dm_hadr_availability_replica_states ars
-    ON ars.replica_id = ar.replica_id AND ars.is_local = 1
 GROUP BY
     d.name, d.state_desc, d.recovery_model_desc, d.compatibility_level,
     d.is_read_only, d.is_published, d.is_subscribed, d.is_distributor,
-    d.is_cdc_enabled, d.owner_sid, d.create_date, d.database_id,
-    ag.name, ars.role_desc
+    d.is_cdc_enabled, d.owner_sid, d.create_date, d.database_id
 ORDER BY DatabaseType DESC, d.name
 "@
     $dbInvData = Invoke-SqlQuerySafe -ServerInstance $server -Query $dbInvQuery
