@@ -82,8 +82,17 @@ function Get-CompactName {
 
 function Ensure-Directory {
     param([string]$Path)
+    if ([string]::IsNullOrWhiteSpace($Path)) {
+        throw 'Output path is empty. Cannot create directory.'
+    }
+
     if (-not (Test-Path -LiteralPath $Path)) {
-        [IO.Directory]::CreateDirectory($Path) | Out-Null
+        try {
+            [IO.Directory]::CreateDirectory($Path) | Out-Null
+        }
+        catch {
+            throw "Failed to create directory: $Path. $($_.Exception.Message)"
+        }
     }
 }
 
