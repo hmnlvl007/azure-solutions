@@ -584,8 +584,7 @@ function Invoke-FileDownload {
         }
 
         $handler = [System.Net.Http.HttpClientHandler]::new()
-        $handler.AllowAutoRedirect = $true
-        $handler.MaxAutomaticRedirections = 10
+        $handler.AllowAutoRedirect = $false   # redirects handled manually so auth headers can be stripped before following to CDN
         $handler.AutomaticDecompression = [System.Net.DecompressionMethods]::GZip -bor [System.Net.DecompressionMethods]::Deflate
 
         $client = [System.Net.Http.HttpClient]::new($handler)
@@ -635,6 +634,8 @@ function Invoke-FileDownload {
             return [PSCustomObject]@{ Success = $true; StatusCode = $statusCode; Location = $null; Error = $null }
         }
 
+        # Surface redirect location so the caller can strip auth headers before following
+        # to CDN URLs (cross-host redirects that must not carry the Authorization header).
         try {
             if ($null -ne $response.Headers.Location) {
                 $location = [string]$response.Headers.Location.OriginalString
@@ -1141,9 +1142,10 @@ function Save-Attachments {
         $lastError  = $null
 
         # Primary path: direct REST API binary download with Basic auth headers.
-        # This avoids session/cookie state issues seen with some attachments.
+        # Do NOT append os_authType=basic here – the REST API uses the Authorization header;
+        # os_authType is a web-UI hint and can cause unexpected redirects on some tenants.
         if (-not [string]::IsNullOrWhiteSpace($attId)) {
-            $directApiUrl = Add-OsAuthTypeBasic -Url "$ApiBase/content/$PageId/child/attachment/$attId/download"
+            $directApiUrl = "$ApiBase/content/$PageId/child/attachment/$attId/download"
             try {
                 if (Test-Path -LiteralPath $tempFile) {
                     Remove-Item -LiteralPath $tempFile -Force -ErrorAction SilentlyContinue
@@ -1151,11 +1153,18 @@ function Save-Attachments {
 
                 $directResult = Invoke-FileDownload -Url $directApiUrl -OutFile $tempFile -Headers $Headers -Session $Session
                 if (-not $directResult.Success) {
-                    # AllowAutoRedirect=true means this is a real auth/notfound failure, not a redirect.
+                    # A 3xx here means Confluence redirected to a CDN pre-signed URL.
+                    # Surface it as $lastError so the candidates fallback loop handles
+                    # the redirect with proper auth-stripping for cross-host hops.
                     if ($null -ne $directResult.Error) {
                         $lastError = $directResult.Error
                     } else {
                         $lastError = [System.Exception]::new("Direct API attachment request failed with status $($directResult.StatusCode)")
+                    }
+                    # If the primary returned a redirect, prime candidates with the CDN target
+                    # so the fallback loop picks it up without re-requesting the REST endpoint.
+                    if ($directResult.StatusCode -in @(301,302,303,307,308) -and -not [string]::IsNullOrWhiteSpace($directResult.Location)) {
+                        $script:_directRedirectLocation = $directResult.Location
                     }
                 }
 
@@ -1178,12 +1187,20 @@ function Save-Attachments {
         }
 
         if ($downloaded) {
+            $script:_directRedirectLocation = $null   # clear any stale redirect from this iteration
             continue
         }
 
         # Build candidate download URLs; some tenants return paths without /wiki
         $confluenceRoot = $WikiBase -replace '/wiki$', ''
         $candidates = [System.Collections.Generic.List[string]]::new()
+
+        # If the primary REST path returned a redirect (e.g. to CDN pre-signed URL), add
+        # that URL first so it is tried before re-requesting the REST endpoint.
+        if (-not [string]::IsNullOrWhiteSpace($script:_directRedirectLocation)) {
+            $candidates.Add($script:_directRedirectLocation)
+            $script:_directRedirectLocation = $null
+        }
 
         if (-not [string]::IsNullOrWhiteSpace($attId)) {
             $wikiRoot = $WikiBase
