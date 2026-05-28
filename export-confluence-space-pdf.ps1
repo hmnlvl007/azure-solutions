@@ -584,7 +584,8 @@ function Invoke-FileDownload {
         }
 
         $handler = [System.Net.Http.HttpClientHandler]::new()
-        $handler.AllowAutoRedirect = $false
+        $handler.AllowAutoRedirect = $true
+        $handler.MaxAutomaticRedirections = 10
         $handler.AutomaticDecompression = [System.Net.DecompressionMethods]::GZip -bor [System.Net.DecompressionMethods]::Deflate
 
         $client = [System.Net.Http.HttpClient]::new($handler)
@@ -1150,20 +1151,11 @@ function Save-Attachments {
 
                 $directResult = Invoke-FileDownload -Url $directApiUrl -OutFile $tempFile -Headers $Headers -Session $Session
                 if (-not $directResult.Success) {
-                    # Any redirect (3xx) on a binary download means auth was rejected.
-                    # Real attachment payloads are never served via redirect.
-                    $isAuthRedirect = ($directResult.StatusCode -ge 300 -and $directResult.StatusCode -lt 400)
-                    if (-not $isAuthRedirect -and -not [string]::IsNullOrWhiteSpace($directResult.Location)) {
-                        # Also treat any redirect location pointing at a login page as auth failure
-                        $loc = $directResult.Location
-                        $isAuthRedirect = ($loc -match 'login' -or $loc -match '\.action' -or $loc -match 'id\.atlassian\.com' -or $loc -match 'application=confluence')
-                    }
-                    if ($isAuthRedirect) {
-                        $lastError = [System.Exception]::new("Direct API returned redirect (HTTP $($directResult.StatusCode)) - auth not accepted for direct download")
-                    } elseif ($null -ne $directResult.Error) {
-                        throw $directResult.Error
+                    # AllowAutoRedirect=true means this is a real auth/notfound failure, not a redirect.
+                    if ($null -ne $directResult.Error) {
+                        $lastError = $directResult.Error
                     } else {
-                        throw [System.Exception]::new("Direct API attachment request failed with status $($directResult.StatusCode)")
+                        $lastError = [System.Exception]::new("Direct API attachment request failed with status $($directResult.StatusCode)")
                     }
                 }
 
@@ -1283,17 +1275,15 @@ function Save-Attachments {
                         if ([string]::IsNullOrWhiteSpace($downloadResult.Location)) { break }
 
                         $nextUrl = Resolve-ConfluenceUrl -BaseUrl $downloadUrl -PathOrUrl $downloadResult.Location
-                        # Treat as auth redirect if: location matches login patterns, OR
-                        # redirect stays on the same Confluence host (real CDN redirects go cross-host).
+                        # Only treat as auth redirect if the location explicitly points to a login page.
+                        # Do NOT flag same-host redirects as auth bounces - Cloud uses same-host intermediate hops.
                         $isLoginRedirect = $false
                         try {
                             $nextUri2 = [Uri]$nextUrl
-                            $originHost = ([Uri]$candidateUrl).Host
                             if ($nextUri2.Host -ieq 'id.atlassian.com') { $isLoginRedirect = $true }
-                            elseif ($nextUrl -match 'login' -or $nextUrl -match '\.action' -or $nextUrl -match 'application=confluence') { $isLoginRedirect = $true }
-                            elseif ($nextUri2.Host -ieq $originHost) { $isLoginRedirect = $true }  # same-host redirect = auth bounce
+                            elseif ($nextUrl -match 'login' -or $nextUrl -match 'application=confluence') { $isLoginRedirect = $true }
                         }
-                        catch { $isLoginRedirect = $true }
+                        catch { $isLoginRedirect = $false }
 
                         if ($isLoginRedirect) {
                             break
