@@ -1281,6 +1281,17 @@ DROP TABLE #cdcjobs;
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
+# 2a. Deduplicate database inventory
+# (same instance registered under multiple CMS names produces identical rows)
+# ─────────────────────────────────────────────────────────────────────────────
+if ($allDatabaseInventory.Count -gt 0) {
+    $allDatabaseInventory = $allDatabaseInventory |
+        Group-Object ServerName, DatabaseName |
+        ForEach-Object { $_.Group | Select-Object -First 1 }
+    Write-Host "  Database inventory: $($allDatabaseInventory.Count) unique rows" -ForegroundColor DarkGray
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
 # 2b. Deduplicate replication data (publisher-side + distributor-side overlap)
 # ─────────────────────────────────────────────────────────────────────────────
 if (-not $InventoryOnly) {
