@@ -1150,22 +1150,16 @@ function Save-Attachments {
 
                 $directResult = Invoke-FileDownload -Url $directApiUrl -OutFile $tempFile -Headers $Headers -Session $Session
                 if (-not $directResult.Success) {
-                    # Detect login-redirect response: 302 to /login or id.atlassian.com - not a real file
-                    $isLoginRedirect = $false
-                    if ($directResult.StatusCode -eq 302 -and -not [string]::IsNullOrWhiteSpace($directResult.Location)) {
-                        try {
-                            $locUri = [Uri](Resolve-ConfluenceUrl -BaseUrl $directApiUrl -PathOrUrl $directResult.Location)
-                            if ($locUri.Host -ieq 'id.atlassian.com' -or
-                                $locUri.AbsolutePath -match '(/wiki)?/login' -or
-                                $locUri.AbsolutePath -match '\.action$' -or
-                                $directResult.Location -match 'login\.action' -or
-                                $directResult.Location -match 'application=confluence') {
-                                $isLoginRedirect = $true
-                            }
-                        } catch {}
+                    # Any redirect (3xx) on a binary download means auth was rejected.
+                    # Real attachment payloads are never served via redirect.
+                    $isAuthRedirect = ($directResult.StatusCode -ge 300 -and $directResult.StatusCode -lt 400)
+                    if (-not $isAuthRedirect -and -not [string]::IsNullOrWhiteSpace($directResult.Location)) {
+                        # Also treat any redirect location pointing at a login page as auth failure
+                        $loc = $directResult.Location
+                        $isAuthRedirect = ($loc -match 'login' -or $loc -match '\.action' -or $loc -match 'id\.atlassian\.com' -or $loc -match 'application=confluence')
                     }
-                    if ($isLoginRedirect) {
-                        $lastError = [System.Exception]::new("Direct API returned login redirect (HTTP 302) - auth not accepted for direct download")
+                    if ($isAuthRedirect) {
+                        $lastError = [System.Exception]::new("Direct API returned redirect (HTTP $($directResult.StatusCode)) - auth not accepted for direct download")
                     } elseif ($null -ne $directResult.Error) {
                         throw $directResult.Error
                     } else {
@@ -1289,18 +1283,17 @@ function Save-Attachments {
                         if ([string]::IsNullOrWhiteSpace($downloadResult.Location)) { break }
 
                         $nextUrl = Resolve-ConfluenceUrl -BaseUrl $downloadUrl -PathOrUrl $downloadResult.Location
+                        # Treat as auth redirect if: location matches login patterns, OR
+                        # redirect stays on the same Confluence host (real CDN redirects go cross-host).
                         $isLoginRedirect = $false
                         try {
                             $nextUri2 = [Uri]$nextUrl
+                            $originHost = ([Uri]$candidateUrl).Host
                             if ($nextUri2.Host -ieq 'id.atlassian.com') { $isLoginRedirect = $true }
-                            if ($nextUri2.AbsolutePath -match '(/wiki)?/login' -or
-                                $nextUri2.AbsolutePath -match '\.action$' -or
-                                $nextUrl -match 'login\.action' -or
-                                $nextUrl -match '[?&]application=confluence') { $isLoginRedirect = $true }
+                            elseif ($nextUrl -match 'login' -or $nextUrl -match '\.action' -or $nextUrl -match 'application=confluence') { $isLoginRedirect = $true }
+                            elseif ($nextUri2.Host -ieq $originHost) { $isLoginRedirect = $true }  # same-host redirect = auth bounce
                         }
-                        catch {
-                            $isLoginRedirect = $false
-                        }
+                        catch { $isLoginRedirect = $true }
 
                         if ($isLoginRedirect) {
                             break
