@@ -1156,7 +1156,9 @@ function Save-Attachments {
                         try {
                             $locUri = [Uri](Resolve-ConfluenceUrl -BaseUrl $directApiUrl -PathOrUrl $directResult.Location)
                             if ($locUri.Host -ieq 'id.atlassian.com' -or
-                                $locUri.AbsolutePath -match '^/login' -or
+                                $locUri.AbsolutePath -match '(/wiki)?/login' -or
+                                $locUri.AbsolutePath -match '\.action$' -or
+                                $directResult.Location -match 'login\.action' -or
                                 $directResult.Location -match 'application=confluence') {
                                 $isLoginRedirect = $true
                             }
@@ -1291,7 +1293,10 @@ function Save-Attachments {
                         try {
                             $nextUri2 = [Uri]$nextUrl
                             if ($nextUri2.Host -ieq 'id.atlassian.com') { $isLoginRedirect = $true }
-                            if ($nextUri2.AbsolutePath -match '^/login' -or $nextUrl -match '[?&]application=confluence') { $isLoginRedirect = $true }
+                            if ($nextUri2.AbsolutePath -match '(/wiki)?/login' -or
+                                $nextUri2.AbsolutePath -match '\.action$' -or
+                                $nextUrl -match 'login\.action' -or
+                                $nextUrl -match '[?&]application=confluence') { $isLoginRedirect = $true }
                         }
                         catch {
                             $isLoginRedirect = $false
