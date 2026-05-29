@@ -586,6 +586,26 @@ function Test-IsConfluenceTenantHost {
     return ($h -match '^[a-z0-9-]+\.atlassian\.net$')
 }
 
+function Test-IsAtlassianHost {
+    # Returns $true for Atlassian-owned hosts where credential forwarding across
+    # redirects is acceptable (except known CDN/object storage hosts).
+    param([string]$HostName)
+    if ([string]::IsNullOrWhiteSpace($HostName)) { return $false }
+    $h = $HostName.ToLowerInvariant()
+    return (
+        $h -eq 'atlassian.com' -or
+        $h -match '\.atlassian\.com$' -or
+        $h -eq 'atlassian.net' -or
+        $h -match '\.atlassian\.net$'
+    )
+}
+
+function Test-IsConfluenceAttachmentPath {
+    param([string]$Path)
+    if ([string]::IsNullOrWhiteSpace($Path)) { return $false }
+    return ($Path -match '/wiki/download/' -or $Path -match '/download/attachments/')
+}
+
 function Invoke-FileDownload {
     # Downloads a URL to a file, following redirects internally within a single
     # HttpClient instance (avoids creating a new handler per hop, which lowers
@@ -657,6 +677,23 @@ function Invoke-FileDownload {
                 $useSession = $null
             }
 
+            $hasAuthHeader = $false
+            if ($null -ne $useHeaders) {
+                try { $hasAuthHeader = -not [string]::IsNullOrWhiteSpace([string]$useHeaders['Authorization']) } catch { $hasAuthHeader = $false }
+            }
+
+            # Confluence attachment endpoints may still emit login redirects
+            # unless os_authType=basic is present when using Basic auth.
+            if ($hasAuthHeader) {
+                try {
+                    $curUri = [Uri]$currentUrl
+                    if ((Test-IsConfluenceTenantHost -HostName $curUri.Host) -and (Test-IsConfluenceAttachmentPath -Path $curUri.AbsolutePath)) {
+                        $currentUrl = Add-OsAuthTypeBasic -Url $currentUrl
+                    }
+                }
+                catch {}
+            }
+
             $request = [System.Net.Http.HttpRequestMessage]::new([System.Net.Http.HttpMethod]::Get, $currentUrl)
 
             if ($null -ne $useHeaders) {
@@ -670,17 +707,17 @@ function Invoke-FileDownload {
             $request.Headers.Accept.Clear()
             $null = $request.Headers.TryAddWithoutValidation('Accept', '*/*')
 
-            # Add session cookies only when no Authorization header is present,
-            # to avoid the CDN/S3 conflicting-auth issue.
-            $hasAuthHeader = $false
-            if ($null -ne $useHeaders) {
-                try { $hasAuthHeader = -not [string]::IsNullOrWhiteSpace([string]$useHeaders['Authorization']) } catch {}
-            }
-            if (-not $hasAuthHeader -and $null -ne $useSession -and $null -ne $useSession.Cookies) {
+            # Attach session cookies for non-CDN hosts (including alongside
+            # Authorization on Confluence hosts). Keep cookies off CDN/object
+            # storage hops to avoid conflicting-credential failures.
+            if ($null -ne $useSession -and $null -ne $useSession.Cookies) {
                 try {
-                    $cookieHeader = $useSession.Cookies.GetCookieHeader([Uri]$currentUrl)
-                    if (-not [string]::IsNullOrWhiteSpace($cookieHeader)) {
-                        $null = $request.Headers.TryAddWithoutValidation('Cookie', $cookieHeader)
+                    $cookieHost = ([Uri]$currentUrl).Host
+                    if (-not (Test-IsCdnHost -HostName $cookieHost)) {
+                        $cookieHeader = $useSession.Cookies.GetCookieHeader([Uri]$currentUrl)
+                        if (-not [string]::IsNullOrWhiteSpace($cookieHeader)) {
+                            $null = $request.Headers.TryAddWithoutValidation('Cookie', $cookieHeader)
+                        }
                     }
                 }
                 catch {}
@@ -750,10 +787,27 @@ function Invoke-FileDownload {
                 return [PSCustomObject]@{ Success = $false; StatusCode = $statusCode; Location = $nextUrl; Error = [System.Exception]::new("HTTP $statusCode redirected to login for $currentUrl") }
             }
 
-            # Strip auth when leaving the origin host (cross-host hop).
+            # Strip auth when leaving the origin host, except for Atlassian->Atlassian
+            # redirects that are not CDN/object-storage hosts.
             $nextHost2 = ''
             try { $nextHost2 = ([Uri]$nextUrl).Host } catch {}
+
+            $keepCrossHostCreds = $false
             if ($nextHost2 -ine $originHost) {
+                try {
+                    $originIsAtlassian = Test-IsAtlassianHost -HostName $originHost
+                    $nextIsAtlassian = Test-IsAtlassianHost -HostName $nextHost2
+                    $nextIsCdn = Test-IsCdnHost -HostName $nextHost2
+                    if ($originIsAtlassian -and $nextIsAtlassian -and -not $nextIsCdn) {
+                        $keepCrossHostCreds = $true
+                    }
+                }
+                catch {
+                    $keepCrossHostCreds = $false
+                }
+            }
+
+            if ($nextHost2 -ine $originHost -and -not $keepCrossHostCreds) {
                 $useHeaders = $null
                 $useSession = $null
             }
@@ -1272,9 +1326,14 @@ function Save-Attachments {
 
                 $directResult = Invoke-FileDownload -Url $directApiUrl -OutFile $tempFile -Headers $Headers -Session $Session
                 if (-not $directResult.Success) {
-                    $lastError = if ($null -ne $directResult.Error) { $directResult.Error } else {
-                        [System.Exception]::new("Direct API attachment request failed with status $($directResult.StatusCode)")
+                    $directMsg = "Direct API attachment request failed with status $($directResult.StatusCode)"
+                    if (-not [string]::IsNullOrWhiteSpace([string]$directResult.Location)) {
+                        $directMsg += "; location=$([string]$directResult.Location)"
                     }
+                    if ($null -ne $directResult.Error) {
+                        $directMsg += "; error=$($directResult.Error.Message)"
+                    }
+                    $lastError = [System.Exception]::new($directMsg)
                 }
 
                 if (Test-Path -LiteralPath $tempFile) {
@@ -1400,14 +1459,29 @@ function Save-Attachments {
                     try { $errMsg = $downloadResult.Error.Message } catch {}
                     if ($errMsg -match 'login') { continue }
 
+                    # A 302 that was not detected as a login redirect may require
+                    # session-cookie-only auth (e.g. Confluence Cloud inline images
+                    # whose /wiki/download/attachments/ endpoint ignores os_authType=basic
+                    # but honours the cloud.session.token cookie set during initial auth).
+                    # Continue to try the remaining auth modes, especially Headers=$null + Session.
+                    if ($downloadResult.StatusCode -eq 302) { continue }
+
                     # Any other failure (404, 400, timeout, redirect limit) → no point
                     # retrying with different auth; break and move to next candidate.
                     break
                 }
 
                 if ($null -eq $downloadResult -or -not $downloadResult.Success) {
-                    if ($null -ne $downloadResult -and $null -ne $downloadResult.Error) {
-                        throw $downloadResult.Error
+                    if ($null -ne $downloadResult) {
+                        $detail = "Attachment request failed status=$($downloadResult.StatusCode)"
+                        if (-not [string]::IsNullOrWhiteSpace([string]$downloadResult.Location)) {
+                            $detail += "; location=$([string]$downloadResult.Location)"
+                        }
+                        if ($null -ne $downloadResult.Error -and -not [string]::IsNullOrWhiteSpace([string]$downloadResult.Error.Message)) {
+                            $detail += "; error=$([string]$downloadResult.Error.Message)"
+                        }
+                        $detail += "; url=$candidateUrl"
+                        throw [System.Exception]::new($detail)
                     }
                     throw [System.Exception]::new('Attachment request failed without a response payload.')
                 }
