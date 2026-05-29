@@ -577,6 +577,15 @@ function Test-IsCdnHost {
     )
 }
 
+function Test-IsConfluenceTenantHost {
+    # Returns $true for first-party Atlassian tenant hosts where adding
+    # os_authType=basic can help bypass login redirects for attachment paths.
+    param([string]$HostName)
+    if ([string]::IsNullOrWhiteSpace($HostName)) { return $false }
+    $h = $HostName.ToLowerInvariant()
+    return ($h -match '^[a-z0-9-]+\.atlassian\.net$')
+}
+
 function Invoke-FileDownload {
     # Downloads a URL to a file, following redirects internally within a single
     # HttpClient instance (avoids creating a new handler per hop, which lowers
@@ -1336,6 +1345,25 @@ function Save-Attachments {
             if ($seenCandidates.Add($normalized)) {
                 $uniqueCandidates.Add($normalized)
             }
+
+            # For Confluence-hosted attachment URLs, also try an explicit
+            # os_authType=basic variant. This avoids 302 login redirects on
+            # some tenants/endpoints while keeping CDN pre-signed URLs untouched.
+            try {
+                $candidateUri = [Uri]$normalized
+                $isTenantHost = Test-IsConfluenceTenantHost -HostName $candidateUri.Host
+                $looksLikeAttachmentPath = ($candidateUri.AbsolutePath -match '/wiki/download/' -or $candidateUri.AbsolutePath -match '/download/attachments/')
+                if ($isTenantHost -and $looksLikeAttachmentPath) {
+                    $basicCandidate = Add-OsAuthTypeBasic -Url $normalized
+                    if (-not [string]::IsNullOrWhiteSpace($basicCandidate)) {
+                        $basicNormalized = $basicCandidate.Trim()
+                        if ($seenCandidates.Add($basicNormalized)) {
+                            $uniqueCandidates.Add($basicNormalized)
+                        }
+                    }
+                }
+            }
+            catch {}
         }
 
         foreach ($candidateUrl in $uniqueCandidates) {
