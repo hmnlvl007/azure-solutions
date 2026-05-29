@@ -628,7 +628,7 @@ function Invoke-FileDownload {
         [Parameter(Mandatory)][string]$OutFile,
         [hashtable]$Headers,
         [Microsoft.PowerShell.Commands.WebRequestSession]$Session,
-        [int]$MaxRedirects = 10
+        [int]$MaxRedirects = 25
     )
 
     $statusCode = $null
@@ -667,6 +667,7 @@ function Invoke-FileDownload {
         $currentUrl  = $Url
         $useHeaders  = $Headers    # may be set to $null once we cross to CDN / foreign host
         $useSession  = $Session
+        $authStrippedAt = @()      # track which hosts caused auth stripping for redirect-back detection
 
         for ($hop = 0; $hop -le $MaxRedirects; $hop++) {
 
@@ -677,6 +678,9 @@ function Invoke-FileDownload {
             try { $currentHost = ([Uri]$currentUrl).Host } catch {}
 
             if (Test-IsCdnHost -HostName $currentHost) {
+                if ($null -ne $useHeaders -or $null -ne $useSession) {
+                    $authStrippedAt += @($currentHost)
+                }
                 $useHeaders = $null
                 $useSession = $null
             }
@@ -814,6 +818,18 @@ function Invoke-FileDownload {
             if ($nextHost2 -ine $originHost -and -not $keepCrossHostCreds) {
                 $useHeaders = $null
                 $useSession = $null
+            }
+            elseif ($nextHost2 -ine $originHost -and $keepCrossHostCreds -and $authStrippedAt.Count -gt 0) {
+                # Restore headers if we're coming back to Atlassian after CDN hop
+                if ($null -eq $useHeaders -and $null -ne $Headers) {
+                    try {
+                        $nextUri = [Uri]$nextUrl
+                        if (Test-IsConfluenceTenantHost -HostName $nextUri.Host) {
+                            $useHeaders = $Headers
+                        }
+                    }
+                    catch { }
+                }
             }
 
             $currentUrl = $nextUrl
@@ -1117,7 +1133,7 @@ function Save-WordExport {
             Method = 'Get'
             OutFile = $tempFile
             UseBasicParsing = $true
-            MaximumRedirection = 10
+            MaximumRedirection = 25
             ErrorAction = 'Stop'
             Headers = @{ Authorization = $Headers.Authorization }
         }
@@ -1322,7 +1338,9 @@ function Save-Attachments {
         # auth-stripping on CDN / cross-host hops.
         # Do NOT append os_authType=basic here – the REST API uses the Authorization header.
         if (-not [string]::IsNullOrWhiteSpace($attId)) {
-            $directApiUrl = "$ApiBase/content/$PageId/child/attachment/$attId/download"
+            $encodedPageIdDirect = [Uri]::EscapeDataString($PageId)
+            $encodedAttIdDirect = [Uri]::EscapeDataString($attId)
+            $directApiUrl = "$ApiBase/content/$encodedPageIdDirect/child/attachment/$encodedAttIdDirect/download"
             try {
                 if (Test-Path -LiteralPath $tempFile) {
                     Remove-Item -LiteralPath $tempFile -Force -ErrorAction SilentlyContinue
@@ -1369,11 +1387,15 @@ function Save-Attachments {
             if ($wikiRoot -match '/wiki$') { $wikiRoot = $wikiRoot.TrimEnd('/') }
             else { $wikiRoot = ($WikiBase.TrimEnd('/') + '/wiki') }
 
-            $apiDownload = "$ApiBase/content/$PageId/child/attachment/$attId/download"
+            # Use URI encoding for IDs to handle edge cases with special characters
+            $encodedPageId = [Uri]::EscapeDataString($PageId)
+            $encodedAttId = [Uri]::EscapeDataString($attId)
+            
+            $apiDownload = "$ApiBase/content/$encodedPageId/child/attachment/$encodedAttId/download"
             $candidates.Add($apiDownload)
 
             # Confluence Cloud v2 download endpoint fallback (often avoids v1 attachment 403s).
-            $v2Download = "$wikiRoot/api/v2/attachments/$attId/download"
+            $v2Download = "$wikiRoot/api/v2/attachments/$encodedAttId/download"
             $candidates.Add($v2Download)
         }
 
@@ -1532,8 +1554,10 @@ function Save-Attachments {
             }
             if (-not [string]::IsNullOrWhiteSpace($attId)) {
                 $wikiRootFb = if ($WikiBase -match '/wiki$') { $WikiBase.TrimEnd('/') } else { $WikiBase.TrimEnd('/') + '/wiki' }
-                $iwrCandidates.Add("$ApiBase/content/$PageId/child/attachment/$attId/download")
-                $iwrCandidates.Add("$wikiRootFb/api/v2/attachments/$attId/download")
+                $encodedPageIdFb = [Uri]::EscapeDataString($PageId)
+                $encodedAttIdFb = [Uri]::EscapeDataString($attId)
+                $iwrCandidates.Add("$ApiBase/content/$encodedPageIdFb/child/attachment/$encodedAttIdFb/download")
+                $iwrCandidates.Add("$wikiRootFb/api/v2/attachments/$encodedAttIdFb/download")
             }
 
             $seenIwr = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
@@ -1552,7 +1576,7 @@ function Save-Attachments {
                         Method             = 'Get'
                         OutFile            = $tempFile
                         UseBasicParsing    = $true
-                        MaximumRedirection = 10
+                        MaximumRedirection = 25
                         ErrorAction        = 'Stop'
                         Headers            = @{ Authorization = $Headers['Authorization'] }
                     }
