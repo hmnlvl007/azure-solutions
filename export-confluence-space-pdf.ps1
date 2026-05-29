@@ -920,11 +920,22 @@ function Finalize-DownloadedFile {
         [Parameter(Mandatory)][string]$DestinationPath
     )
 
-    $destDir = [IO.Path]::GetDirectoryName($DestinationPath)
-    if (-not [string]::IsNullOrWhiteSpace($destDir)) { Ensure-Directory -Path $destDir }
+    if (-not (Test-Path -LiteralPath $TempPath)) {
+        throw "Temp attachment file does not exist: $TempPath"
+    }
 
-    [IO.File]::Copy($TempPath, $DestinationPath, $true)
-    Remove-Item -LiteralPath $TempPath -Force -ErrorAction SilentlyContinue
+    $destDir = [IO.Path]::GetDirectoryName($DestinationPath)
+    if ([string]::IsNullOrWhiteSpace($destDir)) {
+        throw "Destination directory is empty for attachment path: $DestinationPath"
+    }
+
+    Ensure-Directory -Path $destDir
+
+    if (-not (Test-Path -LiteralPath $destDir)) {
+        throw "Destination directory was not created: $destDir"
+    }
+
+    Move-Item -LiteralPath $TempPath -Destination $DestinationPath -Force -ErrorAction Stop
 }
 
 function Test-DownloadLooksValid {
@@ -1359,7 +1370,7 @@ function Save-Attachments {
     )
 
     $baseName = [IO.Path]::GetFileNameWithoutExtension($BaseFilePath)
-    $attachmentFolder = Join-Path -Path $PageFolder -ChildPath ($baseName + '-attachments')
+    $attachmentFolder = Join-Path -Path $PageFolder -ChildPath ($baseName + '-att')
 
     $items = [System.Collections.Generic.List[object]]::new()
     $failures = [System.Collections.Generic.List[object]]::new()
@@ -1432,12 +1443,21 @@ function Save-Attachments {
         $attV2 = $null
         $containerIdForDownload = $PageId
 
-        # Preserve the file extension from the title so the saved file opens correctly
         $ext = [IO.Path]::GetExtension($attTitle)
+        if ([string]::IsNullOrWhiteSpace($ext)) { $ext = '.bin' }
+
         $nameNoExt = [IO.Path]::GetFileNameWithoutExtension($attTitle)
-        $safeBase = Get-CompactName -Name $nameNoExt -MaxLength 60
-        # Append attachment ID to prevent collisions when two attachments share the same name
-        $fileName = if ([string]::IsNullOrWhiteSpace($attId)) { $safeBase + $ext } else { "$safeBase-$attId$ext" }
+        if ([string]::IsNullOrWhiteSpace($nameNoExt)) { $nameNoExt = 'attachment' }
+
+        $safeBase = Get-CompactName -Name $nameNoExt -MaxLength 24
+
+        if ([string]::IsNullOrWhiteSpace($attId)) {
+            $idPart = Get-ShortHash -Text $attTitle
+        } else {
+            $idPart = Get-ShortHash -Text $attId
+        }
+
+        $fileName = "$safeBase-$idPart$ext"
         $filePath = Join-Path -Path $attachmentFolder -ChildPath $fileName
         $tempFile = Join-Path -Path ([IO.Path]::GetTempPath()) -ChildPath ("cf-att-$([Guid]::NewGuid().ToString('N')).tmp")
 
