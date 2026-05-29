@@ -604,6 +604,22 @@ function Test-IsAtlassianHost {
     )
 }
 
+function Test-IsAtlassianMediaHost {
+    # Media-backed attachment endpoints can return 404 when Authorization: Basic
+    # is sent. Prefer session cookies / signed redirects for these hosts.
+    param([string]$HostName)
+    if ([string]::IsNullOrWhiteSpace($HostName)) { return $false }
+    $h = $HostName.ToLowerInvariant()
+    return (
+        $h -eq 'api.media.atlassian.com' -or
+        $h -match '\.media\.atlassian\.com$' -or
+        $h -eq 'media.atlassian.com' -or
+        $h -eq 'api-private.media.atlassian.com' -or
+        $h -eq 'attachment-cdn.prod.public.atl-paas.net' -or
+        $h -match '\.atl-paas\.net$'
+    )
+}
+
 function Test-IsConfluenceAttachmentPath {
     param([string]$Path)
     if ([string]::IsNullOrWhiteSpace($Path)) { return $false }
@@ -683,6 +699,12 @@ function Invoke-FileDownload {
                 }
                 $useHeaders = $null
                 $useSession = $null
+            }
+
+            # Atlassian media hosts may return 404 when Authorization is present.
+            # Keep session if available, but drop Authorization for this hop.
+            if (Test-IsAtlassianMediaHost -HostName $currentHost) {
+                $useHeaders = $null
             }
 
             $hasAuthHeader = $false
@@ -824,7 +846,7 @@ function Invoke-FileDownload {
                 if ($null -eq $useHeaders -and $null -ne $Headers) {
                     try {
                         $nextUri = [Uri]$nextUrl
-                        if (Test-IsConfluenceTenantHost -HostName $nextUri.Host) {
+                        if ((Test-IsConfluenceTenantHost -HostName $nextUri.Host) -and -not (Test-IsAtlassianMediaHost -HostName $nextUri.Host)) {
                             $useHeaders = $Headers
                         }
                     }
@@ -1465,10 +1487,10 @@ function Save-Attachments {
                 # hops automatically.  We only need to try different starting-auth modes
                 # in case the first mode is rejected by the server (e.g. 401/403).
                 $authModes = @(
-                    @{ Headers = $Headers; Session = $Session },
-                    @{ Headers = $Headers; Session = $null },
                     @{ Headers = $null;    Session = $Session },
-                    @{ Headers = $null;    Session = $null }
+                    @{ Headers = $Headers; Session = $Session },
+                    @{ Headers = $null;    Session = $null },
+                    @{ Headers = $Headers; Session = $null }
                 )
 
                 $downloadResult = $null
@@ -1492,7 +1514,11 @@ function Save-Attachments {
                     # Continue to try the remaining auth modes, especially Headers=$null + Session.
                     if ($downloadResult.StatusCode -eq 302) { continue }
 
-                    # Any other failure (404, 400, timeout, redirect limit) → no point
+                    # Some media-backed attachments return 404 for header-auth modes
+                    # but succeed for session-only mode; keep trying auth variants.
+                    if ($downloadResult.StatusCode -eq 404) { continue }
+
+                    # Any other failure (400, timeout, redirect limit) → no point
                     # retrying with different auth; break and move to next candidate.
                     break
                 }
