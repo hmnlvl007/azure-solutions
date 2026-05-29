@@ -118,14 +118,55 @@ function Write-JsonFile {
 }
 
 function New-ConfluenceSession {
-    param([string]$ApiBase, [hashtable]$Headers)
-    try {
-        $null = Invoke-WebRequest -Uri "$ApiBase/user/current" -Method Get -Headers $Headers -SessionVariable session -UseBasicParsing -ErrorAction Stop
+    param(
+        [string]$WikiBase,
+        [string]$ApiBase,
+        [hashtable]$Headers
+    )
+
+    $session = $null
+    $seeded = $false
+    $bootstrapUrls = @(
+        (Add-OsAuthTypeBasic -Url ($WikiBase.TrimEnd('/') + '/')),
+        (Add-OsAuthTypeBasic -Url ($WikiBase.TrimEnd('/') + '/index.action')),
+        "$ApiBase/user/current"
+    )
+
+    foreach ($uri in $bootstrapUrls) {
+        if ([string]::IsNullOrWhiteSpace($uri)) { continue }
+        try {
+            if ($null -eq $session) {
+                $null = Invoke-WebRequest -Uri $uri -Method Get -Headers $Headers -SessionVariable session -UseBasicParsing -MaximumRedirection 10 -ErrorAction Stop
+            }
+            else {
+                $null = Invoke-WebRequest -Uri $uri -Method Get -Headers $Headers -WebSession $session -UseBasicParsing -MaximumRedirection 10 -ErrorAction Stop
+            }
+
+            if ($null -ne $session -and $null -ne $session.Cookies) {
+                try {
+                    $cookieHeader = $session.Cookies.GetCookieHeader([Uri]$WikiBase)
+                    if (-not [string]::IsNullOrWhiteSpace($cookieHeader)) {
+                        $seeded = $true
+                    }
+                }
+                catch {}
+            }
+        }
+        catch {
+            # Keep trying the next bootstrap URL; some tenants only set browser
+            # cookies on wiki-facing endpoints, while REST auth can still validate.
+        }
+    }
+
+    if ($seeded -and $null -ne $session) {
         return $session
     }
-    catch {
-        return $null
+
+    if ($null -ne $session) {
+        return $session
     }
+
+    return $null
 }
 
 function Get-SpaceHomePageId {
@@ -1759,7 +1800,7 @@ catch {
 }
 
 Write-Host 'Establishing session...'
-$session = New-ConfluenceSession -ApiBase $apiBase -Headers $headers
+$session = New-ConfluenceSession -WikiBase $wikiBase -ApiBase $apiBase -Headers $headers
 if ($null -ne $session) {
     Write-Host 'Session established.' -ForegroundColor Green
 }
