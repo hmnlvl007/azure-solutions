@@ -1508,15 +1508,13 @@ function Save-Attachments {
             }
         }
         
-        # ── Invoke-WebRequest two-hop fallback ───────────────────────────────────
-        # The /wiki/download/attachments/ redirect chain is always 2 hops:
-        #   Hop 1: Confluence (needs Basic Auth) → 302 to CDN pre-signed URL
-        #   Hop 2: CDN pre-signed URL (NO auth — S3/CloudFront rejects Authorization)
-        # Invoke-WebRequest with MaximumRedirection>0 forwards the Authorization
-        # header to the CDN leg, causing 400/404.  The fix: stop after hop 1 to
-        # capture the CDN URL, then fetch that URL with zero auth headers.
+        # ── Invoke-WebRequest simple fallback (same approach as Save-WordExport) ──
+        # Proven method: Invoke-WebRequest with both Authorization header AND WebSession.
+        # PowerShell's built-in HTTP client automatically handles cookie forwarding
+        # across redirects (Confluence → media.atlassianusercontent.com) without
+        # the complexity of manually managing auth stripping per hop.
         if (-not $downloaded -and $null -ne $Headers -and -not [string]::IsNullOrWhiteSpace([string]$Headers['Authorization'])) {
-            # Build candidate URLs from raw _links.download, clean of os_authType=basic.
+            # Build candidate URLs from raw _links.download (no os_authType=basic).
             $iwrCandidates = [System.Collections.Generic.List[string]]::new()
             if (-not [string]::IsNullOrWhiteSpace($downloadPath)) {
                 $confluenceRootFb = $WikiBase -replace '/wiki$', ''
@@ -1549,96 +1547,27 @@ function Save-Attachments {
                 }
 
                 try {
-                    # ── Hop 1: auth → Confluence, do NOT follow redirect ──────────
-                    $hop1 = $null
-                    try {
-                        $hop1 = Invoke-WebRequest -Uri $iwrUrl -Method Get -Headers @{ Authorization = $Headers['Authorization'] } `
-                            -UseBasicParsing -MaximumRedirection 0 -ErrorAction Stop
-                    } catch [System.Net.WebException] {
-                        # PowerShell < 6 throws on 3xx when MaximumRedirection=0;
-                        # pull the Location from the exception's response.
-                        $hop1Response = $_.Exception.Response
-                        if ($null -ne $hop1Response) {
-                            $loc1 = $hop1Response.Headers['Location']
-                            if (-not [string]::IsNullOrWhiteSpace($loc1)) {
-                                $hop1 = [PSCustomObject]@{ StatusCode = [int]$hop1Response.StatusCode; Headers = @{ Location = $loc1 } }
-                            }
-                        }
-                    } catch {
-                        # Non-redirect error on hop 1 — try next candidate
-                        $lastError = $_
-                        continue
-                    }
-
-                    # Extract Location from hop 1 response
-                    $cdnUrl = $null
-                    if ($null -ne $hop1) {
-                        $sc1 = 0
-                        try { $sc1 = [int]$hop1.StatusCode } catch {}
-
-                        if ($sc1 -ge 200 -and $sc1 -lt 300) {
-                            # Already a direct 200 — content in response body? Save it.
-                            # (some tenants serve small attachments inline)
-                            try {
-                                [IO.File]::WriteAllBytes($tempFile, $hop1.Content)
-                            } catch {}
-                            if (Test-Path -LiteralPath $tempFile) {
-                                $directSize2 = (Get-Item -LiteralPath $tempFile).Length
-                                if ($directSize2 -gt 0 -and (Test-DownloadLooksValid -Path $tempFile -ExpectedExtension $ext)) {
-                                    Finalize-DownloadedFile -TempPath $tempFile -DestinationPath $filePath
-                                    $count++; $totalBytes += $directSize2; $downloaded = $true
-                                    break
-                                }
-                            }
-                        }
-
-                        if ($sc1 -in @(301,302,303,307,308)) {
-                            try { $cdnUrl = [string]$hop1.Headers['Location'] } catch {}
-                            if ([string]::IsNullOrWhiteSpace($cdnUrl)) {
-                                try { $cdnUrl = [string]($hop1.Headers.Location) } catch {}
-                            }
-                            if (-not [string]::IsNullOrWhiteSpace($cdnUrl) -and $cdnUrl -notmatch '^https?://') {
-                                $cdnUrl = Resolve-ConfluenceUrl -BaseUrl $iwrUrl -PathOrUrl $cdnUrl
-                            }
-                        }
-                    }
-
-                    if ([string]::IsNullOrWhiteSpace($cdnUrl) -or $downloaded) { continue }
-
-                    # Abort if hop 1 redirected to a login page
-                    if ($cdnUrl -match 'id\.atlassian\.com|/login|application=confluence') { continue }
-
-                    # ── Hop 2: fetch redirect target ──────────────────────────────
-                    # Keep Authorization for Atlassian-owned hosts (e.g. media.atlassianusercontent.com)
-                    # which require auth on every hop.  Strip it only for real pre-signed CDN
-                    # hosts (S3, CloudFront, etc.) where a conflicting auth header causes errors.
-                    $hop2Headers = $null
-                    try {
-                        $cdnHost = ([Uri]$cdnUrl).Host
-                        $isRealCdn = Test-IsCdnHost -HostName $cdnHost
-                        $isAtlassian = Test-IsAtlassianHost -HostName $cdnHost
-                        if ($isAtlassian -and -not $isRealCdn -and $null -ne $Headers -and -not [string]::IsNullOrWhiteSpace([string]$Headers['Authorization'])) {
-                            $hop2Headers = @{ Authorization = $Headers['Authorization'] }
-                        }
-                    } catch {}
-
-                    $hop2Params = @{
-                        Uri                = $cdnUrl
+                    $iwrParams = @{
+                        Uri                = $iwrUrl
                         Method             = 'Get'
                         OutFile            = $tempFile
                         UseBasicParsing    = $true
                         MaximumRedirection = 10
                         ErrorAction        = 'Stop'
+                        Headers            = @{ Authorization = $Headers['Authorization'] }
                     }
-                    if ($null -ne $hop2Headers) { $hop2Params['Headers'] = $hop2Headers }
-                    if ($null -ne $Session) { $hop2Params['WebSession'] = $Session }
-                    Invoke-WebRequest @hop2Params | Out-Null
+                    if ($null -ne $Session) {
+                        $iwrParams.WebSession = $Session
+                    }
+                    Invoke-WebRequest @iwrParams | Out-Null
 
                     if (Test-Path -LiteralPath $tempFile) {
                         $iwrSize = (Get-Item -LiteralPath $tempFile).Length
                         if ($iwrSize -gt 0 -and (Test-DownloadLooksValid -Path $tempFile -ExpectedExtension $ext)) {
                             Finalize-DownloadedFile -TempPath $tempFile -DestinationPath $filePath
-                            $count++; $totalBytes += $iwrSize; $downloaded = $true
+                            $count++
+                            $totalBytes += $iwrSize
+                            $downloaded = $true
                         }
                     }
                 }
