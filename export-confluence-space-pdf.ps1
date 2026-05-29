@@ -554,22 +554,59 @@ function Resolve-ConfluenceUrl {
     }
 }
 
+function Test-IsCdnHost {
+    # Returns $true for known CDN / object-storage hosts whose pre-signed URLs
+    # must NOT carry an Authorization header (adding one causes a 400/403 from S3
+    # because it sees conflicting query-string and header credentials).
+    param([string]$Host)
+    if ([string]::IsNullOrWhiteSpace($Host)) { return $false }
+    $h = $Host.ToLowerInvariant()
+    return (
+        $h -match '\.amazonaws\.com$' -or
+        $h -match '\.cloudfront\.net$' -or
+        $h -match '\.akamaiedge\.net$' -or
+        $h -match '\.akamai\.net$' -or
+        $h -match '\.atlassian-us-east-1\.net$' -or
+        $h -match '\.atlassian-eu-west-1\.net$' -or
+        $h -match '\.atlassian-us-east-1-2\.net$' -or
+        $h -match '\.atlassian\.net$' -and $h -notmatch '^[a-z0-9-]+\.atlassian\.net$' -or   # sub-sub-domains used for CDN
+        $h -match '\.storage\.googleapis\.com$' -or
+        $h -match '\.blob\.core\.windows\.net$' -or
+        $h -match 'cdn\.' -or
+        $h -match 'files\.'
+    )
+}
+
 function Invoke-FileDownload {
+    # Downloads a URL to a file, following redirects internally within a single
+    # HttpClient instance (avoids creating a new handler per hop, which lowers
+    # latency and prevents pre-signed CDN URLs from expiring mid-chain).
+    #
+    # Auth-stripping rules applied on every hop:
+    #   • Any redirect to a known CDN / object-storage host (S3, CloudFront …)
+    #     → Authorization and Cookie headers are dropped immediately, even for
+    #       same-host hops, because S3 pre-signed URLs reject extra credentials.
+    #   • Any redirect that crosses to a different host (and is not CDN) strips
+    #     auth headers to avoid leaking credentials to third-party servers.
+    #   • Redirects to id.atlassian.com or URLs containing "login" / "application=confluence"
+    #     are treated as auth-failure redirects and abort the chain.
     param(
         [Parameter(Mandatory)][string]$Url,
         [Parameter(Mandatory)][string]$OutFile,
         [hashtable]$Headers,
-        [Microsoft.PowerShell.Commands.WebRequestSession]$Session
+        [Microsoft.PowerShell.Commands.WebRequestSession]$Session,
+        [int]$MaxRedirects = 10
     )
 
     $statusCode = $null
     $location = $null
     $handler = $null
     $client = $null
-    $request = $null
-    $response = $null
     $contentStream = $null
     $fileStream = $null
+
+    # Resolved responses that need disposing after each hop
+    $responses = [System.Collections.Generic.List[object]]::new()
 
     try {
         if (-not $script:HttpClientReady) {
@@ -584,77 +621,148 @@ function Invoke-FileDownload {
         }
 
         $handler = [System.Net.Http.HttpClientHandler]::new()
-        $handler.AllowAutoRedirect = $false   # redirects handled manually so auth headers can be stripped before following to CDN
+        $handler.AllowAutoRedirect = $false   # we follow manually to control auth stripping
         $handler.AutomaticDecompression = [System.Net.DecompressionMethods]::GZip -bor [System.Net.DecompressionMethods]::Deflate
 
         $client = [System.Net.Http.HttpClient]::new($handler)
         $client.Timeout = [TimeSpan]::FromSeconds(120)
 
-        $request = [System.Net.Http.HttpRequestMessage]::new([System.Net.Http.HttpMethod]::Get, $Url)
+        # Determine the "origin host" — the host that owns the credentials.
+        $originHost = ''
+        try { $originHost = ([Uri]$Url).Host } catch {}
 
-        if ($null -ne $Headers) {
-            foreach ($key in $Headers.Keys) {
-                $value = [string]$Headers[$key]
-                if ([string]::IsNullOrWhiteSpace($value)) { continue }
-                $null = $request.Headers.TryAddWithoutValidation([string]$key, $value)
+        $currentUrl  = $Url
+        $useHeaders  = $Headers    # may be set to $null once we cross to CDN / foreign host
+        $useSession  = $Session
+
+        for ($hop = 0; $hop -le $MaxRedirects; $hop++) {
+
+            # Detect CDN / object-storage host and proactively drop auth headers.
+            # This prevents S3 from rejecting requests that carry both a
+            # query-string signature and an Authorization header (HTTP 400).
+            $currentHost = ''
+            try { $currentHost = ([Uri]$currentUrl).Host } catch {}
+
+            if (Test-IsCdnHost -Host $currentHost) {
+                $useHeaders = $null
+                $useSession = $null
             }
-        }
 
-        # Binary downloads should not inherit JSON-oriented Accept headers.
-        $request.Headers.Accept.Clear()
-        $null = $request.Headers.TryAddWithoutValidation('Accept', '*/*')
+            $request = [System.Net.Http.HttpRequestMessage]::new([System.Net.Http.HttpMethod]::Get, $currentUrl)
 
-        $hasAuthorizationHeader = $false
-        if ($null -ne $Headers) {
-            try {
-                $authValue = [string]$Headers['Authorization']
-                if (-not [string]::IsNullOrWhiteSpace($authValue)) { $hasAuthorizationHeader = $true }
-            }
-            catch { $hasAuthorizationHeader = $false }
-        }
-
-        if (-not $hasAuthorizationHeader -and $null -ne $Session -and $null -ne $Session.Cookies) {
-            try {
-                $cookieHeader = $Session.Cookies.GetCookieHeader([Uri]$Url)
-                if (-not [string]::IsNullOrWhiteSpace($cookieHeader)) {
-                    $null = $request.Headers.TryAddWithoutValidation('Cookie', $cookieHeader)
+            if ($null -ne $useHeaders) {
+                foreach ($key in $useHeaders.Keys) {
+                    $value = [string]$useHeaders[$key]
+                    if ([string]::IsNullOrWhiteSpace($value)) { continue }
+                    $null = $request.Headers.TryAddWithoutValidation([string]$key, $value)
                 }
             }
-            catch {}
-        }
 
-        $response = $client.SendAsync($request, [System.Net.Http.HttpCompletionOption]::ResponseHeadersRead).GetAwaiter().GetResult()
-        $statusCode = [int]$response.StatusCode
+            $request.Headers.Accept.Clear()
+            $null = $request.Headers.TryAddWithoutValidation('Accept', '*/*')
 
-        if ($statusCode -ge 200 -and $statusCode -lt 300) {
-            $contentStream = $response.Content.ReadAsStreamAsync().GetAwaiter().GetResult()
-            $fileStream = [System.IO.File]::Create($OutFile)
-            $contentStream.CopyTo($fileStream)
-            $fileStream.Flush()
-            return [PSCustomObject]@{ Success = $true; StatusCode = $statusCode; Location = $null; Error = $null }
-        }
-
-        # Surface redirect location so the caller can strip auth headers before following
-        # to CDN URLs (cross-host redirects that must not carry the Authorization header).
-        try {
-            if ($null -ne $response.Headers.Location) {
-                $location = [string]$response.Headers.Location.OriginalString
+            # Add session cookies only when no Authorization header is present,
+            # to avoid the CDN/S3 conflicting-auth issue.
+            $hasAuthHeader = $false
+            if ($null -ne $useHeaders) {
+                try { $hasAuthHeader = -not [string]::IsNullOrWhiteSpace([string]$useHeaders['Authorization']) } catch {}
             }
-        }
-        catch { $location = $null }
+            if (-not $hasAuthHeader -and $null -ne $useSession -and $null -ne $useSession.Cookies) {
+                try {
+                    $cookieHeader = $useSession.Cookies.GetCookieHeader([Uri]$currentUrl)
+                    if (-not [string]::IsNullOrWhiteSpace($cookieHeader)) {
+                        $null = $request.Headers.TryAddWithoutValidation('Cookie', $cookieHeader)
+                    }
+                }
+                catch {}
+            }
 
-        return [PSCustomObject]@{ Success = $false; StatusCode = $statusCode; Location = $location; Error = [System.Exception]::new("HTTP $statusCode for $Url") }
+            $response = $client.SendAsync($request, [System.Net.Http.HttpCompletionOption]::ResponseHeadersRead).GetAwaiter().GetResult()
+            $responses.Add($response)
+            $statusCode = [int]$response.StatusCode
+
+            if ($statusCode -ge 200 -and $statusCode -lt 300) {
+                $contentStream = $response.Content.ReadAsStreamAsync().GetAwaiter().GetResult()
+                $fileStream = [System.IO.File]::Create($OutFile)
+                $contentStream.CopyTo($fileStream)
+                $fileStream.Flush()
+                return [PSCustomObject]@{ Success = $true; StatusCode = $statusCode; Location = $null; Error = $null }
+            }
+
+            if ($statusCode -notin @(301, 302, 303, 307, 308)) {
+                # Non-redirect, non-success — surface the location if present (may be used
+                # by callers) and report failure.
+                try {
+                    if ($null -ne $response.Headers.Location) {
+                        $location = [string]$response.Headers.Location.OriginalString
+                    }
+                }
+                catch { $location = $null }
+                return [PSCustomObject]@{ Success = $false; StatusCode = $statusCode; Location = $location; Error = [System.Exception]::new("HTTP $statusCode for $currentUrl") }
+            }
+
+            # ---- Redirect handling ----
+            $rawLocation = $null
+            try {
+                if ($null -ne $response.Headers.Location) {
+                    $rawLocation = [string]$response.Headers.Location.OriginalString
+                }
+            }
+            catch { $rawLocation = $null }
+
+            # Some servers return the Location as a raw string in the Content-Location
+            # header when the Location header cannot be parsed as a URI by HttpClient.
+            if ([string]::IsNullOrWhiteSpace($rawLocation)) {
+                try {
+                    $rawLocation = $response.Headers.GetValues('Location') | Select-Object -First 1
+                }
+                catch { $rawLocation = $null }
+            }
+
+            if ([string]::IsNullOrWhiteSpace($rawLocation)) {
+                # 3xx with no Location — cannot follow
+                $location = $null
+                return [PSCustomObject]@{ Success = $false; StatusCode = $statusCode; Location = $null; Error = [System.Exception]::new("HTTP $statusCode (no Location) for $currentUrl") }
+            }
+
+            $nextUrl = Resolve-ConfluenceUrl -BaseUrl $currentUrl -PathOrUrl $rawLocation
+
+            # Detect auth-failure redirects (login page) — abort immediately.
+            $isLoginRedirect = $false
+            try {
+                $nextHost = ([Uri]$nextUrl).Host
+                if ($nextHost -ieq 'id.atlassian.com') { $isLoginRedirect = $true }
+                elseif ($nextUrl -match 'login' -or $nextUrl -match 'application=confluence') { $isLoginRedirect = $true }
+            }
+            catch { $isLoginRedirect = $false }
+
+            if ($isLoginRedirect) {
+                $location = $nextUrl
+                return [PSCustomObject]@{ Success = $false; StatusCode = $statusCode; Location = $nextUrl; Error = [System.Exception]::new("HTTP $statusCode redirected to login for $currentUrl") }
+            }
+
+            # Strip auth when leaving the origin host (cross-host hop).
+            $nextHost2 = ''
+            try { $nextHost2 = ([Uri]$nextUrl).Host } catch {}
+            if ($nextHost2 -ine $originHost) {
+                $useHeaders = $null
+                $useSession = $null
+            }
+
+            $currentUrl = $nextUrl
+        }
+
+        # Redirect limit exceeded
+        return [PSCustomObject]@{ Success = $false; StatusCode = $statusCode; Location = $null; Error = [System.Exception]::new("Too many redirects ($MaxRedirects) for $Url") }
     }
     catch {
         $err = $_
-
         return [PSCustomObject]@{ Success = $false; StatusCode = $statusCode; Location = $location; Error = $err; Message = $err.Exception.Message }
     }
     finally {
-        if ($null -ne $fileStream) { try { $fileStream.Dispose() } catch {} }
+        if ($null -ne $fileStream) { try { $fileStream.Flush(); $fileStream.Dispose() } catch {} }
         if ($null -ne $contentStream) { try { $contentStream.Dispose() } catch {} }
-        if ($null -ne $response) { try { $response.Dispose() } catch {} }
-        if ($null -ne $request) { try { $request.Dispose() } catch {} }
+        foreach ($r in $responses) { try { $r.Dispose() } catch {} }
         if ($null -ne $client) { try { $client.Dispose() } catch {} }
         if ($null -ne $handler) { try { $handler.Dispose() } catch {} }
     }
@@ -1142,8 +1250,10 @@ function Save-Attachments {
         $lastError  = $null
 
         # Primary path: direct REST API binary download with Basic auth headers.
-        # Do NOT append os_authType=basic here – the REST API uses the Authorization header;
-        # os_authType is a web-UI hint and can cause unexpected redirects on some tenants.
+        # Invoke-FileDownload now follows the full redirect chain internally
+        # (REST API → /wiki/download/… → CDN pre-signed URL) with automatic
+        # auth-stripping on CDN / cross-host hops.
+        # Do NOT append os_authType=basic here – the REST API uses the Authorization header.
         if (-not [string]::IsNullOrWhiteSpace($attId)) {
             $directApiUrl = "$ApiBase/content/$PageId/child/attachment/$attId/download"
             try {
@@ -1153,18 +1263,8 @@ function Save-Attachments {
 
                 $directResult = Invoke-FileDownload -Url $directApiUrl -OutFile $tempFile -Headers $Headers -Session $Session
                 if (-not $directResult.Success) {
-                    # A 3xx here means Confluence redirected to a CDN pre-signed URL.
-                    # Surface it as $lastError so the candidates fallback loop handles
-                    # the redirect with proper auth-stripping for cross-host hops.
-                    if ($null -ne $directResult.Error) {
-                        $lastError = $directResult.Error
-                    } else {
-                        $lastError = [System.Exception]::new("Direct API attachment request failed with status $($directResult.StatusCode)")
-                    }
-                    # If the primary returned a redirect, prime candidates with the CDN target
-                    # so the fallback loop picks it up without re-requesting the REST endpoint.
-                    if ($directResult.StatusCode -in @(301,302,303,307,308) -and -not [string]::IsNullOrWhiteSpace($directResult.Location)) {
-                        $script:_directRedirectLocation = $directResult.Location
+                    $lastError = if ($null -ne $directResult.Error) { $directResult.Error } else {
+                        [System.Exception]::new("Direct API attachment request failed with status $($directResult.StatusCode)")
                     }
                 }
 
@@ -1186,21 +1286,11 @@ function Save-Attachments {
             }
         }
 
-        if ($downloaded) {
-            $script:_directRedirectLocation = $null   # clear any stale redirect from this iteration
-            continue
-        }
+        if ($downloaded) { continue }
 
         # Build candidate download URLs; some tenants return paths without /wiki
         $confluenceRoot = $WikiBase -replace '/wiki$', ''
         $candidates = [System.Collections.Generic.List[string]]::new()
-
-        # If the primary REST path returned a redirect (e.g. to CDN pre-signed URL), add
-        # that URL first so it is tried before re-requesting the REST endpoint.
-        if (-not [string]::IsNullOrWhiteSpace($script:_directRedirectLocation)) {
-            $candidates.Add($script:_directRedirectLocation)
-            $script:_directRedirectLocation = $null
-        }
 
         if (-not [string]::IsNullOrWhiteSpace($attId)) {
             $wikiRoot = $WikiBase
@@ -1209,29 +1299,20 @@ function Save-Attachments {
 
             $apiDownload = "$ApiBase/content/$PageId/child/attachment/$attId/download"
             $candidates.Add($apiDownload)
-            $apiWithAuth = Add-OsAuthTypeBasic -Url $apiDownload
-            if ($apiWithAuth -ne $apiDownload) { $candidates.Add($apiWithAuth) }
 
             # Confluence Cloud v2 download endpoint fallback (often avoids v1 attachment 403s).
             $v2Download = "$wikiRoot/api/v2/attachments/$attId/download"
             $candidates.Add($v2Download)
-
-            $withAuth = Add-OsAuthTypeBasic -Url $v2Download
-            if ($withAuth -ne $v2Download) { $candidates.Add($withAuth) }
         }
 
         if ($downloadPath -match '^https?://') {
             $candidates.Add($downloadPath)
-            $withAuth = Add-OsAuthTypeBasic -Url $downloadPath
-            if ($withAuth -ne $downloadPath) { $candidates.Add($withAuth) }
         }
         else {
             $raw = $downloadPath
             if (-not [string]::IsNullOrWhiteSpace($raw)) {
                 $resolved = Resolve-ConfluenceUrl -BaseUrl $confluenceRoot -PathOrUrl $raw
                 $candidates.Add($resolved)
-                $withAuth = Add-OsAuthTypeBasic -Url $resolved
-                if ($withAuth -ne $resolved) { $candidates.Add($withAuth) }
 
                 if ($raw -match '^/download/') {
                     $raw = "/wiki$raw"
@@ -1243,8 +1324,6 @@ function Save-Attachments {
                 if ($raw -ne $downloadPath) {
                     $resolved = Resolve-ConfluenceUrl -BaseUrl $confluenceRoot -PathOrUrl $raw
                     $candidates.Add($resolved)
-                    $withAuth = Add-OsAuthTypeBasic -Url $resolved
-                    if ($withAuth -ne $resolved) { $candidates.Add($withAuth) }
                 }
             }
         }
@@ -1268,63 +1347,34 @@ function Save-Attachments {
             }
 
             try {
+                # Invoke-FileDownload now follows the full redirect chain internally
+                # (Confluence → CDN pre-signed URL), stripping auth on CDN / cross-host
+                # hops automatically.  We only need to try different starting-auth modes
+                # in case the first mode is rejected by the server (e.g. 401/403).
                 $authModes = @(
-                    @{ Headers = $Headers; Session = $null },
                     @{ Headers = $Headers; Session = $Session },
-                    @{ Headers = $null; Session = $Session },
-                    @{ Headers = $null; Session = $null }
+                    @{ Headers = $Headers; Session = $null },
+                    @{ Headers = $null;    Session = $Session },
+                    @{ Headers = $null;    Session = $null }
                 )
 
                 $downloadResult = $null
                 foreach ($mode in $authModes) {
-                    $downloadUrl = $candidateUrl
-                    $headersToUse = $mode.Headers
-                    $sessionToUse = $mode.Session
+                    $downloadResult = Invoke-FileDownload -Url $candidateUrl -OutFile $tempFile -Headers $mode.Headers -Session $mode.Session
 
-                    for ($redirects = 0; $redirects -lt 5; $redirects++) {
-                        $downloadResult = Invoke-FileDownload -Url $downloadUrl -OutFile $tempFile -Headers $headersToUse -Session $sessionToUse
-                        if ($downloadResult.Success) { break }
+                    if ($downloadResult.Success) { break }
 
-                        if ($downloadResult.StatusCode -in @(401, 403) -and [string]::IsNullOrWhiteSpace($downloadResult.Location)) {
-                            break
-                        }
+                    # Auth-failure on the very first hop → try next mode.
+                    if ($downloadResult.StatusCode -in @(401, 403)) { continue }
 
-                        if ([string]::IsNullOrWhiteSpace($downloadResult.Location)) { break }
+                    # Login redirect abort → try next mode.
+                    $errMsg = ''
+                    try { $errMsg = $downloadResult.Error.Message } catch {}
+                    if ($errMsg -match 'login') { continue }
 
-                        $nextUrl = Resolve-ConfluenceUrl -BaseUrl $downloadUrl -PathOrUrl $downloadResult.Location
-                        # Only treat as auth redirect if the location explicitly points to a login page.
-                        # Do NOT flag same-host redirects as auth bounces - Cloud uses same-host intermediate hops.
-                        $isLoginRedirect = $false
-                        try {
-                            $nextUri2 = [Uri]$nextUrl
-                            if ($nextUri2.Host -ieq 'id.atlassian.com') { $isLoginRedirect = $true }
-                            elseif ($nextUrl -match 'login' -or $nextUrl -match 'application=confluence') { $isLoginRedirect = $true }
-                        }
-                        catch { $isLoginRedirect = $false }
-
-                        if ($isLoginRedirect) {
-                            break
-                        }
-
-                        $sameHost = $false
-                        try {
-                            $sameHost = ([Uri]$nextUrl).Host -eq ([Uri]$candidateUrl).Host
-                        }
-                        catch {
-                            $sameHost = $false
-                        }
-
-                        if (-not $sameHost) {
-                            $headersToUse = $null
-                            $sessionToUse = $null
-                        }
-
-                        $downloadUrl = $nextUrl
-                    }
-
-                    if ($null -ne $downloadResult -and $downloadResult.Success) {
-                        break
-                    }
+                    # Any other failure (404, 400, timeout, redirect limit) → no point
+                    # retrying with different auth; break and move to next candidate.
+                    break
                 }
 
                 if ($null -eq $downloadResult -or -not $downloadResult.Success) {
