@@ -1530,41 +1530,86 @@ function Save-Attachments {
             }
         }
         
-        # ── Invoke-WebRequest simple fallback (same approach as Save-WordExport) ──
-        # Proven method: Invoke-WebRequest with both Authorization header AND WebSession.
-        # PowerShell's built-in HTTP client automatically handles cookie forwarding
-        # across redirects (Confluence → media.atlassianusercontent.com) without
-        # the complexity of manually managing auth stripping per hop.
-        if (-not $downloaded -and $null -ne $Headers -and -not [string]::IsNullOrWhiteSpace([string]$Headers['Authorization'])) {
-            # Build candidate URLs from raw _links.download (no os_authType=basic).
-            $iwrCandidates = [System.Collections.Generic.List[string]]::new()
+        # ── Invoke-WebRequest simple fallback ──
+        # Confluence Cloud media-backed attachments (newer uploads, .msg files,
+        # inline images from email) return HTTP 404 when the Authorization: Basic
+        # header is present — those endpoints ONLY accept session-cookie auth.
+        # We therefore try four auth combinations in priority order:
+        #   1. Session-only (no Authorization) for _links.download paths — this is
+        #      the correct auth mode for Atlassian media-service downloads.
+        #   2. Authorization + Session (works for legacy /download/attachments/ paths).
+        #   3. Authorization only.
+        #   4. Session only (covers any variant not caught by #1).
+        if (-not $downloaded) {
+            $confluenceRootFb = $WikiBase -replace '/wiki$', ''
+            $cleanDp = ''
             if (-not [string]::IsNullOrWhiteSpace($downloadPath)) {
-                $confluenceRootFb = $WikiBase -replace '/wiki$', ''
                 $cleanDp = $downloadPath -replace '[?&]os_authType=basic', '' -replace '\?&', '?' -replace '\?$', '' -replace '&&', '&'
+            }
+
+            # Build a resolved absolute URL from _links.download (used for attempts 1+2)
+            $resolvedDownloadUrl = $null
+            if (-not [string]::IsNullOrWhiteSpace($cleanDp)) {
                 if ($cleanDp -match '^https?://') {
-                    $iwrCandidates.Add($cleanDp)
+                    $resolvedDownloadUrl = $cleanDp
                 } else {
-                    $iwrCandidates.Add((Resolve-ConfluenceUrl -BaseUrl $confluenceRootFb -PathOrUrl $cleanDp))
-                    if ($cleanDp -match '^/download/') {
-                        $iwrCandidates.Add((Resolve-ConfluenceUrl -BaseUrl $confluenceRootFb -PathOrUrl ("/wiki" + $cleanDp)))
-                    } elseif ($cleanDp -match '^download/') {
-                        $iwrCandidates.Add((Resolve-ConfluenceUrl -BaseUrl $confluenceRootFb -PathOrUrl ("/wiki/" + $cleanDp)))
+                    $resolvedDownloadUrl = Resolve-ConfluenceUrl -BaseUrl $confluenceRootFb -PathOrUrl $cleanDp
+                    # Also try /wiki prefix if missing
+                    if ($cleanDp -match '^/download/' -and $cleanDp -notmatch '^/wiki/') {
+                        $resolvedDownloadUrl = Resolve-ConfluenceUrl -BaseUrl $confluenceRootFb -PathOrUrl ("/wiki" + $cleanDp)
                     }
                 }
             }
-            if (-not [string]::IsNullOrWhiteSpace($attId)) {
-                $wikiRootFb = if ($WikiBase -match '/wiki$') { $WikiBase.TrimEnd('/') } else { $WikiBase.TrimEnd('/') + '/wiki' }
-                $encodedPageIdFb = [Uri]::EscapeDataString($PageId)
-                $encodedAttIdFb = [Uri]::EscapeDataString($attId)
-                $iwrCandidates.Add("$ApiBase/content/$encodedPageIdFb/child/attachment/$encodedAttIdFb/download")
-                $iwrCandidates.Add("$wikiRootFb/api/v2/attachments/$encodedAttIdFb/download")
+
+            $wikiRootFb = if ($WikiBase -match '/wiki$') { $WikiBase.TrimEnd('/') } else { $WikiBase.TrimEnd('/') + '/wiki' }
+            $encodedPageIdFb = [Uri]::EscapeDataString($PageId)
+            $encodedAttIdFb  = if (-not [string]::IsNullOrWhiteSpace($attId)) { [Uri]::EscapeDataString($attId) } else { '' }
+            $v1ApiUrl  = if (-not [string]::IsNullOrWhiteSpace($encodedAttIdFb)) { "$ApiBase/content/$encodedPageIdFb/child/attachment/$encodedAttIdFb/download" } else { $null }
+            $v2ApiUrl  = if (-not [string]::IsNullOrWhiteSpace($encodedAttIdFb)) { "$wikiRootFb/api/v2/attachments/$encodedAttIdFb/download" } else { $null }
+
+            # Each attempt: [url, sendAuth (bool), sendSession (bool)]
+            # Priority: session-only on download URL first (media-backed attachments),
+            # then auth+session, then API URLs with auth.
+            $iwrAttempts = [System.Collections.Generic.List[object]]::new()
+
+            # Attempt 1: _links.download with session ONLY — fixes 404 on media-backed attachments
+            if (-not [string]::IsNullOrWhiteSpace($resolvedDownloadUrl) -and $null -ne $Session) {
+                $iwrAttempts.Add([PSCustomObject]@{ Url = $resolvedDownloadUrl; SendAuth = $false; SendSession = $true; Label = 'download-session-only' })
+            }
+
+            # Attempt 2: _links.download with Authorization + Session (legacy path)
+            if (-not [string]::IsNullOrWhiteSpace($resolvedDownloadUrl) -and $null -ne $Headers -and -not [string]::IsNullOrWhiteSpace([string]$Headers['Authorization'])) {
+                $iwrAttempts.Add([PSCustomObject]@{ Url = $resolvedDownloadUrl; SendAuth = $true; SendSession = $true; Label = 'download-auth+session' })
+                $iwrAttempts.Add([PSCustomObject]@{ Url = $resolvedDownloadUrl; SendAuth = $true; SendSession = $false; Label = 'download-auth-only' })
+            }
+
+            # Attempt 3: v1 REST API URL with session-only (media 404 fix)
+            if (-not [string]::IsNullOrWhiteSpace($v1ApiUrl) -and $null -ne $Session) {
+                $iwrAttempts.Add([PSCustomObject]@{ Url = $v1ApiUrl; SendAuth = $false; SendSession = $true; Label = 'v1api-session-only' })
+            }
+            # Attempt 4: v1 REST API with auth + session
+            if (-not [string]::IsNullOrWhiteSpace($v1ApiUrl) -and $null -ne $Headers -and -not [string]::IsNullOrWhiteSpace([string]$Headers['Authorization'])) {
+                $iwrAttempts.Add([PSCustomObject]@{ Url = $v1ApiUrl; SendAuth = $true; SendSession = $true; Label = 'v1api-auth+session' })
+            }
+
+            # Attempt 5: v2 API URL with session-only then auth
+            if (-not [string]::IsNullOrWhiteSpace($v2ApiUrl)) {
+                if ($null -ne $Session) {
+                    $iwrAttempts.Add([PSCustomObject]@{ Url = $v2ApiUrl; SendAuth = $false; SendSession = $true; Label = 'v2api-session-only' })
+                }
+                if ($null -ne $Headers -and -not [string]::IsNullOrWhiteSpace([string]$Headers['Authorization'])) {
+                    $iwrAttempts.Add([PSCustomObject]@{ Url = $v2ApiUrl; SendAuth = $true; SendSession = $true; Label = 'v2api-auth+session' })
+                }
             }
 
             $seenIwr = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
-            foreach ($iwrUrl in $iwrCandidates) {
+            foreach ($attempt in $iwrAttempts) {
                 if ($downloaded) { break }
+                $iwrUrl = $attempt.Url
                 if ([string]::IsNullOrWhiteSpace($iwrUrl)) { continue }
-                if (-not $seenIwr.Add($iwrUrl.Trim())) { continue }
+                # Deduplicate on url+auth combination
+                $dedupeKey = "$($attempt.SendAuth):$($attempt.SendSession):$iwrUrl"
+                if (-not $seenIwr.Add($dedupeKey)) { continue }
 
                 if (Test-Path -LiteralPath $tempFile) {
                     Remove-Item -LiteralPath $tempFile -Force -ErrorAction SilentlyContinue
@@ -1578,9 +1623,11 @@ function Save-Attachments {
                         UseBasicParsing    = $true
                         MaximumRedirection = 25
                         ErrorAction        = 'Stop'
-                        Headers            = @{ Authorization = $Headers['Authorization'] }
                     }
-                    if ($null -ne $Session) {
+                    if ($attempt.SendAuth -and $null -ne $Headers -and -not [string]::IsNullOrWhiteSpace([string]$Headers['Authorization'])) {
+                        $iwrParams.Headers = @{ Authorization = $Headers['Authorization'] }
+                    }
+                    if ($attempt.SendSession -and $null -ne $Session) {
                         $iwrParams.WebSession = $Session
                     }
                     Invoke-WebRequest @iwrParams | Out-Null
@@ -1592,6 +1639,10 @@ function Save-Attachments {
                             $count++
                             $totalBytes += $iwrSize
                             $downloaded = $true
+                        }
+                        elseif ($iwrSize -gt 0) {
+                            # Got content but failed validation — could be error HTML
+                            $lastError = [System.Exception]::new("IWR attempt '$($attempt.Label)' returned non-file content ($iwrSize bytes)")
                         }
                     }
                 }
@@ -1668,7 +1719,7 @@ $wikiBase = Get-WikiBaseUrl -BaseUrl $ConfluenceBaseUrl
 $apiBase = "$wikiBase/rest/api"
 $headers = Get-AuthHeaders -UserEmail $Email -Token $ApiToken
 
-$exporterVersion = '2026-05-27-httpclient-v2'
+$exporterVersion = '2026-05-29-media-session-fix'
 Write-Host ("Exporter version: {0}" -f $exporterVersion) -ForegroundColor DarkCyan
 Write-Host ("Exporter script : {0}" -f $PSCommandPath) -ForegroundColor DarkCyan
 
