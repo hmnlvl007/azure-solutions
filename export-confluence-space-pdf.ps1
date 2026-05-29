@@ -1504,6 +1504,80 @@ function Save-Attachments {
             }
         }
         
+        # ── Invoke-WebRequest + WebSession fallback ───────────────────────────────
+        # Confluence Cloud's /wiki/download/attachments/ endpoint uses a
+        # cookie-authenticated multi-hop redirect chain.  The manual HttpClient
+        # approach in Invoke-FileDownload can lose session cookies across hops
+        # (e.g. when Atlassian redirects internally before handing off to CDN).
+        # Invoke-WebRequest with -WebSession lets PowerShell's built-in HTTP
+        # stack manage cookies automatically — exactly like a browser session —
+        # which is why the browser can always download these attachments.
+        if (-not $downloaded -and $null -ne $Session) {
+            # Build the best candidate URL: the raw _links.download resolved to absolute,
+            # WITHOUT os_authType=basic so the cookie path is used exclusively.
+            $iwrCandidates = [System.Collections.Generic.List[string]]::new()
+            if (-not [string]::IsNullOrWhiteSpace($downloadPath)) {
+                $confluenceRootFb = $WikiBase -replace '/wiki$', ''
+                if ($downloadPath -match '^https?://') {
+                    $iwrCandidates.Add($downloadPath)
+                }
+                else {
+                    $raw2 = $downloadPath
+                    $iwrCandidates.Add((Resolve-ConfluenceUrl -BaseUrl $confluenceRootFb -PathOrUrl $raw2))
+                    if ($raw2 -match '^/download/') { $raw2 = "/wiki$raw2" }
+                    elseif ($raw2 -match '^download/')  { $raw2 = "/wiki/$raw2" }
+                    $iwrCandidates.Add((Resolve-ConfluenceUrl -BaseUrl $confluenceRootFb -PathOrUrl $raw2))
+                }
+            }
+            if (-not [string]::IsNullOrWhiteSpace($attId)) {
+                $wikiRootFb = if ($WikiBase -match '/wiki$') { $WikiBase.TrimEnd('/') } else { $WikiBase.TrimEnd('/') + '/wiki' }
+                $iwrCandidates.Add("$ApiBase/content/$PageId/child/attachment/$attId/download")
+                $iwrCandidates.Add("$wikiRootFb/api/v2/attachments/$attId/download")
+            }
+
+            $seenIwr = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
+            foreach ($iwrUrl in $iwrCandidates) {
+                if ($downloaded) { break }
+                if ([string]::IsNullOrWhiteSpace($iwrUrl)) { continue }
+                if (-not $seenIwr.Add($iwrUrl.Trim())) { continue }
+
+                if (Test-Path -LiteralPath $tempFile) {
+                    Remove-Item -LiteralPath $tempFile -Force -ErrorAction SilentlyContinue
+                }
+
+                try {
+                    $iwrParams = @{
+                        Uri                  = $iwrUrl
+                        Method               = 'Get'
+                        OutFile              = $tempFile
+                        UseBasicParsing      = $true
+                        MaximumRedirection   = 15
+                        ErrorAction          = 'Stop'
+                        WebSession           = $Session
+                    }
+                    # Also send the Authorization header alongside cookies so
+                    # both credential types are available on the first hop.
+                    if ($null -ne $Headers -and -not [string]::IsNullOrWhiteSpace([string]$Headers['Authorization'])) {
+                        $iwrParams['Headers'] = @{ Authorization = $Headers['Authorization'] }
+                    }
+                    Invoke-WebRequest @iwrParams | Out-Null
+
+                    if (Test-Path -LiteralPath $tempFile) {
+                        $iwrSize = (Get-Item -LiteralPath $tempFile).Length
+                        if ($iwrSize -gt 0 -and (Test-DownloadLooksValid -Path $tempFile -ExpectedExtension $ext)) {
+                            Finalize-DownloadedFile -TempPath $tempFile -DestinationPath $filePath
+                            $count++
+                            $totalBytes += $iwrSize
+                            $downloaded = $true
+                        }
+                    }
+                }
+                catch {
+                    $lastError = $_
+                }
+            }
+        }
+
         if (-not $downloaded) {
             $failCount++
             if ($null -ne $lastError) {
