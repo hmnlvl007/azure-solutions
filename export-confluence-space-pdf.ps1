@@ -558,9 +558,9 @@ function Test-IsCdnHost {
     # Returns $true for known CDN / object-storage hosts whose pre-signed URLs
     # must NOT carry an Authorization header (adding one causes a 400/403 from S3
     # because it sees conflicting query-string and header credentials).
-    param([string]$Host)
-    if ([string]::IsNullOrWhiteSpace($Host)) { return $false }
-    $h = $Host.ToLowerInvariant()
+    param([string]$HostName)
+    if ([string]::IsNullOrWhiteSpace($HostName)) { return $false }
+    $h = $HostName.ToLowerInvariant()
     return (
         $h -match '\.amazonaws\.com$' -or
         $h -match '\.cloudfront\.net$' -or
@@ -643,7 +643,7 @@ function Invoke-FileDownload {
             $currentHost = ''
             try { $currentHost = ([Uri]$currentUrl).Host } catch {}
 
-            if (Test-IsCdnHost -Host $currentHost) {
+            if (Test-IsCdnHost -HostName $currentHost) {
                 $useHeaders = $null
                 $useSession = $null
             }
