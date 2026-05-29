@@ -1506,27 +1506,39 @@ function Save-Attachments {
         
         # ── Invoke-WebRequest + WebSession fallback ───────────────────────────────
         # Confluence Cloud's /wiki/download/attachments/ endpoint uses a
-        # cookie-authenticated multi-hop redirect chain.  The manual HttpClient
-        # approach in Invoke-FileDownload can lose session cookies across hops
-        # (e.g. when Atlassian redirects internally before handing off to CDN).
-        # Invoke-WebRequest with -WebSession lets PowerShell's built-in HTTP
-        # stack manage cookies automatically — exactly like a browser session —
-        # which is why the browser can always download these attachments.
+        # cookie-authenticated multi-hop redirect chain:
+        #   Confluence (cookie auth) → internal Atlassian hop → CDN pre-signed URL
+        # The CDN leg MUST NOT receive an Authorization header — S3/CloudFront
+        # rejects requests that carry both a query-string signature and an
+        # Authorization header (returns 400/403/404 depending on the CDN).
+        # Invoke-WebRequest with -WebSession follows all redirects automatically
+        # while the CookieContainer is maintained per-host, but it forwards
+        # custom headers (Authorization) to every hop including CDN.
+        # Therefore: cookies-only (no Authorization) is tried first, which
+        # exactly mirrors what a browser does.  Authorization-only is tried
+        # second as a fallback for tenants that do not issue session cookies.
         if (-not $downloaded -and $null -ne $Session) {
-            # Build the best candidate URL: the raw _links.download resolved to absolute,
-            # WITHOUT os_authType=basic so the cookie path is used exclusively.
+            # Build candidate URLs from raw _links.download (no os_authType=basic).
             $iwrCandidates = [System.Collections.Generic.List[string]]::new()
             if (-not [string]::IsNullOrWhiteSpace($downloadPath)) {
                 $confluenceRootFb = $WikiBase -replace '/wiki$', ''
                 if ($downloadPath -match '^https?://') {
-                    $iwrCandidates.Add($downloadPath)
+                    # Strip os_authType=basic if present — cookie path only
+                    $cleanDp = $downloadPath -replace '[?&]os_authType=basic', '' -replace '\?&', '?' -replace '&&', '&'
+                    $iwrCandidates.Add($cleanDp)
                 }
                 else {
-                    $raw2 = $downloadPath
+                    $raw2 = $downloadPath -replace '[?&]os_authType=basic', '' -replace '\?&', '?' -replace '&&', '&'
                     $iwrCandidates.Add((Resolve-ConfluenceUrl -BaseUrl $confluenceRootFb -PathOrUrl $raw2))
-                    if ($raw2 -match '^/download/') { $raw2 = "/wiki$raw2" }
-                    elseif ($raw2 -match '^download/')  { $raw2 = "/wiki/$raw2" }
-                    $iwrCandidates.Add((Resolve-ConfluenceUrl -BaseUrl $confluenceRootFb -PathOrUrl $raw2))
+                    if ($raw2 -match '^\?') {
+                        # path-only variant with /wiki prefix
+                    } elseif ($raw2 -match '^/download/') {
+                        $raw2wiki = "/wiki$raw2"
+                        $iwrCandidates.Add((Resolve-ConfluenceUrl -BaseUrl $confluenceRootFb -PathOrUrl $raw2wiki))
+                    } elseif ($raw2 -match '^download/') {
+                        $raw2wiki = "/wiki/$raw2"
+                        $iwrCandidates.Add((Resolve-ConfluenceUrl -BaseUrl $confluenceRootFb -PathOrUrl $raw2wiki))
+                    }
                 }
             }
             if (-not [string]::IsNullOrWhiteSpace($attId)) {
@@ -1535,45 +1547,58 @@ function Save-Attachments {
                 $iwrCandidates.Add("$wikiRootFb/api/v2/attachments/$attId/download")
             }
 
+            # Two auth strategies tried in order per URL:
+            #   1. Cookies only  — no Authorization header forwarded to CDN hops
+            #   2. Auth header only — for tenants without meaningful session cookies
+            $authStrategy = @(
+                @{ UseAuth = $false },
+                @{ UseAuth = $true  }
+            )
+
             $seenIwr = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
             foreach ($iwrUrl in $iwrCandidates) {
                 if ($downloaded) { break }
                 if ([string]::IsNullOrWhiteSpace($iwrUrl)) { continue }
                 if (-not $seenIwr.Add($iwrUrl.Trim())) { continue }
 
-                if (Test-Path -LiteralPath $tempFile) {
-                    Remove-Item -LiteralPath $tempFile -Force -ErrorAction SilentlyContinue
-                }
-
-                try {
-                    $iwrParams = @{
-                        Uri                  = $iwrUrl
-                        Method               = 'Get'
-                        OutFile              = $tempFile
-                        UseBasicParsing      = $true
-                        MaximumRedirection   = 15
-                        ErrorAction          = 'Stop'
-                        WebSession           = $Session
-                    }
-                    # Also send the Authorization header alongside cookies so
-                    # both credential types are available on the first hop.
-                    if ($null -ne $Headers -and -not [string]::IsNullOrWhiteSpace([string]$Headers['Authorization'])) {
-                        $iwrParams['Headers'] = @{ Authorization = $Headers['Authorization'] }
-                    }
-                    Invoke-WebRequest @iwrParams | Out-Null
+                foreach ($strategy in $authStrategy) {
+                    if ($downloaded) { break }
 
                     if (Test-Path -LiteralPath $tempFile) {
-                        $iwrSize = (Get-Item -LiteralPath $tempFile).Length
-                        if ($iwrSize -gt 0 -and (Test-DownloadLooksValid -Path $tempFile -ExpectedExtension $ext)) {
-                            Finalize-DownloadedFile -TempPath $tempFile -DestinationPath $filePath
-                            $count++
-                            $totalBytes += $iwrSize
-                            $downloaded = $true
+                        Remove-Item -LiteralPath $tempFile -Force -ErrorAction SilentlyContinue
+                    }
+
+                    try {
+                        $iwrParams = @{
+                            Uri                = $iwrUrl
+                            Method             = 'Get'
+                            OutFile            = $tempFile
+                            UseBasicParsing    = $true
+                            MaximumRedirection = 15
+                            ErrorAction        = 'Stop'
+                            WebSession         = $Session
+                        }
+                        # Strategy 1: cookies only — do NOT add Authorization header
+                        # so CDN hops never see conflicting credentials.
+                        # Strategy 2: add Authorization as well (fallback).
+                        if ($strategy.UseAuth -and $null -ne $Headers -and -not [string]::IsNullOrWhiteSpace([string]$Headers['Authorization'])) {
+                            $iwrParams['Headers'] = @{ Authorization = $Headers['Authorization'] }
+                        }
+                        Invoke-WebRequest @iwrParams | Out-Null
+
+                        if (Test-Path -LiteralPath $tempFile) {
+                            $iwrSize = (Get-Item -LiteralPath $tempFile).Length
+                            if ($iwrSize -gt 0 -and (Test-DownloadLooksValid -Path $tempFile -ExpectedExtension $ext)) {
+                                Finalize-DownloadedFile -TempPath $tempFile -DestinationPath $filePath
+                                $count++
+                                $totalBytes += $iwrSize
+                                $downloaded = $true
+                            }
                         }
                     }
-                }
-                catch {
-                    $lastError = $_
+                    catch {
+                        $lastError = $_
+                    }
                 }
             }
         }
