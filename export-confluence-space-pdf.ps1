@@ -1836,7 +1836,7 @@ foreach ($page in $pages) {
     if ([string]::IsNullOrWhiteSpace($pageTitle)) { $pageTitle = "Untitled-$index" }
 
     if ([string]::IsNullOrWhiteSpace($pageId)) {
-        $failed.Add([PSCustomObject]@{ id = '(unknown)'; title = $pageTitle; reason = 'Missing page id' }) | Out-Null
+            Write-Host ("[{0}/{1}] SKIP (missing page id): {2}" -f $index, $pages.Count, $pageTitle) -ForegroundColor Yellow
         continue
     }
 
@@ -2042,6 +2042,14 @@ Write-Host ("  Duration : {0:hh\:mm\:ss}" -f $elapsed)
 Write-Host "  Output   : $spaceRoot"
 Write-Host "  Summary  : $summaryPath"
 Write-Host "  State    : $statePath"
+
+if ($failed.Count -gt 0) {
+    Write-Host ''
+    Write-Host '  Failed pages:' -ForegroundColor Red
+    foreach ($f in $failed) {
+        Write-Host ("    [$($f.id)] $($f.title) - $($f.reason)") -ForegroundColor Red
+    }
+}
 
 if ($failed.Count -gt 0 -or $attachmentsFailed -gt 0) {
     exit 2
