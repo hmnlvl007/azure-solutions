@@ -595,39 +595,6 @@ function Resolve-ConfluenceUrl {
     }
 }
 
-function Get-AttachmentV2Metadata {
-    param(
-        [Parameter(Mandatory)][string]$WikiBase,
-        [Parameter(Mandatory)][string]$AttachmentId,
-        [hashtable]$Headers,
-        [Microsoft.PowerShell.Commands.WebRequestSession]$Session
-    )
-
-    if ([string]::IsNullOrWhiteSpace($AttachmentId)) { return $null }
-
-    $wikiRoot = if ($WikiBase -match '/wiki$') { $WikiBase.TrimEnd('/') } else { $WikiBase.TrimEnd('/') + '/wiki' }
-    $uri = "$wikiRoot/api/v2/attachments/$([Uri]::EscapeDataString($AttachmentId))"
-
-    $irmParams = @{
-        Uri = $uri
-        Method = 'Get'
-        ErrorAction = 'Stop'
-    }
-    if ($null -ne $Headers) {
-        $irmParams.Headers = $Headers
-    }
-    if ($null -ne $Session) {
-        $irmParams.WebSession = $Session
-    }
-
-    try {
-        return (Invoke-RestMethod @irmParams)
-    }
-    catch {
-        return $null
-    }
-}
-
 function Test-IsCdnHost {
     # Returns $true for known CDN / object-storage hosts whose pre-signed URLs
     # must NOT carry an Authorization header (adding one causes a 400/403 from S3
@@ -1346,6 +1313,40 @@ function Save-HtmlFallback {
     return [PSCustomObject]@{ Success = $true; Reason = '' }
 }
 
+function Resolve-ConfluenceDownloadUrl {
+    param(
+        [Parameter(Mandatory)][string]$WikiBase,
+        [Parameter(Mandatory)][string]$PathOrUrl
+    )
+
+    if ([string]::IsNullOrWhiteSpace($PathOrUrl)) { return $null }
+
+    if ($PathOrUrl -match '^https?://') {
+        return $PathOrUrl
+    }
+
+    $wikiRoot = $WikiBase.TrimEnd('/')
+    if ($wikiRoot -notmatch '/wiki$') {
+        $wikiRoot = "$wikiRoot/wiki"
+    }
+
+    $siteRoot = $wikiRoot -replace '/wiki$', ''
+
+    # Confluence Cloud REST usually returns _links.download as:
+    # /download/attachments/...
+    # It must be joined to /wiki, not to the site root.
+    if ($PathOrUrl -match '^/download/') {
+        return "$wikiRoot$PathOrUrl"
+    }
+
+    # If Confluence already returned /wiki/download/..., join to site root.
+    if ($PathOrUrl -match '^/wiki/') {
+        return "$siteRoot$PathOrUrl"
+    }
+
+    return "$wikiRoot/$($PathOrUrl.TrimStart('/'))"
+}
+
 function Save-Attachments {
     param(
         [string]$ApiBase,
@@ -1365,7 +1366,9 @@ function Save-Attachments {
     $count = 0
     $failCount = 0
     $totalBytes = [long]0
-    $nextUri = "$ApiBase/content/$PageId/child/attachment?limit=200"
+
+    # List attachments from the page. This is the authoritative source.
+    $nextUri = "$ApiBase/content/$PageId/child/attachment?limit=200&expand=version"
 
     while (-not [string]::IsNullOrWhiteSpace($nextUri)) {
         try {
@@ -1376,23 +1379,27 @@ function Save-Attachments {
             if ($items.Count -eq 0) {
                 throw "Attachment list request failed for page ${PageId}: $msg"
             }
+
             $failCount++
             $failures.Add([PSCustomObject]@{
-                pageId = $PageId
+                pageId       = $PageId
                 attachmentId = ''
-                title = '(attachment list)'
-                download = $nextUri
-                reason = $msg
+                title        = '(attachment list)'
+                download     = $nextUri
+                reason       = $msg
             }) | Out-Null
             break
         }
 
         foreach ($entry in @($response.results)) {
-            if ($null -ne $entry) { $items.Add($entry) }
+            if ($null -ne $entry) {
+                $items.Add($entry)
+            }
         }
 
         $rawNext = $null
         try { $rawNext = [string]$response._links.next } catch { $rawNext = $null }
+
         if ([string]::IsNullOrWhiteSpace($rawNext)) {
             $nextUri = $null
         }
@@ -1402,460 +1409,149 @@ function Save-Attachments {
     }
 
     if ($items.Count -eq 0) {
-        return [PSCustomObject]@{ Count = 0; Failed = 0; Attempted = 0; Bytes = [long]0; Path = $null; Failures = @() }
+        return [PSCustomObject]@{
+            Count     = 0
+            Failed    = 0
+            Attempted = 0
+            Bytes     = [long]0
+            Path      = $null
+            Failures  = @()
+        }
     }
 
     Ensure-Directory -Path $attachmentFolder
 
     foreach ($item in $items) {
-        $downloadPath = $null
-        try { $downloadPath = [string]$item._links.download } catch { $downloadPath = $null }
-        if ([string]::IsNullOrWhiteSpace($downloadPath)) { continue }
-
-        $attTitle = [string]$item.title
+        $attTitle = ''
         $attId = ''
+        $downloadPath = ''
+
+        try { $attTitle = [string]$item.title } catch { $attTitle = '' }
         try { $attId = [string]$item.id } catch { $attId = '' }
-        $attV2 = $null
-        $containerIdForDownload = $PageId
-        if (-not [string]::IsNullOrWhiteSpace($attId)) {
-            $attV2 = Get-AttachmentV2Metadata -WikiBase $WikiBase -AttachmentId $attId -Headers $Headers -Session $Session
+        try { $downloadPath = [string]$item._links.download } catch { $downloadPath = '' }
 
-            if ($null -ne $attV2) {
-                $containerCandidates = @()
-                try { $containerCandidates += [string]$attV2.pageId } catch {}
-                try { $containerCandidates += [string]$attV2.blogPostId } catch {}
-                try { $containerCandidates += [string]$attV2.customContentId } catch {}
+        if ([string]::IsNullOrWhiteSpace($attTitle)) { $attTitle = "attachment-$attId" }
 
-                foreach ($candidateContainerId in $containerCandidates) {
-                    if (-not [string]::IsNullOrWhiteSpace($candidateContainerId)) {
-                        $containerIdForDownload = $candidateContainerId
-                        break
-                    }
-                }
-            }
+        if ([string]::IsNullOrWhiteSpace($downloadPath)) {
+            $failCount++
+            $failures.Add([PSCustomObject]@{
+                pageId       = $PageId
+                attachmentId = $attId
+                title        = $attTitle
+                download     = ''
+                reason       = 'Attachment metadata did not include _links.download.'
+            }) | Out-Null
+            continue
         }
 
-        # Preserve the file extension from the title so the saved file opens correctly
-        $ext = [IO.Path]::GetExtension($attTitle)   # e.g. ".pdf" or ""
+        $ext = [IO.Path]::GetExtension($attTitle)
         $nameNoExt = [IO.Path]::GetFileNameWithoutExtension($attTitle)
+        if ([string]::IsNullOrWhiteSpace($nameNoExt)) { $nameNoExt = "attachment" }
         $safeBase = Get-CompactName -Name $nameNoExt -MaxLength 60
-        # Append attachment ID to prevent collisions when two attachments share the same name
-        $fileName = if ([string]::IsNullOrWhiteSpace($attId)) { $safeBase + $ext } else { "$safeBase-$attId$ext" }
+        $fileName = if ([string]::IsNullOrWhiteSpace($attId)) { "$safeBase$ext" } else { "$safeBase-$attId$ext" }
         $filePath = Join-Path -Path $attachmentFolder -ChildPath $fileName
         $tempFile = Join-Path -Path ([IO.Path]::GetTempPath()) -ChildPath ("cf-att-$([Guid]::NewGuid().ToString('N')).tmp")
 
         $downloaded = $false
-        $lastError  = $null
+        $lastError = $null
 
-        # Primary path: direct REST API binary download with Basic auth headers.
-        # Invoke-FileDownload now follows the full redirect chain internally
-        # (REST API → /wiki/download/… → CDN pre-signed URL) with automatic
-        # auth-stripping on CDN / cross-host hops.
-        # Do NOT append os_authType=basic here – the REST API uses the Authorization header.
-        if (-not [string]::IsNullOrWhiteSpace($attId)) {
-            $encodedPageIdDirect = [Uri]::EscapeDataString($containerIdForDownload)
-            $encodedAttIdDirect = [Uri]::EscapeDataString($attId)
-            $directApiUrl = "$ApiBase/content/$encodedPageIdDirect/child/attachment/$encodedAttIdDirect/download"
+        $downloadUrl = Resolve-ConfluenceDownloadUrl -WikiBase $WikiBase -PathOrUrl $downloadPath
+
+        $candidateUrls = [System.Collections.Generic.List[string]]::new()
+        $seenUrls = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
+
+        if (-not [string]::IsNullOrWhiteSpace($downloadUrl)) {
+            if ($seenUrls.Add($downloadUrl)) { $candidateUrls.Add($downloadUrl) }
             try {
-                if (Test-Path -LiteralPath $tempFile) {
-                    Remove-Item -LiteralPath $tempFile -Force -ErrorAction SilentlyContinue
-                }
-
-                $directResult = Invoke-FileDownload -Url $directApiUrl -OutFile $tempFile -Headers $Headers -Session $Session
-                if (-not $directResult.Success) {
-                    $directMsg = "Direct API attachment request failed with status $($directResult.StatusCode)"
-                    if (-not [string]::IsNullOrWhiteSpace([string]$directResult.Location)) {
-                        $directMsg += "; location=$([string]$directResult.Location)"
-                    }
-                    if ($null -ne $directResult.Error) {
-                        $directMsg += "; error=$($directResult.Error.Message)"
-                    }
-                    $lastError = [System.Exception]::new($directMsg)
-                }
-
-                if (Test-Path -LiteralPath $tempFile) {
-                    $directSize = (Get-Item -LiteralPath $tempFile).Length
-                    if ($directSize -gt 0 -and (Test-DownloadLooksValid -Path $tempFile -ExpectedExtension $ext)) {
-                        Finalize-DownloadedFile -TempPath $tempFile -DestinationPath $filePath
-                        $count++
-                        $totalBytes += $directSize
-                        $downloaded = $true
-                    }
-                    elseif ($directSize -gt 0) {
-                        $lastError = [System.Exception]::new('Direct API attachment response was non-empty but not a valid file payload.')
-                    }
-                }
-            }
-            catch {
-                $lastError = $_
-            }
-        }
-
-        if ($downloaded) { continue }
-
-        # Build candidate download URLs; some tenants return paths without /wiki
-        $confluenceRoot = $WikiBase -replace '/wiki$', ''
-        $candidates = [System.Collections.Generic.List[string]]::new()
-
-        if (-not [string]::IsNullOrWhiteSpace($attId)) {
-            $wikiRoot = $WikiBase
-            if ($wikiRoot -match '/wiki$') { $wikiRoot = $wikiRoot.TrimEnd('/') }
-            else { $wikiRoot = ($WikiBase.TrimEnd('/') + '/wiki') }
-
-            # Use URI encoding for IDs to handle edge cases with special characters
-            $encodedPageId = [Uri]::EscapeDataString($containerIdForDownload)
-            $encodedAttId = [Uri]::EscapeDataString($attId)
-            
-            $apiDownload = "$ApiBase/content/$encodedPageId/child/attachment/$encodedAttId/download"
-            $candidates.Add($apiDownload)
-
-            if ($null -ne $attV2) {
-                $v2DownloadCandidates = @()
-                try { $v2DownloadCandidates += [string]$attV2.downloadLink } catch {}
-                try { $v2DownloadCandidates += [string]$attV2._links.download } catch {}
-
-                foreach ($v2DownloadCandidate in $v2DownloadCandidates) {
-                    if ([string]::IsNullOrWhiteSpace($v2DownloadCandidate)) { continue }
-                    $resolvedV2Download = Resolve-ConfluenceUrl -BaseUrl $wikiRoot -PathOrUrl $v2DownloadCandidate
-                    if (-not [string]::IsNullOrWhiteSpace($resolvedV2Download)) {
-                        $candidates.Add($resolvedV2Download)
-                    }
-                }
-            }
-        }
-
-        if ($downloadPath -match '^https?://') {
-            $candidates.Add($downloadPath)
-        }
-        else {
-            $raw = $downloadPath
-            if (-not [string]::IsNullOrWhiteSpace($raw)) {
-                $resolved = Resolve-ConfluenceUrl -BaseUrl $confluenceRoot -PathOrUrl $raw
-                $candidates.Add($resolved)
-
-                if ($raw -match '^/download/') {
-                    $raw = "/wiki$raw"
-                }
-                elseif ($raw -match '^download/') {
-                    $raw = "/wiki/$raw"
-                }
-
-                if ($raw -ne $downloadPath) {
-                    $resolved = Resolve-ConfluenceUrl -BaseUrl $confluenceRoot -PathOrUrl $raw
-                    $candidates.Add($resolved)
-                }
-            }
-        }
-        
-        $uniqueCandidates = [System.Collections.Generic.List[string]]::new()
-        $seenCandidates = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
-        foreach ($candidate in $candidates) {
-            if ([string]::IsNullOrWhiteSpace($candidate)) { continue }
-            $normalized = $candidate.Trim()
-            if ($seenCandidates.Add($normalized)) {
-                $uniqueCandidates.Add($normalized)
-            }
-
-            # For Confluence-hosted attachment URLs, also try an explicit
-            # os_authType=basic variant. This avoids 302 login redirects on
-            # some tenants/endpoints while keeping CDN pre-signed URLs untouched.
-            try {
-                $candidateUri = [Uri]$normalized
-                $isTenantHost = Test-IsConfluenceTenantHost -HostName $candidateUri.Host
-                $looksLikeAttachmentPath = ($candidateUri.AbsolutePath -match '/wiki/download/' -or $candidateUri.AbsolutePath -match '/download/attachments/')
-                if ($isTenantHost -and $looksLikeAttachmentPath) {
-                    $basicCandidate = Add-OsAuthTypeBasic -Url $normalized
-                    if (-not [string]::IsNullOrWhiteSpace($basicCandidate)) {
-                        $basicNormalized = $basicCandidate.Trim()
-                        if ($seenCandidates.Add($basicNormalized)) {
-                            $uniqueCandidates.Add($basicNormalized)
-                        }
+                $u = [Uri]$downloadUrl
+                if ((Test-IsConfluenceTenantHost -HostName $u.Host) -and (Test-IsConfluenceAttachmentPath -Path $u.AbsolutePath)) {
+                    $basicUrl = Add-OsAuthTypeBasic -Url $downloadUrl
+                    if (-not [string]::IsNullOrWhiteSpace($basicUrl) -and $seenUrls.Add($basicUrl)) {
+                        $candidateUrls.Add($basicUrl)
                     }
                 }
             }
             catch {}
         }
 
-        foreach ($candidateUrl in $uniqueCandidates) {
+        foreach ($candidateUrl in $candidateUrls) {
             if ($downloaded) { break }
-            if ([string]::IsNullOrWhiteSpace($candidateUrl)) { continue }
+            if (Test-Path -LiteralPath $tempFile) { Remove-Item -LiteralPath $tempFile -Force -ErrorAction SilentlyContinue }
 
-            if (Test-Path -LiteralPath $tempFile) {
-                Remove-Item -LiteralPath $tempFile -Force -ErrorAction SilentlyContinue
-            }
+            $attempts = @(
+                @{ Label = 'auth-only';        Headers = $Headers; Session = $null    },
+                @{ Label = 'auth-and-session'; Headers = $Headers; Session = $Session },
+                @{ Label = 'session-only';     Headers = $null;    Session = $Session }
+            )
 
-            try {
-                # Invoke-FileDownload now follows the full redirect chain internally
-                # (Confluence → CDN pre-signed URL), stripping auth on CDN / cross-host
-                # hops automatically.  We only need to try different starting-auth modes
-                # in case the first mode is rejected by the server (e.g. 401/403).
-                $authModes = @(
-                    @{ Headers = $null;    Session = $Session },
-                    @{ Headers = $Headers; Session = $Session },
-                    @{ Headers = $null;    Session = $null },
-                    @{ Headers = $Headers; Session = $null }
-                )
-
-                $downloadResult = $null
-                foreach ($mode in $authModes) {
-                    $downloadResult = Invoke-FileDownload -Url $candidateUrl -OutFile $tempFile -Headers $mode.Headers -Session $mode.Session
-
-                    if ($downloadResult.Success) { break }
-
-                    # Auth-failure on the very first hop → try next mode.
-                    if ($downloadResult.StatusCode -in @(401, 403)) { continue }
-
-                    # Login redirect abort → try next mode.
-                    $errMsg = ''
-                    try { $errMsg = $downloadResult.Error.Message } catch {}
-                    if ($errMsg -match 'login') { continue }
-
-                    # A 302 that was not detected as a login redirect may require
-                    # session-cookie-only auth (e.g. Confluence Cloud inline images
-                    # whose /wiki/download/attachments/ endpoint ignores os_authType=basic
-                    # but honours the cloud.session.token cookie set during initial auth).
-                    # Continue to try the remaining auth modes, especially Headers=$null + Session.
-                    if ($downloadResult.StatusCode -eq 302) { continue }
-
-                    # Some media-backed attachments return 404 for header-auth modes
-                    # but succeed for session-only mode; keep trying auth variants.
-                    if ($downloadResult.StatusCode -eq 404) { continue }
-
-                    # Any other failure (400, timeout, redirect limit) → no point
-                    # retrying with different auth; break and move to next candidate.
-                    break
-                }
-
-                if ($null -eq $downloadResult -or -not $downloadResult.Success) {
-                    if ($null -ne $downloadResult) {
-                        $detail = "Attachment request failed status=$($downloadResult.StatusCode)"
-                        if (-not [string]::IsNullOrWhiteSpace([string]$downloadResult.Location)) {
-                            $detail += "; location=$([string]$downloadResult.Location)"
-                        }
-                        if ($null -ne $downloadResult.Error -and -not [string]::IsNullOrWhiteSpace([string]$downloadResult.Error.Message)) {
-                            $detail += "; error=$([string]$downloadResult.Error.Message)"
-                        }
-                        $detail += "; url=$candidateUrl"
-                        throw [System.Exception]::new($detail)
-                    }
-                    throw [System.Exception]::new('Attachment request failed without a response payload.')
-                }
-
-                if (Test-Path -LiteralPath $tempFile) {
-                    $size = (Get-Item -LiteralPath $tempFile).Length
-                    if ($size -gt 0 -and (Test-DownloadLooksValid -Path $tempFile -ExpectedExtension $ext)) {
-                        Finalize-DownloadedFile -TempPath $tempFile -DestinationPath $filePath
-                        $count++
-                        $totalBytes += $size
-                        $downloaded = $true
-                    }
-                    elseif ($size -gt 0) {
-                        $lastError = [System.Exception]::new('Downloaded content appears to be HTML or unauthorized response.')
-                    }
-                }
-            }
-            catch {
-                $lastError = $_
-            }
-        }
-        
-        # ── Invoke-WebRequest simple fallback ──
-        # Confluence Cloud media-backed attachments (newer uploads, .msg files,
-        # inline images from email) return HTTP 404 when the Authorization: Basic
-        # header is present — those endpoints ONLY accept session-cookie auth.
-        # We therefore try four auth combinations in priority order:
-        #   1. Session-only (no Authorization) for _links.download paths — this is
-        #      the correct auth mode for Atlassian media-service downloads.
-        #   2. Authorization + Session (works for legacy /download/attachments/ paths).
-        #   3. Authorization only.
-        #   4. Session only (covers any variant not caught by #1).
-        if (-not $downloaded) {
-            $confluenceRootFb = $WikiBase -replace '/wiki$', ''
-            $cleanDp = ''
-            if (-not [string]::IsNullOrWhiteSpace($downloadPath)) {
-                $cleanDp = $downloadPath -replace '[?&]os_authType=basic', '' -replace '\?&', '?' -replace '\?$', '' -replace '&&', '&'
-            }
-
-            # Build a resolved absolute URL from _links.download (used for attempts 1+2)
-            $resolvedDownloadUrl = $null
-            if (-not [string]::IsNullOrWhiteSpace($cleanDp)) {
-                if ($cleanDp -match '^https?://') {
-                    $resolvedDownloadUrl = $cleanDp
-                } else {
-                    $resolvedDownloadUrl = Resolve-ConfluenceUrl -BaseUrl $confluenceRootFb -PathOrUrl $cleanDp
-                    # Also try /wiki prefix if missing
-                    if ($cleanDp -match '^/download/' -and $cleanDp -notmatch '^/wiki/') {
-                        $resolvedDownloadUrl = Resolve-ConfluenceUrl -BaseUrl $confluenceRootFb -PathOrUrl ("/wiki" + $cleanDp)
-                    }
-                }
-            }
-
-            $wikiRootFb = if ($WikiBase -match '/wiki$') { $WikiBase.TrimEnd('/') } else { $WikiBase.TrimEnd('/') + '/wiki' }
-            $encodedPageIdFb = [Uri]::EscapeDataString($containerIdForDownload)
-            $encodedAttIdFb  = if (-not [string]::IsNullOrWhiteSpace($attId)) { [Uri]::EscapeDataString($attId) } else { '' }
-            $v1ApiUrl  = if (-not [string]::IsNullOrWhiteSpace($encodedAttIdFb)) { "$ApiBase/content/$encodedPageIdFb/child/attachment/$encodedAttIdFb/download" } else { $null }
-            $v2ApiUrl  = $null
-            if ($null -ne $attV2) {
-                $v2ApiCandidates = @()
-                try { $v2ApiCandidates += [string]$attV2.downloadLink } catch {}
-                try { $v2ApiCandidates += [string]$attV2._links.download } catch {}
-
-                foreach ($v2ApiCandidate in $v2ApiCandidates) {
-                    if ([string]::IsNullOrWhiteSpace($v2ApiCandidate)) { continue }
-                    $resolvedV2ApiCandidate = Resolve-ConfluenceUrl -BaseUrl $wikiRootFb -PathOrUrl $v2ApiCandidate
-                    if (-not [string]::IsNullOrWhiteSpace($resolvedV2ApiCandidate)) {
-                        $v2ApiUrl = $resolvedV2ApiCandidate
-                        break
-                    }
-                }
-            }
-
-            # Each attempt: [url, sendAuth (bool), sendSession (bool)]
-            # Priority: session-only on download URL first (media-backed attachments),
-            # then auth+session, then API URLs with auth.
-            $iwrAttempts = [System.Collections.Generic.List[object]]::new()
-
-            # Attempt 1: _links.download with session ONLY — fixes 404 on media-backed attachments
-            if (-not [string]::IsNullOrWhiteSpace($resolvedDownloadUrl) -and $null -ne $Session) {
-                $iwrAttempts.Add([PSCustomObject]@{ Url = $resolvedDownloadUrl; SendAuth = $false; SendSession = $true; Label = 'download-session-only' })
-            }
-
-            # Attempt 2: _links.download with Authorization + Session (legacy path)
-            if (-not [string]::IsNullOrWhiteSpace($resolvedDownloadUrl) -and $null -ne $Headers -and -not [string]::IsNullOrWhiteSpace([string]$Headers['Authorization'])) {
-                $iwrAttempts.Add([PSCustomObject]@{ Url = $resolvedDownloadUrl; SendAuth = $true; SendSession = $true; Label = 'download-auth+session' })
-                $iwrAttempts.Add([PSCustomObject]@{ Url = $resolvedDownloadUrl; SendAuth = $true; SendSession = $false; Label = 'download-auth-only' })
-            }
-
-            # Attempt 3: v1 REST API URL with session-only (media 404 fix)
-            if (-not [string]::IsNullOrWhiteSpace($v1ApiUrl) -and $null -ne $Session) {
-                $iwrAttempts.Add([PSCustomObject]@{ Url = $v1ApiUrl; SendAuth = $false; SendSession = $true; Label = 'v1api-session-only' })
-            }
-            # Attempt 4: v1 REST API with auth + session
-            if (-not [string]::IsNullOrWhiteSpace($v1ApiUrl) -and $null -ne $Headers -and -not [string]::IsNullOrWhiteSpace([string]$Headers['Authorization'])) {
-                $iwrAttempts.Add([PSCustomObject]@{ Url = $v1ApiUrl; SendAuth = $true; SendSession = $true; Label = 'v1api-auth+session' })
-            }
-
-            # Attempt 5: v2 API URL with session-only then auth
-            if (-not [string]::IsNullOrWhiteSpace($v2ApiUrl)) {
-                if ($null -ne $Session) {
-                    $iwrAttempts.Add([PSCustomObject]@{ Url = $v2ApiUrl; SendAuth = $false; SendSession = $true; Label = 'v2api-session-only' })
-                }
-                if ($null -ne $Headers -and -not [string]::IsNullOrWhiteSpace([string]$Headers['Authorization'])) {
-                    $iwrAttempts.Add([PSCustomObject]@{ Url = $v2ApiUrl; SendAuth = $true; SendSession = $true; Label = 'v2api-auth+session' })
-                }
-            }
-
-            $seenIwr = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
-            foreach ($attempt in $iwrAttempts) {
+            foreach ($attempt in $attempts) {
                 if ($downloaded) { break }
-                $iwrUrl = $attempt.Url
-                if ([string]::IsNullOrWhiteSpace($iwrUrl)) { continue }
-                # Deduplicate on url+auth combination
-                $dedupeKey = "$($attempt.SendAuth):$($attempt.SendSession):$iwrUrl"
-                if (-not $seenIwr.Add($dedupeKey)) { continue }
-
-                if (Test-Path -LiteralPath $tempFile) {
-                    Remove-Item -LiteralPath $tempFile -Force -ErrorAction SilentlyContinue
-                }
-
+                if (Test-Path -LiteralPath $tempFile) { Remove-Item -LiteralPath $tempFile -Force -ErrorAction SilentlyContinue }
                 try {
-                    $iwrParams = @{
-                        Uri                = $iwrUrl
-                        Method             = 'Get'
-                        OutFile            = $tempFile
-                        UseBasicParsing    = $true
-                        MaximumRedirection = 25
-                        ErrorAction        = 'Stop'
+                    $result = Invoke-FileDownload -Url $candidateUrl -OutFile $tempFile -Headers $attempt.Headers -Session $attempt.Session
+                    if (-not $result.Success) {
+                        $msg = "Attempt $($attempt.Label) failed. Status=$($result.StatusCode)."
+                        if (-not [string]::IsNullOrWhiteSpace([string]$result.Location)) { $msg += " Location=$($result.Location)." }
+                        if ($null -ne $result.Error -and -not [string]::IsNullOrWhiteSpace([string]$result.Error.Message)) { $msg += " Error=$($result.Error.Message)." }
+                        $lastError = [System.Exception]::new($msg)
+                        continue
                     }
-                    if ($attempt.SendAuth -and $null -ne $Headers -and -not [string]::IsNullOrWhiteSpace([string]$Headers['Authorization'])) {
-                        $iwrParams.Headers = @{ Authorization = $Headers['Authorization'] }
-                    }
-                    if ($attempt.SendSession -and $null -ne $Session) {
-                        $iwrParams.WebSession = $Session
-                    }
-                    Invoke-WebRequest @iwrParams | Out-Null
-
                     if (Test-Path -LiteralPath $tempFile) {
-                        $iwrSize = (Get-Item -LiteralPath $tempFile).Length
-                        if ($iwrSize -gt 0 -and (Test-DownloadLooksValid -Path $tempFile -ExpectedExtension $ext)) {
+                        $size = (Get-Item -LiteralPath $tempFile).Length
+                        if ($size -gt 0 -and (Test-DownloadLooksValid -Path $tempFile -ExpectedExtension $ext)) {
                             Finalize-DownloadedFile -TempPath $tempFile -DestinationPath $filePath
-                            $count++
-                            $totalBytes += $iwrSize
-                            $downloaded = $true
+                            $count++; $totalBytes += $size; $downloaded = $true; break
                         }
-                        elseif ($iwrSize -gt 0) {
-                            # Got content but failed validation — could be error HTML
-                            $lastError = [System.Exception]::new("IWR attempt '$($attempt.Label)' returned non-file content ($iwrSize bytes)")
-                        }
+                        if ($size -gt 0) { $lastError = [System.Exception]::new("Attempt $($attempt.Label) returned non-file content.") }
+                        else { $lastError = [System.Exception]::new("Attempt $($attempt.Label) produced an empty file.") }
                     }
+                    else { $lastError = [System.Exception]::new("Attempt $($attempt.Label) did not produce a file.") }
                 }
-                catch {
-                    $lastError = $_
-                }
+                catch { $lastError = $_ }
             }
         }
 
         if (-not $downloaded) {
             $failCount++
+            $msg = 'Attachment download failed.'
             if ($null -ne $lastError) {
-                $msg = ''
-                if ($lastError -is [System.Management.Automation.ErrorRecord]) {
-                    $msg = $lastError.Exception.Message
-                }
-                elseif ($lastError -is [System.Exception]) {
-                    $msg = $lastError.Message
-                }
-                else {
-                    $msg = [string]$lastError
-                }
-                if (-not [string]::IsNullOrWhiteSpace($msg)) {
-                    $msg = $msg.Trim()
-                }
-                if ($msg -match '404|Not Found') {
-                    Write-Host ("     ! Attachment 404 [{0}]: {1}" -f $attTitle, $msg) -ForegroundColor DarkGray
-                } else {
-                    $errType = ''
-                    try {
-                        if ($lastError -is [System.Management.Automation.ErrorRecord]) {
-                            $errType = $lastError.Exception.GetType().FullName
-                        }
-                        elseif ($lastError -is [System.Exception]) {
-                            $errType = $lastError.GetType().FullName
-                        }
-                    }
-                    catch {
-                        $errType = ''
-                    }
-
-                    if ([string]::IsNullOrWhiteSpace($errType)) {
-                        Write-Host ("     ! Attachment download failed [{0}]: {1}" -f $attTitle, $msg) -ForegroundColor DarkYellow
-                    }
-                    else {
-                        Write-Host ("     ! Attachment download failed [{0}] ({1}): {2}" -f $attTitle, $errType, $msg) -ForegroundColor DarkYellow
-                    }
-                }
-
-                $failures.Add([PSCustomObject]@{
-                    pageId = $PageId
-                    attachmentId = $attId
-                    title = $attTitle
-                    download = $downloadPath
-                    reason = $msg
-                }) | Out-Null
+                if ($lastError -is [System.Management.Automation.ErrorRecord]) { $msg = $lastError.Exception.Message }
+                elseif ($lastError -is [System.Exception]) { $msg = $lastError.Message }
+                else { $msg = [string]$lastError }
             }
+            Write-Host ("     ! Attachment download failed [{0}]: {1}" -f $attTitle, $msg) -ForegroundColor DarkYellow
+            $failures.Add([PSCustomObject]@{
+                pageId       = $PageId
+                attachmentId = $attId
+                title        = $attTitle
+                download     = $downloadPath
+                reason       = $msg
+            }) | Out-Null
         }
-        
-        if (Test-Path -LiteralPath $tempFile) {
-            Remove-Item -LiteralPath $tempFile -Force -ErrorAction SilentlyContinue
-        }
+
+        if (Test-Path -LiteralPath $tempFile) { Remove-Item -LiteralPath $tempFile -Force -ErrorAction SilentlyContinue }
     }
 
     if ($count -eq 0) {
         Remove-Item -LiteralPath $attachmentFolder -Recurse -Force -ErrorAction SilentlyContinue
-        return [PSCustomObject]@{ Count = 0; Failed = $failCount; Attempted = ($count + $failCount); Bytes = [long]0; Path = $null; Failures = @($failures) }
+        return [PSCustomObject]@{
+            Count     = 0
+            Failed    = $failCount
+            Attempted = ($count + $failCount)
+            Bytes     = [long]0
+            Path      = $null
+            Failures  = @($failures)
+        }
     }
 
-    return [PSCustomObject]@{ Count = $count; Failed = $failCount; Attempted = ($count + $failCount); Bytes = $totalBytes; Path = $attachmentFolder; Failures = @($failures) }
+    return [PSCustomObject]@{
+        Count     = $count
+        Failed    = $failCount
+        Attempted = ($count + $failCount)
+        Bytes     = $totalBytes
+        Path      = $attachmentFolder
+        Failures  = @($failures)
+    }
 }
 
 $wikiBase = Get-WikiBaseUrl -BaseUrl $ConfluenceBaseUrl
