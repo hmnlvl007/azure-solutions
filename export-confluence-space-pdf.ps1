@@ -595,6 +595,39 @@ function Resolve-ConfluenceUrl {
     }
 }
 
+function Get-AttachmentV2Metadata {
+    param(
+        [Parameter(Mandatory)][string]$WikiBase,
+        [Parameter(Mandatory)][string]$AttachmentId,
+        [hashtable]$Headers,
+        [Microsoft.PowerShell.Commands.WebRequestSession]$Session
+    )
+
+    if ([string]::IsNullOrWhiteSpace($AttachmentId)) { return $null }
+
+    $wikiRoot = if ($WikiBase -match '/wiki$') { $WikiBase.TrimEnd('/') } else { $WikiBase.TrimEnd('/') + '/wiki' }
+    $uri = "$wikiRoot/api/v2/attachments/$([Uri]::EscapeDataString($AttachmentId))"
+
+    $irmParams = @{
+        Uri = $uri
+        Method = 'Get'
+        ErrorAction = 'Stop'
+    }
+    if ($null -ne $Headers) {
+        $irmParams.Headers = $Headers
+    }
+    if ($null -ne $Session) {
+        $irmParams.WebSession = $Session
+    }
+
+    try {
+        return (Invoke-RestMethod @irmParams)
+    }
+    catch {
+        return $null
+    }
+}
+
 function Test-IsCdnHost {
     # Returns $true for known CDN / object-storage hosts whose pre-signed URLs
     # must NOT carry an Authorization header (adding one causes a 400/403 from S3
@@ -1382,6 +1415,25 @@ function Save-Attachments {
         $attTitle = [string]$item.title
         $attId = ''
         try { $attId = [string]$item.id } catch { $attId = '' }
+        $attV2 = $null
+        $containerIdForDownload = $PageId
+        if (-not [string]::IsNullOrWhiteSpace($attId)) {
+            $attV2 = Get-AttachmentV2Metadata -WikiBase $WikiBase -AttachmentId $attId -Headers $Headers -Session $Session
+
+            if ($null -ne $attV2) {
+                $containerCandidates = @()
+                try { $containerCandidates += [string]$attV2.pageId } catch {}
+                try { $containerCandidates += [string]$attV2.blogPostId } catch {}
+                try { $containerCandidates += [string]$attV2.customContentId } catch {}
+
+                foreach ($candidateContainerId in $containerCandidates) {
+                    if (-not [string]::IsNullOrWhiteSpace($candidateContainerId)) {
+                        $containerIdForDownload = $candidateContainerId
+                        break
+                    }
+                }
+            }
+        }
 
         # Preserve the file extension from the title so the saved file opens correctly
         $ext = [IO.Path]::GetExtension($attTitle)   # e.g. ".pdf" or ""
@@ -1401,7 +1453,7 @@ function Save-Attachments {
         # auth-stripping on CDN / cross-host hops.
         # Do NOT append os_authType=basic here – the REST API uses the Authorization header.
         if (-not [string]::IsNullOrWhiteSpace($attId)) {
-            $encodedPageIdDirect = [Uri]::EscapeDataString($PageId)
+            $encodedPageIdDirect = [Uri]::EscapeDataString($containerIdForDownload)
             $encodedAttIdDirect = [Uri]::EscapeDataString($attId)
             $directApiUrl = "$ApiBase/content/$encodedPageIdDirect/child/attachment/$encodedAttIdDirect/download"
             try {
@@ -1451,15 +1503,25 @@ function Save-Attachments {
             else { $wikiRoot = ($WikiBase.TrimEnd('/') + '/wiki') }
 
             # Use URI encoding for IDs to handle edge cases with special characters
-            $encodedPageId = [Uri]::EscapeDataString($PageId)
+            $encodedPageId = [Uri]::EscapeDataString($containerIdForDownload)
             $encodedAttId = [Uri]::EscapeDataString($attId)
             
             $apiDownload = "$ApiBase/content/$encodedPageId/child/attachment/$encodedAttId/download"
             $candidates.Add($apiDownload)
 
-            # Confluence Cloud v2 download endpoint fallback (often avoids v1 attachment 403s).
-            $v2Download = "$wikiRoot/api/v2/attachments/$encodedAttId/download"
-            $candidates.Add($v2Download)
+            if ($null -ne $attV2) {
+                $v2DownloadCandidates = @()
+                try { $v2DownloadCandidates += [string]$attV2.downloadLink } catch {}
+                try { $v2DownloadCandidates += [string]$attV2._links.download } catch {}
+
+                foreach ($v2DownloadCandidate in $v2DownloadCandidates) {
+                    if ([string]::IsNullOrWhiteSpace($v2DownloadCandidate)) { continue }
+                    $resolvedV2Download = Resolve-ConfluenceUrl -BaseUrl $wikiRoot -PathOrUrl $v2DownloadCandidate
+                    if (-not [string]::IsNullOrWhiteSpace($resolvedV2Download)) {
+                        $candidates.Add($resolvedV2Download)
+                    }
+                }
+            }
         }
 
         if ($downloadPath -match '^https?://') {
@@ -1629,10 +1691,24 @@ function Save-Attachments {
             }
 
             $wikiRootFb = if ($WikiBase -match '/wiki$') { $WikiBase.TrimEnd('/') } else { $WikiBase.TrimEnd('/') + '/wiki' }
-            $encodedPageIdFb = [Uri]::EscapeDataString($PageId)
+            $encodedPageIdFb = [Uri]::EscapeDataString($containerIdForDownload)
             $encodedAttIdFb  = if (-not [string]::IsNullOrWhiteSpace($attId)) { [Uri]::EscapeDataString($attId) } else { '' }
             $v1ApiUrl  = if (-not [string]::IsNullOrWhiteSpace($encodedAttIdFb)) { "$ApiBase/content/$encodedPageIdFb/child/attachment/$encodedAttIdFb/download" } else { $null }
-            $v2ApiUrl  = if (-not [string]::IsNullOrWhiteSpace($encodedAttIdFb)) { "$wikiRootFb/api/v2/attachments/$encodedAttIdFb/download" } else { $null }
+            $v2ApiUrl  = $null
+            if ($null -ne $attV2) {
+                $v2ApiCandidates = @()
+                try { $v2ApiCandidates += [string]$attV2.downloadLink } catch {}
+                try { $v2ApiCandidates += [string]$attV2._links.download } catch {}
+
+                foreach ($v2ApiCandidate in $v2ApiCandidates) {
+                    if ([string]::IsNullOrWhiteSpace($v2ApiCandidate)) { continue }
+                    $resolvedV2ApiCandidate = Resolve-ConfluenceUrl -BaseUrl $wikiRootFb -PathOrUrl $v2ApiCandidate
+                    if (-not [string]::IsNullOrWhiteSpace($resolvedV2ApiCandidate)) {
+                        $v2ApiUrl = $resolvedV2ApiCandidate
+                        break
+                    }
+                }
+            }
 
             # Each attempt: [url, sendAuth (bool), sendSession (bool)]
             # Priority: session-only on download URL first (media-backed attachments),
