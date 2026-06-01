@@ -89,36 +89,13 @@ CREATE EVENT SESSION [XE_DML_ServiceAccount] ON SERVER
             -- Restrict to DML and SELECT keywords in the statement text.
             -- sql_statement_completed exposes the statement as the "statement" data field.
             AND (
-                    sqlserver.like_i_sql_unicode_string(N'%INSERT%')
-                 OR sqlserver.like_i_sql_unicode_string(N'%UPDATE%')
-                 OR sqlserver.like_i_sql_unicode_string(N'%DELETE%')
-                 OR sqlserver.like_i_sql_unicode_string(N'%SELECT%')
+                    sqlserver.like_i_sql_unicode_string([statement], N'%INSERT%')
+                 OR sqlserver.like_i_sql_unicode_string([statement], N'%UPDATE%')
+                 OR sqlserver.like_i_sql_unicode_string([statement], N'%DELETE%')
+                 OR sqlserver.like_i_sql_unicode_string([statement], N'%SELECT%')
             )
         )
     ),
-
-    -- Also capture RPC calls (sp_executesql, ODBC parameterised queries, etc.)
-    -- which bypass sql_statement_completed in some driver configurations.
-    ADD EVENT sqlserver.rpc_completed (
-        ACTION (
-            sqlserver.server_principal_name,
-            sqlserver.database_name,
-            sqlserver.client_app_name,
-            sqlserver.client_hostname,
-            sqlserver.session_id,
-            sqlserver.sql_text,
-            sqlserver.transaction_id
-        )
-        WHERE (
-            sqlserver.server_principal_name = N'DOMAIN\svc_accountname'  -- ← CHANGE ME
-            AND (
-                    sqlserver.like_i_sql_unicode_string(N'%INSERT%')
-                 OR sqlserver.like_i_sql_unicode_string(N'%UPDATE%')
-                 OR sqlserver.like_i_sql_unicode_string(N'%DELETE%')
-                 OR sqlserver.like_i_sql_unicode_string(N'%SELECT%')
-            )
-        )
-    )
 
     ADD TARGET package0.event_file (
         SET filename            = N'D:\SQLXE\DML_SvcAccount',          -- ← CHANGE ME (same as @xe_file_path)
@@ -178,7 +155,6 @@ SELECT
     x.xd.value('(event/action[@name="session_id"]/value)[1]',              'int')            AS session_id,
     x.xd.value('(event/action[@name="transaction_id"]/value)[1]',          'bigint')         AS transaction_id,
     -- sql_statement_completed stores the statement in the "statement" data field.
-    -- rpc_completed stores it in "statement" as well (procedure call text).
     x.xd.value('(event/data[@name="statement"]/value)[1]',                 'nvarchar(max)')  AS statement_text,
     -- Duration in microseconds (divide by 1000 for ms):
     x.xd.value('(event/data[@name="duration"]/value)[1]',                  'bigint')         AS duration_us,
