@@ -1363,6 +1363,7 @@ function Save-Attachments {
         [string]$ApiBase,
         [string]$WikiBase,
         [string]$PageId,
+        [string]$PageTitle = '',
         [hashtable]$Headers,
         [Microsoft.PowerShell.Commands.WebRequestSession]$Session,
         [string]$PageFolder,
@@ -1374,6 +1375,7 @@ function Save-Attachments {
 
     $items = [System.Collections.Generic.List[object]]::new()
     $failures = [System.Collections.Generic.List[object]]::new()
+    $savedItems = [System.Collections.Generic.List[PSCustomObject]]::new()
     $count = 0
     $failCount = 0
     $totalBytes = [long]0
@@ -1680,6 +1682,7 @@ function Save-Attachments {
                         if ($iwrSize -gt 0 -and (Test-DownloadLooksValid -Path $tempFile -ExpectedExtension $ext)) {
                             Finalize-DownloadedFile -TempPath $tempFile -DestinationPath $filePath
                             $count++; $totalBytes += $iwrSize; $downloaded = $true
+                            $savedItems.Add([PSCustomObject]@{ OriginalName = $attTitle; SavedName = $fileName }) | Out-Null
                         } elseif ($iwrSize -gt 0) {
                             $lastError = [System.Exception]::new("IWR attempt '$($attempt.Label)' returned non-file content ($iwrSize bytes)")
                         }
@@ -1729,6 +1732,37 @@ function Save-Attachments {
             Failures  = @($failures)
         }
     }
+
+    # Write an _index.html so SharePoint/Copilot can discover and relate
+    # these attachment files back to their parent Confluence page.
+    try {
+        $idxPath = Join-Path -Path $attachmentFolder -ChildPath '_index.html'
+        $safePageTitle = if ([string]::IsNullOrWhiteSpace($PageTitle)) { "Page $PageId" } else { [System.Net.WebUtility]::HtmlEncode($PageTitle) }
+        $rowsHtml = ($savedItems | ForEach-Object {
+            $orig = [System.Net.WebUtility]::HtmlEncode($_.OriginalName)
+            $saved = [System.Net.WebUtility]::HtmlEncode($_.SavedName)
+            "<tr><td>$orig</td><td><a href=`"$saved`">$saved</a></td></tr>"
+        }) -join "`n"
+        $idxHtml = @"
+<!DOCTYPE html>
+<html lang="en">
+<head><meta charset="utf-8" /><title>Attachments: $safePageTitle</title>
+<style>body{font-family:Segoe UI,Arial,sans-serif;max-width:900px;margin:24px auto;color:#172B4D}
+table{border-collapse:collapse;width:100%}th,td{border:1px solid #C1C7D0;padding:6px 10px;text-align:left}
+th{background:#F4F5F7;font-weight:600}</style></head>
+<body>
+<h1>Attachments: $safePageTitle</h1>
+<p>Confluence page ID: $PageId</p>
+<p>This folder contains $count attachment(s) exported from the Confluence page above.</p>
+<table><thead><tr><th>Original attachment name</th><th>Saved filename</th></tr></thead>
+<tbody>
+$rowsHtml
+</tbody></table>
+</body></html>
+"@
+        [IO.File]::WriteAllText($idxPath, $idxHtml, [Text.Encoding]::UTF8)
+    }
+    catch {}
 
     return [PSCustomObject]@{
         Count     = $count
@@ -1927,7 +1961,7 @@ foreach ($page in $pages) {
     Write-Host ("  OK {0} | {1:N0} KB" -f $format.ToUpper(), ($fileSize / 1KB)) -ForegroundColor Green
 
     try {
-        $attachmentInfo = Save-Attachments -ApiBase $apiBase -WikiBase $wikiBase -PageId $pageId -Headers $headers -Session $session -PageFolder $folder -BaseFilePath $destPath
+        $attachmentInfo = Save-Attachments -ApiBase $apiBase -WikiBase $wikiBase -PageId $pageId -PageTitle $pageTitle -Headers $headers -Session $session -PageFolder $folder -BaseFilePath $destPath
     }
     catch {
         $attachmentInfo = [PSCustomObject]@{ Count = 0; Failed = 1; Attempted = 1; Bytes = [long]0; Path = $null; Failures = @() }
