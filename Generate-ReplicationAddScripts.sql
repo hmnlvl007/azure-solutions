@@ -1,22 +1,21 @@
 -- ============================================================
 -- Generate sp_addarticle + sp_addsubscription from replication metadata
 -- ============================================================
--- Run on the PUBLISHER that can also reach the distribution DB
--- (standard topology: publisher is configured to access distributor).
+-- RUN ON: DISTRIBUTOR
+--   All data is sourced entirely from the distribution database
+--   (MSarticles, MSpublications, MSsubscriptions, MSreplservers).
+--   No access to publisher DBs or linked servers is required.
 --
 -- WHAT THIS DOES
 --   1) Resolves every publication each input article belongs to
---      by querying the distribution database.
---   2) Fetches full article parameters from MSarticles on the distribution DB
+--      (MSarticles / MSpublications).
+--   2) Fetches full article parameters from MSarticles
 --      (type, status, pre_creation_cmd, schema_option, ins_cmd, upd_cmd,
 --       del_cmd, creation_script, description, identityrangemanagementoption,
---       vertical_partition) -- avoids dependency on sysarticles which only
---      exists in actively-configured publisher databases.
+--       vertical_partition, destination_object, destination_owner).
 --   3) Resolves all subscriptions from MSsubscriptions.
 --   4) Emits correctly parameterized sp_addarticle + sp_addsubscription
 --      matching SSMS-generated script format.
---
--- RUN ON: Publisher (has access to both publisher DBs and distribution DB)
 -- ============================================================
 
 SET NOCOUNT ON;
@@ -115,18 +114,17 @@ BEGIN
 END;
 
 /* ------------------------------------------------------------
-   STAGE 2: Fetch full article parameters from the distribution DB
-             (MSarticles) -- avoids dependency on sysarticles /
-             syspublications on each publisher DB, which only exist
-             when the database is actively configured as a publisher.
+   STAGE 2: Fetch full article parameters from MSarticles in the
+             distribution DB.  All required columns are stored there;
+             no access to the publisher DB is needed.
    ------------------------------------------------------------ */
 CREATE TABLE #ArticleDetail
 (
     publisher_db                    SYSNAME       NOT NULL,
     publication                     SYSNAME       NOT NULL,
     article                         SYSNAME       NOT NULL,
-    article_type                    TINYINT       NULL,  -- MSarticles.type
-    article_status                  TINYINT       NULL,  -- MSarticles.status
+    article_type                    TINYINT       NULL,
+    article_status                  TINYINT       NULL,
     description                     NVARCHAR(255) NULL,
     creation_script                 NVARCHAR(255) NULL,
     pre_creation_cmd                TINYINT       NULL,
@@ -134,8 +132,8 @@ CREATE TABLE #ArticleDetail
     ins_cmd                         NVARCHAR(255) NULL,
     upd_cmd                         NVARCHAR(255) NULL,
     del_cmd                         NVARCHAR(255) NULL,
-    dest_object                     SYSNAME       NULL,  -- MSarticles.dest_object
-    dest_owner                      SYSNAME       NULL,  -- MSarticles.dest_owner
+    dest_object                     SYSNAME       NULL,
+    dest_owner                      SYSNAME       NULL,
     vertical_partition              BIT           NULL,
     identityrangemanagementoption   INT           NULL
 );
@@ -152,17 +150,17 @@ SELECT
     ra.publisher_db,
     ra.publication,
     ra.article,
-    ma.type                             AS article_type,
-    ma.status                           AS article_status,
+    ma.type                  AS article_type,
+    ma.status                AS article_status,
     ma.description,
     ma.creation_script,
     ma.pre_creation_cmd,
-    CONVERT(BINARY(8), ma.schema_option) AS schema_option,
+    ma.schema_option,
     ma.ins_cmd,
     ma.upd_cmd,
     ma.del_cmd,
-    ma.dest_object,
-    ma.dest_owner,
+    ma.destination_object    AS dest_object,
+    ma.destination_owner     AS dest_owner,
     ma.vertical_partition,
     ma.identityrangemanagementoption
 FROM #ResolvedArticles ra
