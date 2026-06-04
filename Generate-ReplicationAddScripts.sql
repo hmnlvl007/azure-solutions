@@ -7,10 +7,11 @@
 -- WHAT THIS DOES
 --   1) Resolves every publication each input article belongs to
 --      by querying the distribution database.
---   2) Fetches full article parameters from sysarticles on the publisher DB
+--   2) Fetches full article parameters from MSarticles on the distribution DB
 --      (type, status, pre_creation_cmd, schema_option, ins_cmd, upd_cmd,
 --       del_cmd, creation_script, description, identityrangemanagementoption,
---       vertical_partition).
+--       vertical_partition) -- avoids dependency on sysarticles which only
+--      exists in actively-configured publisher databases.
 --   3) Resolves all subscriptions from MSsubscriptions.
 --   4) Emits correctly parameterized sp_addarticle + sp_addsubscription
 --      matching SSMS-generated script format.
@@ -114,16 +115,18 @@ BEGIN
 END;
 
 /* ------------------------------------------------------------
-   STAGE 2: Fetch full article parameters from sysarticles
-             on each publisher DB (cursor per unique publisher_db)
+   STAGE 2: Fetch full article parameters from the distribution DB
+             (MSarticles) -- avoids dependency on sysarticles /
+             syspublications on each publisher DB, which only exist
+             when the database is actively configured as a publisher.
    ------------------------------------------------------------ */
 CREATE TABLE #ArticleDetail
 (
     publisher_db                    SYSNAME       NOT NULL,
     publication                     SYSNAME       NOT NULL,
     article                         SYSNAME       NOT NULL,
-    article_type                    TINYINT       NULL,  -- sysarticles.type
-    article_status                  TINYINT       NULL,  -- sysarticles.status
+    article_type                    TINYINT       NULL,  -- MSarticles.type
+    article_status                  TINYINT       NULL,  -- MSarticles.status
     description                     NVARCHAR(255) NULL,
     creation_script                 NVARCHAR(255) NULL,
     pre_creation_cmd                TINYINT       NULL,
@@ -131,63 +134,43 @@ CREATE TABLE #ArticleDetail
     ins_cmd                         NVARCHAR(255) NULL,
     upd_cmd                         NVARCHAR(255) NULL,
     del_cmd                         NVARCHAR(255) NULL,
-    dest_object                     SYSNAME       NULL,  -- sysarticles.dest_object
-    dest_owner                      SYSNAME       NULL,  -- sysarticles.dest_owner
+    dest_object                     SYSNAME       NULL,  -- MSarticles.dest_object
+    dest_owner                      SYSNAME       NULL,  -- MSarticles.dest_owner
     vertical_partition              BIT           NULL,
     identityrangemanagementoption   INT           NULL
 );
 
-DECLARE @pub_db SYSNAME;
+DECLARE @Sql2 NVARCHAR(MAX) = N'
+INSERT INTO #ArticleDetail
+(
+    publisher_db, publication, article,
+    article_type, article_status, description, creation_script,
+    pre_creation_cmd, schema_option, ins_cmd, upd_cmd, del_cmd,
+    dest_object, dest_owner, vertical_partition, identityrangemanagementoption
+)
+SELECT
+    ra.publisher_db,
+    ra.publication,
+    ra.article,
+    ma.type                             AS article_type,
+    ma.status                           AS article_status,
+    ma.description,
+    ma.creation_script,
+    ma.pre_creation_cmd,
+    CONVERT(BINARY(8), ma.schema_option) AS schema_option,
+    ma.ins_cmd,
+    ma.upd_cmd,
+    ma.del_cmd,
+    ma.dest_object,
+    ma.dest_owner,
+    ma.vertical_partition,
+    ma.identityrangemanagementoption
+FROM #ResolvedArticles ra
+JOIN ' + QUOTENAME(@DistributionDB) + N'.dbo.MSarticles ma
+  ON  ma.publication_id = ra.publication_id
+ AND  ma.article_id     = ra.article_id;';
 
-DECLARE cur_pubdb CURSOR LOCAL FAST_FORWARD FOR
-    SELECT DISTINCT publisher_db FROM #ResolvedArticles;
-
-OPEN cur_pubdb;
-FETCH NEXT FROM cur_pubdb INTO @pub_db;
-
-WHILE @@FETCH_STATUS = 0
-BEGIN
-    DECLARE @Sql2 NVARCHAR(MAX) = N'
-    SELECT
-        ra.publisher_db,
-        ra.publication,
-        ra.article,
-        sa.type              AS article_type,
-        sa.status            AS article_status,
-        sa.description,
-        sa.creation_script,
-        sa.pre_creation_cmd,
-        sa.schema_option,
-        sa.ins_cmd,
-        sa.upd_cmd,
-        sa.del_cmd,
-        sa.dest_object,
-        sa.dest_owner,
-        sa.vertical_partition,
-        sa.identityrangemanagementoption
-    FROM ' + QUOTENAME(@pub_db) + N'.dbo.sysarticles sa
-    JOIN ' + QUOTENAME(@pub_db) + N'.dbo.syspublications sp
-      ON sp.pubid = sa.pubid
-    JOIN #ResolvedArticles ra
-      ON ra.article = sa.name
-     AND ra.publication = sp.name
-     AND ra.publisher_db = N''' + REPLACE(@pub_db, N'''', N'''''') + N''';';
-
-    INSERT INTO #ArticleDetail
-    (
-        publisher_db, publication, article,
-        article_type, article_status, description, creation_script,
-        pre_creation_cmd, schema_option, ins_cmd, upd_cmd, del_cmd,
-        dest_object, dest_owner, vertical_partition, identityrangemanagementoption
-    )
-    DECLARE @ExecSql2 NVARCHAR(MAX) = N'EXECUTE ' + QUOTENAME(@pub_db) + N'..sp_executesql @stmt';
-    EXEC sys.sp_executesql @ExecSql2, N'@stmt NVARCHAR(MAX)', @stmt = @Sql2;
-
-    FETCH NEXT FROM cur_pubdb INTO @pub_db;
-END;
-
-CLOSE cur_pubdb;
-DEALLOCATE cur_pubdb;
+EXEC sys.sp_executesql @Sql2;
 
 /* ------------------------------------------------------------
    STAGE 3: Resolve subscriptions from distributor
