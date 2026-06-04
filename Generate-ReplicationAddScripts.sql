@@ -138,31 +138,20 @@ CREATE TABLE #ArticleDetail
     identityrangemanagementoption   INT           NULL
 );
 
+-- MSarticles only stores destination_object, destination_owner, and description.
+-- All other article detail columns (type, status, ins_cmd, upd_cmd, del_cmd,
+-- schema_option, pre_creation_cmd, creation_script, vertical_partition,
+-- identityrangemanagementoption) do NOT exist in the distribution DB.
+-- They remain NULL here; Stage 4 ISNULL defaults produce correct sp_addarticle output.
 DECLARE @Sql2 NVARCHAR(MAX) = N'
-INSERT INTO #ArticleDetail
-(
-    publisher_db, publication, article,
-    article_type, article_status, description, creation_script,
-    pre_creation_cmd, schema_option, ins_cmd, upd_cmd, del_cmd,
-    dest_object, dest_owner, vertical_partition, identityrangemanagementoption
-)
+INSERT INTO #ArticleDetail (publisher_db, publication, article, description, dest_object, dest_owner)
 SELECT
     ra.publisher_db,
     ra.publication,
     ra.article,
-    ma.type                  AS article_type,
-    ma.status                AS article_status,
     ma.description,
-    ma.creation_script,
-    ma.pre_creation_cmd,
-    ma.schema_option,
-    ma.ins_cmd,
-    ma.upd_cmd,
-    ma.del_cmd,
-    ma.destination_object    AS dest_object,
-    ma.destination_owner     AS dest_owner,
-    ma.vertical_partition,
-    ma.identityrangemanagementoption
+    ma.destination_object,
+    ma.destination_owner
 FROM #ResolvedArticles ra
 JOIN ' + QUOTENAME(@DistributionDB) + N'.dbo.MSarticles ma
   ON  ma.publication_id = ra.publication_id
