@@ -180,7 +180,8 @@ BEGIN
         pre_creation_cmd, schema_option, ins_cmd, upd_cmd, del_cmd,
         dest_object, dest_owner, vertical_partition, identityrangemanagementoption
     )
-    EXEC sys.sp_executesql @Sql2;
+    DECLARE @ExecSql2 NVARCHAR(MAX) = N'EXECUTE ' + QUOTENAME(@pub_db) + N'..sp_executesql @stmt';
+    EXEC sys.sp_executesql @ExecSql2, N'@stmt NVARCHAR(MAX)', @stmt = @Sql2;
 
     FETCH NEXT FROM cur_pubdb INTO @pub_db;
 END;
@@ -200,8 +201,8 @@ CREATE TABLE #ResolvedSubs
     destination_db    SYSNAME NULL,
     subscription_type INT     NULL,  -- 0=push, 1=pull, 2=anonymous
     sync_type         INT     NULL,  -- 1=automatic, 2=replication support only, 3=init with backup, 4=none
-    update_mode       INT     NULL,  -- 0=read only, 1=sync tran, 2=queued tran
-    subscriber_type   INT     NULL   -- 0=MSSQL, 1=ODBC, 3=OLE-DB
+    update_mode       INT     NULL   -- 0=read only, 1=sync tran, 2=queued tran
+    -- subscriber_type removed: column no longer exists in MSsubscriptions (SQL Server 2019)
 );
 
 DECLARE @Sql3 NVARCHAR(MAX) = N'
@@ -213,8 +214,7 @@ SELECT
     s.subscriber_db AS destination_db,
     s.subscription_type,
     s.sync_type,
-    s.update_mode,
-    s.subscriber_type
+    s.update_mode
 FROM ' + QUOTENAME(@DistributionDB) + N'.dbo.MSsubscriptions s
 JOIN ' + QUOTENAME(@DistributionDB) + N'.dbo.MSarticles a
   ON a.article_id = s.article_id
@@ -230,7 +230,7 @@ WHERE srv.srvname IS NOT NULL
 
 INSERT INTO #ResolvedSubs
     (publisher_db, publication, article, subscriber_name, destination_db,
-     subscription_type, sync_type, update_mode, subscriber_type)
+     subscription_type, sync_type, update_mode)
 EXEC sys.sp_executesql @Sql3;
 
 /* ------------------------------------------------------------
@@ -349,13 +349,12 @@ SELECT
             WHEN 3 THEN N'failover'
             WHEN 4 THEN N'queued failover'
             ELSE N'read only'
-        END + N''',' + NCHAR(13)+NCHAR(10)
-    + N'    @subscriber_type = ' + CAST(ISNULL(rs.subscriber_type, 0) AS NVARCHAR(1)) + N';'
+        END + N''';'
 FROM #ResolvedSubs rs
 GROUP BY
     rs.publisher_db, rs.publication, rs.article,
     rs.subscriber_name, rs.destination_db,
-    rs.subscription_type, rs.sync_type, rs.update_mode, rs.subscriber_type
+    rs.subscription_type, rs.sync_type, rs.update_mode
 ORDER BY
     rs.publisher_db, rs.publication, rs.article,
     rs.subscriber_name, rs.destination_db;

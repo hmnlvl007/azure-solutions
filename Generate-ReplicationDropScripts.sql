@@ -120,63 +120,14 @@ BEGIN
 END;
 
 /* ------------------------------------------------------------
-   STAGE 2: Resolve subscription endpoints per resolved article
-   ------------------------------------------------------------ */
-IF OBJECT_ID('tempdb..#ResolvedSubs') IS NOT NULL DROP TABLE #ResolvedSubs;
-CREATE TABLE #ResolvedSubs
-(
-    publisher_db      SYSNAME NOT NULL,
-    publication       SYSNAME NOT NULL,
-    publication_id    INT     NOT NULL,
-    article           SYSNAME NOT NULL,
-    article_id        INT     NOT NULL,
-    subscriber_name   SYSNAME NULL,
-    destination_db    SYSNAME NULL,
-    subscription_type INT     NULL,
-    subscription_status INT   NULL
-    -- NOTE: MSsubscriptions does not have a subscription_id column.
-);
-
-DECLARE @SqlResolveSubs NVARCHAR(MAX) = N'
-SELECT
-    p.publisher_db,
-    p.publication,
-    p.publication_id,
-    a.article,
-    a.article_id,
-    srv.srvname     AS subscriber_name,
-    s.subscriber_db AS destination_db,
-    s.subscription_type,
-    s.status        AS subscription_status
-FROM ' + QUOTENAME(@DistributionDB) + N'.dbo.MSsubscriptions s
-JOIN ' + QUOTENAME(@DistributionDB) + N'.dbo.MSarticles a
-  ON a.article_id = s.article_id
-JOIN ' + QUOTENAME(@DistributionDB) + N'.dbo.MSpublications p
-  ON p.publication_id = a.publication_id
-LEFT JOIN ' + QUOTENAME(@DistributionDB) + N'.dbo.MSreplservers srv
-  ON srv.srvid = s.subscriber_id
-JOIN #ResolvedArticles ra
-  ON ra.publication_id = p.publication_id
- AND ra.article_id = a.article_id
-WHERE srv.srvname IS NOT NULL
-  AND s.subscriber_db IS NOT NULL;';
-
-INSERT INTO #ResolvedSubs
-(
-    publisher_db,
-    publication,
-    publication_id,
-    article,
-    article_id,
-    subscriber_name,
-    destination_db,
-    subscription_type,
-    subscription_status
-)
-EXEC sys.sp_executesql @SqlResolveSubs;
-
-/* ------------------------------------------------------------
-   STAGE 3: Build ordered drop commands
+   STAGE 2: Build ordered drop commands
+   ------------------------------------------------------------ --
+   NOTE: sp_dropsubscription @subscriber=N'all', @destination_db=N'all'
+   is the correct approach - it drops all subscriptions for the article
+   in that publication regardless of subscriber. Resolving individual
+   subscribers from MSsubscriptions is avoided because that table contains
+   rows from all publications sharing the same article_id, which produces
+   false matches across unrelated publications.
    ------------------------------------------------------------ */
 IF OBJECT_ID('tempdb..#Output') IS NOT NULL DROP TABLE #Output;
 CREATE TABLE #Output
@@ -200,47 +151,7 @@ VALUES
     + NCHAR(13)+NCHAR(10) + N'-- Order is important: dropsubscription before droparticle.'
 );
 
-/* 3a) Exact dropsubscription per subscriber/destination */
-INSERT INTO #Output
-(
-    CmdType,
-    publisher_db,
-    publication,
-    article,
-    subscriber_name,
-    destination_db,
-    Cmd
-)
-SELECT
-    'DROP_SUBSCRIPTION_EXACT',
-    rs.publisher_db,
-    rs.publication,
-    rs.article,
-    rs.subscriber_name,
-    rs.destination_db,
-    N'USE ' + QUOTENAME(rs.publisher_db) + N';' + NCHAR(13)+NCHAR(10)
-    + N'EXEC sp_dropsubscription' + NCHAR(13)+NCHAR(10)
-    + N'    @publication = N''' + REPLACE(rs.publication, N'''', N'''''') + N''',' + NCHAR(13)+NCHAR(10)
-    + N'    @article = N''' + REPLACE(rs.article, N'''', N'''''') + N''',' + NCHAR(13)+NCHAR(10)
-    + N'    @subscriber = N''' + REPLACE(rs.subscriber_name, N'''', N'''''') + N''',' + NCHAR(13)+NCHAR(10)
-    + N'    @destination_db = N''' + REPLACE(rs.destination_db, N'''', N'''''') + N''';'
-FROM #ResolvedSubs rs
-WHERE rs.subscriber_name IS NOT NULL
-  AND rs.destination_db  IS NOT NULL
-GROUP BY
-    rs.publisher_db,
-    rs.publication,
-    rs.article,
-    rs.subscriber_name,
-    rs.destination_db
-ORDER BY
-    rs.publisher_db,
-    rs.publication,
-    rs.article,
-    rs.subscriber_name,
-    rs.destination_db;
-
-/* 3b) Safety cleanup for any remaining/anonymous subscriptions */
+/* Drop all subscriptions for each article/publication */
 INSERT INTO #Output
 (
     CmdType,
