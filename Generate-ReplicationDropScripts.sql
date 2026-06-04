@@ -2,23 +2,22 @@
 -- Generate (or execute) sp_dropsubscription + sp_droparticle
 -- from replication metadata for a list of articles/tables
 -- ============================================================
--- Run on the Publisher (or any server that can read distribution DB).
+-- Run on the PUBLISHER that can also reach the distribution DB.
 --
 -- WHAT IT DOES
---   1) Takes a list of article names (typically table names).
---   2) Resolves ALL publications each article belongs to.
---   3) Resolves exact subscription endpoints for each article/publication.
---   4) Produces correctly parameterized statements in this order:
---        a) sp_dropsubscription (all concrete subscribers first)
---        b) sp_dropsubscription @subscriber='all', @destination_db='all' (safety cleanup)
+--   1) Takes a list of article names.
+--   2) Resolves ALL publications each article belongs to (via distributor).
+--   3) Resolves exact subscriber/destination_db pairs from MSsubscriptions.
+--   4) Emits in correct execution order:
+--        a) sp_dropsubscription per concrete subscriber/destination_db
+--        b) sp_dropsubscription @subscriber=N'all', @destination_db=N'all' (cleanup)
 --        c) sp_droparticle
 --
 -- OUTPUT
---   - Result set 1: coverage summary (article -> publication list)
---   - Result set 2: generated statements in execution order
+--   - Result set 1: coverage summary (article -> publications)
+--   - Result set 2: generated commands in execution order
 --
--- OPTIONAL
---   Set @ExecuteGenerated = 1 to execute generated statements in order.
+-- Set @ExecuteGenerated = 1 to execute immediately instead of just generating.
 -- ============================================================
 
 SET NOCOUNT ON;
@@ -126,16 +125,16 @@ END;
 IF OBJECT_ID('tempdb..#ResolvedSubs') IS NOT NULL DROP TABLE #ResolvedSubs;
 CREATE TABLE #ResolvedSubs
 (
-    publisher_db    SYSNAME NOT NULL,
-    publication     SYSNAME NOT NULL,
-    publication_id  INT     NOT NULL,
-    article         SYSNAME NOT NULL,
-    article_id      INT     NOT NULL,
-    subscriber_name SYSNAME NULL,
-    destination_db  SYSNAME NULL,
-    subscription_id INT     NULL,
-    subscription_type INT   NULL,
-    subscription_status INT NULL
+    publisher_db      SYSNAME NOT NULL,
+    publication       SYSNAME NOT NULL,
+    publication_id    INT     NOT NULL,
+    article           SYSNAME NOT NULL,
+    article_id        INT     NOT NULL,
+    subscriber_name   SYSNAME NULL,
+    destination_db    SYSNAME NULL,
+    subscription_type INT     NULL,
+    subscription_status INT   NULL
+    -- NOTE: MSsubscriptions does not have a subscription_id column.
 );
 
 DECLARE @SqlResolveSubs NVARCHAR(MAX) = N'
@@ -145,21 +144,22 @@ SELECT
     p.publication_id,
     a.article,
     a.article_id,
-    rs.srvname AS subscriber_name,
+    srv.srvname     AS subscriber_name,
     s.subscriber_db AS destination_db,
-    s.subscription_id,
     s.subscription_type,
-    s.status AS subscription_status
+    s.status        AS subscription_status
 FROM ' + QUOTENAME(@DistributionDB) + N'.dbo.MSsubscriptions s
 JOIN ' + QUOTENAME(@DistributionDB) + N'.dbo.MSarticles a
   ON a.article_id = s.article_id
 JOIN ' + QUOTENAME(@DistributionDB) + N'.dbo.MSpublications p
   ON p.publication_id = a.publication_id
-LEFT JOIN ' + QUOTENAME(@DistributionDB) + N'.dbo.MSreplservers rs
-  ON rs.srvid = s.subscriber_id
+LEFT JOIN ' + QUOTENAME(@DistributionDB) + N'.dbo.MSreplservers srv
+  ON srv.srvid = s.subscriber_id
 JOIN #ResolvedArticles ra
   ON ra.publication_id = p.publication_id
- AND ra.article_id = a.article_id;';
+ AND ra.article_id = a.article_id
+WHERE srv.srvname IS NOT NULL
+  AND s.subscriber_db IS NOT NULL;';
 
 INSERT INTO #ResolvedSubs
 (
@@ -170,7 +170,6 @@ INSERT INTO #ResolvedSubs
     article_id,
     subscriber_name,
     destination_db,
-    subscription_id,
     subscription_type,
     subscription_status
 )
