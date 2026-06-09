@@ -1,0 +1,790 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Replication Operations Dashboard</title>
+  <style>
+    :root {
+      --bg: #f6f7f9;
+      --panel: #ffffff;
+      --panel-2: #eef2f6;
+      --text: #18212f;
+      --muted: #607083;
+      --line: #d8e0e8;
+      --accent: #1663a6;
+      --accent-2: #0f8b6f;
+      --danger: #b42318;
+      --warn: #a15c07;
+      --shadow: 0 1px 2px rgba(12, 26, 42, 0.08);
+    }
+
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      background: var(--bg);
+      color: var(--text);
+      font: 14px/1.45 "Segoe UI", system-ui, -apple-system, BlinkMacSystemFont, sans-serif;
+    }
+    button, input, select, textarea { font: inherit; }
+    header {
+      display: grid;
+      grid-template-columns: minmax(240px, 1fr) auto;
+      gap: 16px;
+      align-items: center;
+      padding: 18px 22px;
+      background: var(--panel);
+      border-bottom: 1px solid var(--line);
+      position: sticky;
+      top: 0;
+      z-index: 5;
+    }
+    h1 {
+      margin: 0;
+      font-size: 22px;
+      font-weight: 700;
+      letter-spacing: 0;
+    }
+    .subhead {
+      margin-top: 2px;
+      color: var(--muted);
+      font-size: 13px;
+    }
+    main {
+      display: grid;
+      grid-template-columns: 280px minmax(0, 1fr);
+      min-height: calc(100vh - 73px);
+    }
+    aside {
+      padding: 16px;
+      border-right: 1px solid var(--line);
+      background: #fbfcfd;
+    }
+    section {
+      padding: 18px 20px 24px;
+    }
+    .toolbar {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+      justify-content: flex-end;
+      align-items: center;
+    }
+    .btn {
+      border: 1px solid var(--line);
+      background: var(--panel);
+      color: var(--text);
+      border-radius: 6px;
+      padding: 8px 11px;
+      cursor: pointer;
+      box-shadow: var(--shadow);
+      white-space: nowrap;
+    }
+    .btn:hover { border-color: #aac0d4; }
+    .btn.primary {
+      background: var(--accent);
+      border-color: var(--accent);
+      color: #fff;
+    }
+    .btn.danger {
+      background: var(--danger);
+      border-color: var(--danger);
+      color: #fff;
+    }
+    .btn.ghost {
+      box-shadow: none;
+      background: transparent;
+    }
+    .file-grid, .filter-grid {
+      display: grid;
+      gap: 10px;
+    }
+    .field label {
+      display: block;
+      font-size: 12px;
+      font-weight: 700;
+      color: var(--muted);
+      margin-bottom: 5px;
+    }
+    .field input[type="text"],
+    .field input[type="file"],
+    .field select,
+    textarea {
+      width: 100%;
+      min-width: 0;
+      border: 1px solid var(--line);
+      border-radius: 6px;
+      background: var(--panel);
+      color: var(--text);
+      padding: 8px 9px;
+    }
+    .field input[type="file"] { padding: 6px; }
+    .panel {
+      background: var(--panel);
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      box-shadow: var(--shadow);
+    }
+    .panel.pad { padding: 14px; }
+    .panel + .panel { margin-top: 14px; }
+    .panel h2 {
+      margin: 0 0 12px;
+      font-size: 15px;
+      letter-spacing: 0;
+    }
+    .metric-grid {
+      display: grid;
+      grid-template-columns: repeat(6, minmax(120px, 1fr));
+      gap: 10px;
+      margin-bottom: 14px;
+    }
+    .metric {
+      background: var(--panel);
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      padding: 12px;
+      box-shadow: var(--shadow);
+      min-height: 74px;
+    }
+    .metric .value {
+      font-size: 25px;
+      line-height: 1.1;
+      font-weight: 750;
+    }
+    .metric .label {
+      margin-top: 5px;
+      color: var(--muted);
+      font-size: 12px;
+      font-weight: 650;
+    }
+    .tabs {
+      display: flex;
+      gap: 6px;
+      border-bottom: 1px solid var(--line);
+      margin: 4px 0 12px;
+      overflow-x: auto;
+    }
+    .tab {
+      border: 0;
+      border-bottom: 3px solid transparent;
+      background: transparent;
+      padding: 10px 12px 8px;
+      cursor: pointer;
+      color: var(--muted);
+      white-space: nowrap;
+    }
+    .tab.active {
+      color: var(--accent);
+      border-bottom-color: var(--accent);
+      font-weight: 700;
+    }
+    .table-wrap {
+      overflow: auto;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: var(--panel);
+      max-height: 58vh;
+    }
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      min-width: 960px;
+    }
+    th, td {
+      text-align: left;
+      border-bottom: 1px solid var(--line);
+      padding: 8px 10px;
+      vertical-align: top;
+    }
+    th {
+      position: sticky;
+      top: 0;
+      z-index: 1;
+      background: var(--panel-2);
+      color: #2c3b4d;
+      font-size: 12px;
+      white-space: nowrap;
+      cursor: pointer;
+    }
+    tr:hover td { background: #f9fbfd; }
+    td { white-space: nowrap; }
+    .muted { color: var(--muted); }
+    .badge {
+      display: inline-flex;
+      align-items: center;
+      min-height: 22px;
+      padding: 2px 8px;
+      border-radius: 999px;
+      background: #e7f1fb;
+      color: #124f86;
+      font-size: 12px;
+      font-weight: 700;
+      white-space: nowrap;
+    }
+    .badge.good { background: #e7f6f0; color: #066449; }
+    .badge.warn { background: #fff4df; color: var(--warn); }
+    .basket {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 6px;
+      min-height: 36px;
+      padding: 7px;
+      border: 1px dashed #b7c7d8;
+      border-radius: 8px;
+      background: #f8fafc;
+    }
+    .chip {
+      display: inline-flex;
+      gap: 6px;
+      align-items: center;
+      max-width: 100%;
+      border: 1px solid #b8d0e8;
+      background: #edf6ff;
+      border-radius: 999px;
+      padding: 4px 8px;
+      color: #124f86;
+      font-size: 12px;
+      font-weight: 700;
+    }
+    .chip button {
+      border: 0;
+      background: transparent;
+      color: inherit;
+      cursor: pointer;
+      padding: 0;
+      font-weight: 900;
+    }
+    .generator-grid {
+      display: grid;
+      grid-template-columns: minmax(260px, 380px) minmax(0, 1fr);
+      gap: 14px;
+    }
+    textarea {
+      min-height: 430px;
+      font-family: Consolas, "Courier New", monospace;
+      font-size: 12px;
+      resize: vertical;
+    }
+    .status {
+      margin-top: 10px;
+      color: var(--muted);
+      font-size: 12px;
+    }
+    .status strong { color: var(--text); }
+    .empty {
+      padding: 30px;
+      color: var(--muted);
+      text-align: center;
+    }
+    @media (max-width: 1100px) {
+      main { grid-template-columns: 1fr; }
+      aside { border-right: 0; border-bottom: 1px solid var(--line); }
+      .metric-grid { grid-template-columns: repeat(3, minmax(120px, 1fr)); }
+      .generator-grid { grid-template-columns: 1fr; }
+    }
+    @media (max-width: 680px) {
+      header { grid-template-columns: 1fr; }
+      .toolbar { justify-content: flex-start; }
+      .metric-grid { grid-template-columns: repeat(2, minmax(120px, 1fr)); }
+      section { padding: 14px; }
+    }
+  </style>
+</head>
+<body>
+  <header>
+    <div>
+      <h1>Replication Operations Dashboard</h1>
+      <div class="subhead" id="datasetStatus">No CMS report files loaded</div>
+    </div>
+    <div class="toolbar">
+      <button class="btn" id="loadDemoBtn" type="button">Load Demo</button>
+      <button class="btn" id="clearBtn" type="button">Clear</button>
+      <button class="btn primary" id="downloadStateBtn" type="button">Export JSON</button>
+    </div>
+  </header>
+
+  <main>
+    <aside>
+      <div class="panel pad">
+        <h2>Report Files</h2>
+        <div class="file-grid">
+          <div class="field">
+            <label for="csvFiles">CMS CSV output</label>
+            <input id="csvFiles" type="file" accept=".csv" multiple>
+          </div>
+          <div class="field">
+            <label for="addTemplate">Add script template</label>
+            <input id="addTemplate" type="file" accept=".sql">
+          </div>
+          <div class="field">
+            <label for="dropTemplate">Drop script template</label>
+            <input id="dropTemplate" type="file" accept=".sql">
+          </div>
+        </div>
+        <div class="status" id="templateStatus">Templates: probing relative script paths</div>
+      </div>
+
+      <div class="panel pad">
+        <h2>Filters</h2>
+        <div class="filter-grid">
+          <div class="field">
+            <label for="searchBox">Search</label>
+            <input id="searchBox" type="text" placeholder="server, DB, publication, article">
+          </div>
+          <div class="field">
+            <label for="publisherFilter">Publisher</label>
+            <select id="publisherFilter"></select>
+          </div>
+          <div class="field">
+            <label for="publisherDbFilter">Publisher DB</label>
+            <select id="publisherDbFilter"></select>
+          </div>
+          <div class="field">
+            <label for="publicationFilter">Publication</label>
+            <select id="publicationFilter"></select>
+          </div>
+          <div class="field">
+            <label for="subscriberFilter">Subscriber</label>
+            <select id="subscriberFilter"></select>
+          </div>
+          <div class="field">
+            <label for="typeFilter">Replication type</label>
+            <select id="typeFilter"></select>
+          </div>
+        </div>
+      </div>
+
+      <div class="panel pad">
+        <h2>Selected Articles</h2>
+        <div class="basket" id="articleBasket"></div>
+        <div class="toolbar" style="justify-content:flex-start;margin-top:10px">
+          <button class="btn ghost" id="selectVisibleBtn" type="button">Select Visible</button>
+          <button class="btn ghost" id="clearSelectionBtn" type="button">Clear Selection</button>
+        </div>
+      </div>
+    </aside>
+
+    <section>
+      <div class="metric-grid" id="metrics"></div>
+
+      <div class="panel pad">
+        <div class="tabs" id="tabs"></div>
+        <div id="tableHost"></div>
+      </div>
+
+      <div class="panel pad">
+        <h2>Script Generator</h2>
+        <div class="generator-grid">
+          <div>
+            <div class="field">
+              <label for="distributionDb">Distribution DB</label>
+              <input id="distributionDb" type="text" value="distribution">
+            </div>
+            <div class="field" style="margin-top:10px">
+              <label for="forceSnapshot">Force invalidate snapshot</label>
+              <select id="forceSnapshot">
+                <option value="1">1</option>
+                <option value="0">0</option>
+              </select>
+            </div>
+            <div class="toolbar" style="justify-content:flex-start;margin-top:12px">
+              <button class="btn primary" id="generateAddBtn" type="button">Generate Add</button>
+              <button class="btn danger" id="generateDropBtn" type="button">Generate Drop</button>
+              <button class="btn" id="downloadSqlBtn" type="button">Download SQL</button>
+            </div>
+            <div class="status" id="scriptStatus">Select articles from the Articles tab.</div>
+          </div>
+          <textarea id="scriptOutput" spellcheck="false"></textarea>
+        </div>
+      </div>
+    </section>
+  </main>
+
+  <script>
+    const tables = {
+      topology: { title: "Topology", rows: [], columns: ["DistributorServer", "PublisherServer", "PublisherDB", "PublicationName", "ReplicationType", "PublicationStatus", "ArticleCount", "SubscriberServer", "SubscriberDB", "SubscriptionType", "SubscriptionStatus", "AgentName", "ScheduleFrequency", "JobEnabled"] },
+      publications: { title: "Publications", rows: [], columns: ["DistributorServer", "PublisherServer", "PublisherDB", "PublicationName", "PublicationDesc", "ReplicationType", "PublicationStatus", "ImmediateSync", "AllowPush", "AllowPull", "RetentionPeriod"] },
+      articles: { title: "Articles", rows: [], columns: ["PublisherServer", "PublisherDB", "PublicationName", "ArticleName", "DestinationTable", "DestinationOwner", "ArticleType"] },
+      subscriptions: { title: "Subscriptions", rows: [], columns: ["DistributorServer", "PublisherServer", "PublisherDB", "PublicationName", "SubscriberServer", "SubscriberDB", "SubscriptionType", "SubscriptionStatus"] },
+      schedules: { title: "Schedules", rows: [], columns: ["DistributorServer", "PublisherDB", "PublicationName", "SubscriberServer", "SubscriberDB", "AgentName", "ScheduleFrequency", "JobEnabled"] },
+      distributors: { title: "Distributors", rows: [], columns: ["ServerName", "DistributionDB", "IsDistributor", "MinDistributionRetention", "MaxDistributionRetention", "HistoryRetention"] },
+      inventory: { title: "Inventory", rows: [], columns: [] }
+    };
+
+    const state = {
+      active: "topology",
+      selectedArticles: new Set(),
+      sort: { key: "", dir: 1 },
+      generatedName: "replication_generated.sql",
+      addTemplate: "",
+      dropTemplate: ""
+    };
+
+    const templatePaths = {
+      add: "../scripts/Generate-ReplicationAddScripts.sql",
+      drop: "../scripts/Generate-ReplicationDropScripts.sql"
+    };
+
+    const demoRows = {
+      topology: [
+        { DistributorServer: "SQLDIST01", PublisherServer: "SQLPUB01", PublisherDB: "Sales", PublicationName: "SalesOrdersPub", ReplicationType: "Transactional", PublicationStatus: "Active", ArticleCount: "3", SubscriberServer: "SQLSUB01", SubscriberDB: "SalesReporting", SubscriptionType: "Push", SubscriptionStatus: "Active", AgentName: "SalesOrdersPub-SQLSUB01", ScheduleFrequency: "Continuous", JobEnabled: "True" },
+        { DistributorServer: "SQLDIST01", PublisherServer: "SQLPUB01", PublisherDB: "Sales", PublicationName: "SalesOrdersPub", ReplicationType: "Transactional", PublicationStatus: "Active", ArticleCount: "3", SubscriberServer: "SQLSUB02", SubscriberDB: "SalesArchive", SubscriptionType: "Push", SubscriptionStatus: "Active", AgentName: "SalesOrdersPub-SQLSUB02", ScheduleFrequency: "Continuous", JobEnabled: "True" }
+      ],
+      publications: [
+        { DistributorServer: "SQLDIST01", PublisherServer: "SQLPUB01", PublisherDB: "Sales", PublicationName: "SalesOrdersPub", PublicationDesc: "Sales order replication", ReplicationType: "Transactional", PublicationStatus: "Active", ImmediateSync: "False", AllowPush: "True", AllowPull: "False", RetentionPeriod: "72" }
+      ],
+      articles: [
+        { PublisherServer: "SQLPUB01", PublisherDB: "Sales", PublicationName: "SalesOrdersPub", ArticleName: "OrderHeader", DestinationTable: "OrderHeader", DestinationOwner: "dbo", ArticleType: "Log-based" },
+        { PublisherServer: "SQLPUB01", PublisherDB: "Sales", PublicationName: "SalesOrdersPub", ArticleName: "OrderDetail", DestinationTable: "OrderDetail", DestinationOwner: "dbo", ArticleType: "Log-based" },
+        { PublisherServer: "SQLPUB01", PublisherDB: "Sales", PublicationName: "SalesOrdersPub", ArticleName: "Customer", DestinationTable: "Customer", DestinationOwner: "dbo", ArticleType: "Log-based" }
+      ],
+      subscriptions: [
+        { DistributorServer: "SQLDIST01", PublisherServer: "SQLPUB01", PublisherDB: "Sales", PublicationName: "SalesOrdersPub", SubscriberServer: "SQLSUB01", SubscriberDB: "SalesReporting", SubscriptionType: "Push", SubscriptionStatus: "Active" },
+        { DistributorServer: "SQLDIST01", PublisherServer: "SQLPUB01", PublisherDB: "Sales", PublicationName: "SalesOrdersPub", SubscriberServer: "SQLSUB02", SubscriberDB: "SalesArchive", SubscriptionType: "Push", SubscriptionStatus: "Active" }
+      ],
+      schedules: [
+        { DistributorServer: "SQLDIST01", PublisherDB: "Sales", PublicationName: "SalesOrdersPub", SubscriberServer: "SQLSUB01", SubscriberDB: "SalesReporting", AgentName: "SalesOrdersPub-SQLSUB01", ScheduleFrequency: "Continuous", JobEnabled: "True" }
+      ],
+      distributors: [
+        { ServerName: "SQLDIST01", DistributionDB: "distribution", IsDistributor: "1", MinDistributionRetention: "0", MaxDistributionRetention: "72", HistoryRetention: "48" }
+      ],
+      inventory: []
+    };
+
+    function parseCsv(text) {
+      const rows = [];
+      let row = [], field = "", quoted = false;
+      for (let i = 0; i < text.length; i++) {
+        const ch = text[i], next = text[i + 1];
+        if (quoted) {
+          if (ch === '"' && next === '"') { field += '"'; i++; }
+          else if (ch === '"') quoted = false;
+          else field += ch;
+        } else if (ch === '"') quoted = true;
+        else if (ch === ",") { row.push(field); field = ""; }
+        else if (ch === "\n") { row.push(field); rows.push(row); row = []; field = ""; }
+        else if (ch !== "\r") field += ch;
+      }
+      if (field.length || row.length) { row.push(field); rows.push(row); }
+      if (!rows.length) return [];
+      const headers = rows.shift().map(h => h.trim());
+      return rows
+        .filter(r => r.some(v => String(v || "").trim() !== ""))
+        .map(r => Object.fromEntries(headers.map((h, i) => [h, r[i] ?? ""])));
+    }
+
+    function detectTable(fileName) {
+      const name = fileName.toLowerCase();
+      if (name.includes("replicationtopology")) return "topology";
+      if (name.includes("publications")) return "publications";
+      if (name.includes("articles")) return "articles";
+      if (name.includes("subscriptions")) return "subscriptions";
+      if (name.includes("replschedules")) return "schedules";
+      if (name.includes("distributors")) return "distributors";
+      if (name.includes("serverinventory")) return "inventory";
+      return "";
+    }
+
+    async function loadRelativeTemplates() {
+      const add = fetch(templatePaths.add).then(r => r.ok ? r.text() : "");
+      const drop = fetch(templatePaths.drop).then(r => r.ok ? r.text() : "");
+      const [addText, dropText] = await Promise.allSettled([add, drop]);
+      state.addTemplate = addText.status === "fulfilled" ? addText.value : "";
+      state.dropTemplate = dropText.status === "fulfilled" ? dropText.value : "";
+      renderTemplateStatus();
+    }
+
+    function renderTemplateStatus() {
+      const add = state.addTemplate ? "add loaded" : "add missing";
+      const drop = state.dropTemplate ? "drop loaded" : "drop missing";
+      document.getElementById("templateStatus").innerHTML = `Templates: <strong>${add}</strong>, <strong>${drop}</strong>`;
+    }
+
+    function filteredRows(key = state.active) {
+      const search = document.getElementById("searchBox").value.trim().toLowerCase();
+      const filters = {
+        PublisherServer: document.getElementById("publisherFilter").value,
+        PublisherDB: document.getElementById("publisherDbFilter").value,
+        PublicationName: document.getElementById("publicationFilter").value,
+        SubscriberServer: document.getElementById("subscriberFilter").value,
+        ReplicationType: document.getElementById("typeFilter").value
+      };
+      let rows = tables[key].rows.filter(row => {
+        for (const [col, val] of Object.entries(filters)) {
+          if (val && String(row[col] || "") !== val) return false;
+        }
+        if (!search) return true;
+        return Object.values(row).some(v => String(v || "").toLowerCase().includes(search));
+      });
+      if (state.sort.key) {
+        rows = rows.slice().sort((a, b) => {
+          const av = String(a[state.sort.key] || "");
+          const bv = String(b[state.sort.key] || "");
+          return av.localeCompare(bv, undefined, { numeric: true, sensitivity: "base" }) * state.sort.dir;
+        });
+      }
+      return rows;
+    }
+
+    function allLoadedRows() {
+      return Object.values(tables).flatMap(t => t.rows);
+    }
+
+    function populateFilters() {
+      const rows = allLoadedRows();
+      fillSelect("publisherFilter", rows, "PublisherServer", "All publishers");
+      fillSelect("publisherDbFilter", rows, "PublisherDB", "All publisher DBs");
+      fillSelect("publicationFilter", rows, "PublicationName", "All publications");
+      fillSelect("subscriberFilter", rows, "SubscriberServer", "All subscribers");
+      fillSelect("typeFilter", rows, "ReplicationType", "All types");
+    }
+
+    function fillSelect(id, rows, key, label) {
+      const el = document.getElementById(id);
+      const current = el.value;
+      const values = [...new Set(rows.map(r => r[key]).filter(Boolean))].sort((a, b) => a.localeCompare(b));
+      el.innerHTML = `<option value="">${label}</option>` + values.map(v => `<option value="${escapeHtml(v)}">${escapeHtml(v)}</option>`).join("");
+      if (values.includes(current)) el.value = current;
+    }
+
+    function renderMetrics() {
+      const f = name => filteredRows(name);
+      const unique = (rows, key) => new Set(rows.map(r => r[key]).filter(Boolean)).size;
+      const metrics = [
+        ["Publishers", unique(f("publications").concat(f("topology")), "PublisherServer")],
+        ["Publications", unique(f("publications").concat(f("topology")), "PublicationName")],
+        ["Articles", unique(f("articles"), "ArticleName")],
+        ["Subscribers", unique(f("subscriptions").concat(f("topology")), "SubscriberServer")],
+        ["Distributors", unique(f("distributors").concat(f("topology")), "DistributorServer") || unique(f("distributors"), "ServerName")],
+        ["Selected", state.selectedArticles.size]
+      ];
+      document.getElementById("metrics").innerHTML = metrics.map(([label, value]) => `
+        <div class="metric"><div class="value">${value}</div><div class="label">${label}</div></div>
+      `).join("");
+    }
+
+    function renderTabs() {
+      document.getElementById("tabs").innerHTML = Object.entries(tables).map(([key, table]) => `
+        <button class="tab ${key === state.active ? "active" : ""}" data-tab="${key}" type="button">${table.title} (${filteredRows(key).length})</button>
+      `).join("");
+    }
+
+    function renderTable() {
+      const table = tables[state.active];
+      const rows = filteredRows();
+      const columns = table.columns.length ? table.columns : [...new Set(rows.flatMap(r => Object.keys(r)))];
+      const host = document.getElementById("tableHost");
+      if (!rows.length) {
+        host.innerHTML = `<div class="empty">No rows match the current view.</div>`;
+        return;
+      }
+      const addSelectColumn = state.active === "articles";
+      host.innerHTML = `
+        <div class="table-wrap">
+          <table>
+            <thead><tr>
+              ${addSelectColumn ? "<th>Select</th>" : ""}
+              ${columns.map(c => `<th data-sort="${escapeHtml(c)}">${escapeHtml(c)}${state.sort.key === c ? (state.sort.dir === 1 ? " ^" : " v") : ""}</th>`).join("")}
+            </tr></thead>
+            <tbody>
+              ${rows.map((row, i) => `<tr>
+                ${addSelectColumn ? `<td><input type="checkbox" data-article="${escapeHtml(row.ArticleName || "")}" ${state.selectedArticles.has(row.ArticleName) ? "checked" : ""}></td>` : ""}
+                ${columns.map(c => `<td>${formatCell(c, row[c])}</td>`).join("")}
+              </tr>`).join("")}
+            </tbody>
+          </table>
+        </div>`;
+    }
+
+    function formatCell(column, value) {
+      const text = String(value ?? "");
+      const lowered = text.toLowerCase();
+      if (["PublicationStatus", "SubscriptionStatus", "JobEnabled"].includes(column)) {
+        const cls = lowered.includes("active") || lowered.includes("true") || lowered.includes("enabled") ? "good" : lowered.includes("inactive") || lowered.includes("false") ? "warn" : "";
+        return `<span class="badge ${cls}">${escapeHtml(text || "N/A")}</span>`;
+      }
+      if (column === "ReplicationType" || column === "SubscriptionType") {
+        return `<span class="badge">${escapeHtml(text || "N/A")}</span>`;
+      }
+      return escapeHtml(text);
+    }
+
+    function renderBasket() {
+      const basket = document.getElementById("articleBasket");
+      const selected = [...state.selectedArticles].sort((a, b) => a.localeCompare(b));
+      basket.innerHTML = selected.length ? selected.map(article => `
+        <span class="chip">${escapeHtml(article)} <button type="button" data-remove="${escapeHtml(article)}">x</button></span>
+      `).join("") : `<span class="muted">No articles selected</span>`;
+    }
+
+    function renderStatus() {
+      const loaded = Object.entries(tables).filter(([, t]) => t.rows.length).map(([k, t]) => `${t.title}: ${t.rows.length}`);
+      document.getElementById("datasetStatus").textContent = loaded.length ? loaded.join(" | ") : "No CMS report files loaded";
+    }
+
+    function renderAll() {
+      populateFilters();
+      renderMetrics();
+      renderTabs();
+      renderTable();
+      renderBasket();
+      renderStatus();
+    }
+
+    function sqlQuote(value) {
+      return `N'${String(value).replaceAll("'", "''")}'`;
+    }
+
+    function buildInputArticlesBlock(articles) {
+      return "INSERT INTO @InputArticles (ArticleName)\nVALUES\n    " +
+        articles.map((a, i) => `(${sqlQuote(a)})${i === articles.length - 1 ? ";" : ","}`).join("\n    ");
+    }
+
+    function replaceInputArticles(template, articles) {
+      const block = buildInputArticlesBlock(articles);
+      return template.replace(
+        /INSERT INTO @InputArticles \(ArticleName\)\s*VALUES\s*[\s\S]*?;/m,
+        block
+      );
+    }
+
+    function replaceConfig(sql) {
+      const dist = document.getElementById("distributionDb").value.trim() || "distribution";
+      const force = document.getElementById("forceSnapshot").value;
+      return sql
+        .replace(/DECLARE @DistributionDB SYSNAME = N'[^']*';/, `DECLARE @DistributionDB SYSNAME = ${sqlQuote(dist)};`)
+        .replace(/DECLARE @ExecuteGenerated BIT = 1;/, "DECLARE @ExecuteGenerated BIT = 0;")
+        .replace(/DECLARE @ForceInvalidateSnapshot BIT = [01];/, `DECLARE @ForceInvalidateSnapshot BIT = ${force};`);
+    }
+
+    function generateScript(kind) {
+      const articles = [...state.selectedArticles].sort((a, b) => a.localeCompare(b));
+      if (!articles.length) {
+        document.getElementById("scriptStatus").textContent = "No articles selected.";
+        return;
+      }
+      const template = kind === "add" ? state.addTemplate : state.dropTemplate;
+      if (!template) {
+        document.getElementById("scriptStatus").textContent = `Load the ${kind} SQL template first.`;
+        return;
+      }
+      const sql = replaceConfig(replaceInputArticles(template, articles));
+      state.generatedName = `replication_${kind}_${new Date().toISOString().slice(0, 19).replaceAll(":", "").replace("T", "_")}.sql`;
+      document.getElementById("scriptOutput").value = sql;
+      document.getElementById("scriptStatus").innerHTML = `<strong>${articles.length}</strong> article(s), ${kind.toUpperCase()} script ready.`;
+    }
+
+    function downloadText(name, text, type = "text/plain") {
+      const blob = new Blob([text], { type });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.href = url;
+      a.download = name;
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+      URL.revokeObjectURL(url);
+    }
+
+    function escapeHtml(value) {
+      return String(value ?? "").replace(/[&<>"']/g, ch => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[ch]));
+    }
+
+    document.getElementById("csvFiles").addEventListener("change", async event => {
+      for (const file of event.target.files) {
+        const key = detectTable(file.name);
+        if (!key) continue;
+        const rows = parseCsv(await file.text());
+        tables[key].rows = rows;
+        if (!tables[key].columns.length && rows[0]) tables[key].columns = Object.keys(rows[0]);
+      }
+      renderAll();
+    });
+
+    document.getElementById("addTemplate").addEventListener("change", async event => {
+      const file = event.target.files[0];
+      if (file) state.addTemplate = await file.text();
+      renderTemplateStatus();
+    });
+
+    document.getElementById("dropTemplate").addEventListener("change", async event => {
+      const file = event.target.files[0];
+      if (file) state.dropTemplate = await file.text();
+      renderTemplateStatus();
+    });
+
+    ["searchBox", "publisherFilter", "publisherDbFilter", "publicationFilter", "subscriberFilter", "typeFilter"].forEach(id => {
+      document.getElementById(id).addEventListener("input", renderAll);
+    });
+
+    document.getElementById("tabs").addEventListener("click", event => {
+      const tab = event.target.closest("[data-tab]");
+      if (!tab) return;
+      state.active = tab.dataset.tab;
+      state.sort = { key: "", dir: 1 };
+      renderAll();
+    });
+
+    document.getElementById("tableHost").addEventListener("click", event => {
+      const sort = event.target.closest("[data-sort]");
+      if (sort) {
+        const key = sort.dataset.sort;
+        state.sort = state.sort.key === key ? { key, dir: state.sort.dir * -1 } : { key, dir: 1 };
+        renderAll();
+      }
+    });
+
+    document.getElementById("tableHost").addEventListener("change", event => {
+      const checkbox = event.target.closest("[data-article]");
+      if (!checkbox) return;
+      if (checkbox.checked) state.selectedArticles.add(checkbox.dataset.article);
+      else state.selectedArticles.delete(checkbox.dataset.article);
+      renderAll();
+    });
+
+    document.getElementById("articleBasket").addEventListener("click", event => {
+      const remove = event.target.closest("[data-remove]");
+      if (!remove) return;
+      state.selectedArticles.delete(remove.dataset.remove);
+      renderAll();
+    });
+
+    document.getElementById("selectVisibleBtn").addEventListener("click", () => {
+      filteredRows("articles").forEach(row => row.ArticleName && state.selectedArticles.add(row.ArticleName));
+      renderAll();
+    });
+
+    document.getElementById("clearSelectionBtn").addEventListener("click", () => {
+      state.selectedArticles.clear();
+      renderAll();
+    });
+
+    document.getElementById("generateAddBtn").addEventListener("click", () => generateScript("add"));
+    document.getElementById("generateDropBtn").addEventListener("click", () => generateScript("drop"));
+    document.getElementById("downloadSqlBtn").addEventListener("click", () => {
+      const text = document.getElementById("scriptOutput").value;
+      if (text.trim()) downloadText(state.generatedName, text, "application/sql");
+    });
+
+    document.getElementById("downloadStateBtn").addEventListener("click", () => {
+      const data = Object.fromEntries(Object.entries(tables).map(([k, t]) => [k, t.rows]));
+      downloadText("replication_dashboard_data.json", JSON.stringify(data, null, 2), "application/json");
+    });
+
+    document.getElementById("loadDemoBtn").addEventListener("click", () => {
+      for (const [key, rows] of Object.entries(demoRows)) tables[key].rows = rows;
+      renderAll();
+    });
+
+    document.getElementById("clearBtn").addEventListener("click", () => {
+      for (const table of Object.values(tables)) table.rows = [];
+      state.selectedArticles.clear();
+      document.getElementById("scriptOutput").value = "";
+      renderAll();
+    });
+
+    loadRelativeTemplates();
+    renderAll();
+  </script>
+</body>
+</html>
