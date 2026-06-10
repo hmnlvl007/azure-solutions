@@ -1729,6 +1729,36 @@ if ($allDatabaseInventory.Count -gt 0) {
         Export-Csv "$($csvBase)_DatabaseInventory.csv" -NoTypeInformation
     Write-Host "  Database inventory CSV: $($csvBase)_DatabaseInventory.csv" -ForegroundColor Green
 
+    $allDatabaseInventory | Where-Object { $_.DatabaseType -eq 'User' } |
+        Sort-Object ServerName, DatabaseName |
+        Export-Csv "$($csvBase)_DatabaseInventory_UserDatabases.csv" -NoTypeInformation
+    Write-Host "  Database inventory user DB CSV: $($csvBase)_DatabaseInventory_UserDatabases.csv" -ForegroundColor Green
+
+    $databaseInventoryServerSummary = $allDatabaseInventory |
+        Group-Object ServerName |
+        ForEach-Object {
+            $rows = $_.Group
+            [PSCustomObject]@{
+                ServerName          = $_.Name
+                TotalDatabases      = $rows.Count
+                UserDatabases       = ($rows | Where-Object { $_.DatabaseType -eq 'User' }).Count
+                SystemDatabases     = ($rows | Where-Object { $_.DatabaseType -eq 'System' }).Count
+                OnlineDatabases     = ($rows | Where-Object { $_.State -eq 'ONLINE' }).Count
+                OfflineDatabases    = ($rows | Where-Object { $_.State -ne 'ONLINE' }).Count
+                TotalSizeGB         = [math]::Round(($rows | Measure-Object TotalSizeMB -Sum).Sum / 1024, 2)
+                DataSizeGB          = [math]::Round(($rows | Measure-Object DataSizeMB  -Sum).Sum / 1024, 2)
+                LogSizeGB           = [math]::Round(($rows | Measure-Object LogSizeMB   -Sum).Sum / 1024, 2)
+                PublishedDBs        = ($rows | Where-Object { $_.IsPublished -eq 1 }).Count
+                CDCEnabledDBs       = ($rows | Where-Object { $_.IsCDCEnabled -eq 1 }).Count
+                DBsInAG             = ($rows | Where-Object { $_.AGName -ne '' }).Count
+            }
+        } |
+        Sort-Object ServerName
+
+    $databaseInventoryServerSummary |
+        Export-Csv "$($csvBase)_DatabaseInventory_ServerSummary.csv" -NoTypeInformation
+    Write-Host "  Database inventory server summary CSV: $($csvBase)_DatabaseInventory_ServerSummary.csv" -ForegroundColor Green
+
     # Ensure ImportExcel is available (may not be loaded if input was CMS, not Excel)
     if (-not (Get-Module -Name ImportExcel)) {
         if (Get-Module -ListAvailable -Name ImportExcel) {
@@ -1754,26 +1784,7 @@ if ($allDatabaseInventory.Count -gt 0) {
                 -TableName 'UserDatabases' -TableStyle Medium6
 
         # Sheet 3 – Per-server summary (counts + sizes)
-        $allDatabaseInventory |
-            Group-Object ServerName |
-            ForEach-Object {
-                $rows = $_.Group
-                [PSCustomObject]@{
-                    ServerName          = $_.Name
-                    TotalDatabases      = $rows.Count
-                    UserDatabases       = ($rows | Where-Object { $_.DatabaseType -eq 'User' }).Count
-                    SystemDatabases     = ($rows | Where-Object { $_.DatabaseType -eq 'System' }).Count
-                    OnlineDatabases     = ($rows | Where-Object { $_.State -eq 'ONLINE' }).Count
-                    OfflineDatabases    = ($rows | Where-Object { $_.State -ne 'ONLINE' }).Count
-                    TotalSizeGB         = [math]::Round(($rows | Measure-Object TotalSizeMB -Sum).Sum / 1024, 2)
-                    DataSizeGB          = [math]::Round(($rows | Measure-Object DataSizeMB  -Sum).Sum / 1024, 2)
-                    LogSizeGB           = [math]::Round(($rows | Measure-Object LogSizeMB   -Sum).Sum / 1024, 2)
-                    PublishedDBs        = ($rows | Where-Object { $_.IsPublished -eq 1 }).Count
-                    CDCEnabledDBs       = ($rows | Where-Object { $_.IsCDCEnabled -eq 1 }).Count
-                    DBsInAG             = ($rows | Where-Object { $_.AGName -ne '' }).Count
-                }
-            } |
-            Sort-Object ServerName |
+        $databaseInventoryServerSummary |
             Export-Excel -Path $xlPath -WorksheetName 'Server Summary' `
                 -AutoFilter -AutoSize -FreezeTopRow -BoldTopRow `
                 -TableName 'ServerSummary' -TableStyle Medium9

@@ -431,7 +431,9 @@
       schedules: { title: "Schedules", rows: [], columns: ["DistributorServer", "PublisherDB", "PublicationName", "SubscriberServer", "SubscriberDB", "AgentName", "ScheduleFrequency", "JobEnabled"] },
       distributors: { title: "Distributors", rows: [], columns: ["ServerName", "DistributionDB", "IsDistributor", "MinDistributionRetention", "MaxDistributionRetention", "HistoryRetention"] },
       inventory: { title: "Server Inventory", rows: [], columns: [] },
-      databaseInventory: { title: "Database Inventory", rows: [], columns: ["ServerName", "DatabaseName", "DatabaseType", "State", "RecoveryModel", "CompatibilityLevel", "IsReadOnly", "IsPublished", "IsSubscribed", "IsDistributor", "IsCDCEnabled", "DBOwner", "CreateDate", "TotalSizeMB", "DataSizeMB", "LogSizeMB", "AGName", "AGRole"] },
+      databaseInventory: { title: "All Databases", rows: [], columns: ["ServerName", "DatabaseName", "DatabaseType", "State", "RecoveryModel", "CompatibilityLevel", "IsReadOnly", "IsPublished", "IsSubscribed", "IsDistributor", "IsCDCEnabled", "DBOwner", "CreateDate", "TotalSizeMB", "DataSizeMB", "LogSizeMB", "AGName", "AGRole"] },
+      databaseUserDatabases: { title: "User Databases", rows: [], columns: ["ServerName", "DatabaseName", "DatabaseType", "State", "RecoveryModel", "CompatibilityLevel", "IsReadOnly", "IsPublished", "IsSubscribed", "IsDistributor", "IsCDCEnabled", "DBOwner", "CreateDate", "TotalSizeMB", "DataSizeMB", "LogSizeMB", "AGName", "AGRole"] },
+      databaseServerSummary: { title: "Server Summary", rows: [], columns: ["ServerName", "TotalDatabases", "UserDatabases", "SystemDatabases", "OnlineDatabases", "OfflineDatabases", "TotalSizeGB", "DataSizeGB", "LogSizeGB", "PublishedDBs", "CDCEnabledDBs", "DBsInAG"] },
       agReplicas: { title: "AG Replicas", rows: [], columns: ["SourceServer", "AGName", "PrimaryReplica", "AGSyncHealth", "ReplicaServer", "AvailabilityMode", "FailoverMode", "EndpointUrl", "SecondaryConnections", "SeedingMode", "ReplicaRole", "ConnectedState", "ReplicaSyncHealth", "ReplicaOpState", "LastConnectError"] },
       agDatabases: { title: "AG Databases", rows: [], columns: ["SourceServer", "AGName", "DatabaseName", "ReplicaServer", "SyncState", "SyncHealth", "IsSuspended", "SuspendReason", "LogSendQueueKB", "RedoQueueKB", "LastSentTime", "LastRedoneTime"] },
       agListeners: { title: "AG Listeners", rows: [], columns: ["SourceServer", "AGName", "ListenerDNS", "ListenerPort", "IPAddress", "SubnetMask", "IPState"] },
@@ -464,7 +466,7 @@
       },
       database: {
         title: "Database Inventory",
-        tables: ["databaseInventory"]
+        tables: ["databaseInventory", "databaseUserDatabases", "databaseServerSummary"]
       },
       ag: {
         title: "Availability Groups",
@@ -503,6 +505,8 @@
       ],
       inventory: [],
       databaseInventory: [],
+      databaseUserDatabases: [],
+      databaseServerSummary: [],
       agReplicas: [],
       agDatabases: [],
       agListeners: [],
@@ -536,6 +540,8 @@
     function dedupeRows(key, rows) {
       const keyColumns = {
         databaseInventory: ["ServerName", "DatabaseName"],
+        databaseUserDatabases: ["ServerName", "DatabaseName"],
+        databaseServerSummary: ["ServerName"],
         agReplicas: ["AGName", "ReplicaServer", "EndpointUrl"],
         agDatabases: ["AGName", "DatabaseName", "ReplicaServer"],
         agListeners: ["AGName", "ListenerDNS", "ListenerPort", "IPAddress"]
@@ -560,6 +566,8 @@
       if (name.includes("replschedules")) return "schedules";
       if (name.includes("distributors")) return "distributors";
       if (name.includes("serverinventory")) return "inventory";
+      if (name.includes("databaseinventory_serversummary")) return "databaseServerSummary";
+      if (name.includes("databaseinventory_userdatabases")) return "databaseUserDatabases";
       if (name.includes("databaseinventory")) return "databaseInventory";
       if (name.includes("ag_replicas")) return "agReplicas";
       if (name.includes("ag_databases")) return "agDatabases";
@@ -753,7 +761,7 @@
       const filters = context.filters;
       let rows = tables[key].rows.filter(row => {
         const relationshipAware = key === "articles" || key === "distributors" || key === "inventory";
-        const detailAware = ["databaseInventory", "agReplicas", "agDatabases", "agListeners", "cdcDatabases", "cdcTables", "cdcJobs"].includes(key);
+        const detailAware = ["databaseInventory", "databaseUserDatabases", "databaseServerSummary", "agReplicas", "agDatabases", "agListeners", "cdcDatabases", "cdcTables", "cdcJobs"].includes(key);
         if (relationshipAware && !rowMatchesRelationship(key, row, context)) return false;
         if (detailAware && !rowMatchesDetailFilters(key, row, context)) return false;
         for (const [col, val] of Object.entries(filters)) {
@@ -801,7 +809,7 @@
         ["Publishers", unique(f("publications").concat(f("topology")), "PublisherServer")],
         ["Publications", unique(f("publications").concat(f("topology")), "PublicationName")],
         ["Articles", unique(f("articles"), "ArticleName")],
-        ["Databases", unique(f("databaseInventory"), "DatabaseName")],
+        ["Databases", unique(f("databaseInventory").concat(f("databaseUserDatabases")), "DatabaseName")],
         ["AGs", unique(f("agReplicas").concat(f("agDatabases").concat(f("agListeners"))), "AGName")],
         ["CDC DBs", unique(f("cdcDatabases").concat(f("cdcTables").concat(f("cdcJobs"))), "DatabaseName")],
         ["Subscribers", unique(f("subscriptions").concat(f("topology")), "SubscriberServer")],
@@ -1014,7 +1022,11 @@
       const skipped = [];
       for (const file of event.target.files) {
         if (!file.name.toLowerCase().endsWith(".csv")) {
-          skipped.push(file.name);
+          const lowerName = file.name.toLowerCase();
+          const hint = lowerName.includes("databaseinventory") && lowerName.endsWith(".xlsx")
+            ? `${file.name} (Excel workbook ignored; upload *_DatabaseInventory.csv, *_DatabaseInventory_UserDatabases.csv, and *_DatabaseInventory_ServerSummary.csv)`
+            : file.name;
+          skipped.push(hint);
           continue;
         }
         const key = detectTable(file.name);
