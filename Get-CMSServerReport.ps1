@@ -235,7 +235,9 @@ else {
         }
 
         $registeredServers = & $registeredServerCommandName @cmsParams |
-                             Select-Object -ExpandProperty ServerName -Unique
+                             Select-Object -ExpandProperty ServerName |
+                             Where-Object { -not [string]::IsNullOrWhiteSpace($_) } |
+                             Sort-Object -Unique
     }
     catch {
         Write-Error "Could not retrieve registered servers from CMS [$CMSServer] using dbatools. Error: $_"
@@ -1281,7 +1283,27 @@ DROP TABLE #cdcjobs;
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 2a. Deduplicate database inventory
+# 2a. Deduplicate server inventory
+# (CMS folders, aliases, listeners, or FQDN/short-name entries can point to the
+# same SQL instance; the final inventory uses SERVERPROPERTY('ServerName').)
+# ─────────────────────────────────────────────────────────────────────────────
+if ($allServerInfo.Count -gt 0) {
+    $serverInfoBeforeDedupe = $allServerInfo.Count
+    $allServerInfo = $allServerInfo |
+        Group-Object ServerName |
+        ForEach-Object {
+            $reachable = $_.Group | Where-Object { $_.ProductVersion -ne 'UNREACHABLE' } | Select-Object -First 1
+            if ($reachable) { $reachable } else { $_.Group | Select-Object -First 1 }
+        } |
+        Sort-Object ServerName
+
+    if ($serverInfoBeforeDedupe -ne $allServerInfo.Count) {
+        Write-Host "  Server inventory: $($allServerInfo.Count) unique rows ($($serverInfoBeforeDedupe - $allServerInfo.Count) duplicate removed)" -ForegroundColor DarkGray
+    }
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 2b. Deduplicate database inventory
 # (same instance registered under multiple CMS names produces identical rows)
 # ─────────────────────────────────────────────────────────────────────────────
 if ($allDatabaseInventory.Count -gt 0) {
@@ -1292,7 +1314,7 @@ if ($allDatabaseInventory.Count -gt 0) {
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 2b. Deduplicate replication data (publisher-side + distributor-side overlap)
+# 2c. Deduplicate replication data (publisher-side + distributor-side overlap)
 # ─────────────────────────────────────────────────────────────────────────────
 if (-not $InventoryOnly) {
     Write-Host "Deduplicating replication data..." -ForegroundColor DarkGray
@@ -1339,7 +1361,7 @@ if (-not $InventoryOnly) {
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 2c. Build combined replication topology (joined view)
+# 2d. Build combined replication topology (joined view)
 # ─────────────────────────────────────────────────────────────────────────────
 $allReplTopology = [System.Collections.Generic.List[PSObject]]::new()
 if (-not $InventoryOnly -and $allSubscriptions.Count -gt 0) {

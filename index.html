@@ -408,7 +408,14 @@
       subscriptions: { title: "Subscriptions", rows: [], columns: ["DistributorServer", "PublisherServer", "PublisherDB", "PublicationName", "SubscriberServer", "SubscriberDB", "SubscriptionType", "SubscriptionStatus"] },
       schedules: { title: "Schedules", rows: [], columns: ["DistributorServer", "PublisherDB", "PublicationName", "SubscriberServer", "SubscriberDB", "AgentName", "ScheduleFrequency", "JobEnabled"] },
       distributors: { title: "Distributors", rows: [], columns: ["ServerName", "DistributionDB", "IsDistributor", "MinDistributionRetention", "MaxDistributionRetention", "HistoryRetention"] },
-      inventory: { title: "Inventory", rows: [], columns: [] }
+      inventory: { title: "Server Inventory", rows: [], columns: [] },
+      databaseInventory: { title: "Database Inventory", rows: [], columns: ["ServerName", "DatabaseName", "DatabaseType", "State", "RecoveryModel", "CompatibilityLevel", "IsReadOnly", "IsPublished", "IsSubscribed", "IsDistributor", "IsCDCEnabled", "DBOwner", "CreateDate", "TotalSizeMB", "DataSizeMB", "LogSizeMB", "AGName", "AGRole"] },
+      agReplicas: { title: "AG Replicas", rows: [], columns: ["SourceServer", "AGName", "PrimaryReplica", "AGSyncHealth", "ReplicaServer", "AvailabilityMode", "FailoverMode", "EndpointUrl", "SecondaryConnections", "SeedingMode", "ReplicaRole", "ConnectedState", "ReplicaSyncHealth", "ReplicaOpState", "LastConnectError"] },
+      agDatabases: { title: "AG Databases", rows: [], columns: ["SourceServer", "AGName", "DatabaseName", "ReplicaServer", "SyncState", "SyncHealth", "IsSuspended", "SuspendReason", "LogSendQueueKB", "RedoQueueKB", "LastSentTime", "LastRedoneTime"] },
+      agListeners: { title: "AG Listeners", rows: [], columns: ["SourceServer", "AGName", "ListenerDNS", "ListenerPort", "IPAddress", "SubnetMask", "IPState"] },
+      cdcDatabases: { title: "CDC Databases", rows: [], columns: ["ServerName", "DatabaseName", "IsCDCEnabled", "CompatLevel"] },
+      cdcTables: { title: "CDC Tables", rows: [], columns: ["ServerName", "DatabaseName", "CaptureInstance", "SourceTable", "CaptureCreated", "SupportsNetChanges", "HasDropPending", "RoleName", "IndexName", "FilegroupName", "CapturedColumns"] },
+      cdcJobs: { title: "CDC Jobs", rows: [], columns: ["ServerName", "DatabaseName", "JobType", "JobName", "JobStatus", "MaxTrans", "MaxScans", "IsContinuous", "PollingIntervalSec", "RetentionMinutes", "CleanupThreshold"] }
     };
 
     const state = {
@@ -448,7 +455,14 @@
       distributors: [
         { ServerName: "SQLDIST01", DistributionDB: "distribution", IsDistributor: "1", MinDistributionRetention: "0", MaxDistributionRetention: "72", HistoryRetention: "48" }
       ],
-      inventory: []
+      inventory: [],
+      databaseInventory: [],
+      agReplicas: [],
+      agDatabases: [],
+      agListeners: [],
+      cdcDatabases: [],
+      cdcTables: [],
+      cdcJobs: []
     };
 
     function parseCsv(text) {
@@ -482,6 +496,13 @@
       if (name.includes("replschedules")) return "schedules";
       if (name.includes("distributors")) return "distributors";
       if (name.includes("serverinventory")) return "inventory";
+      if (name.includes("databaseinventory")) return "databaseInventory";
+      if (name.includes("ag_replicas")) return "agReplicas";
+      if (name.includes("ag_databases")) return "agDatabases";
+      if (name.includes("ag_listeners")) return "agListeners";
+      if (name.includes("cdc_databases")) return "cdcDatabases";
+      if (name.includes("cdc_tables")) return "cdcTables";
+      if (name.includes("cdc_jobs")) return "cdcJobs";
       return "";
     }
 
@@ -623,6 +644,44 @@
       return false;
     }
 
+    function rowMatchesDetailFilters(key, row, context) {
+      const filters = context.filters;
+      let constrained = false;
+
+      const serverColumns = key.startsWith("ag")
+        ? ["SourceServer", "ReplicaServer", "PrimaryReplica", "ListenerDNS"]
+        : ["ServerName"];
+      const databaseColumns = ["DatabaseName"];
+
+      if (filters.PublisherServer || filters.SubscriberServer) {
+        constrained = true;
+        const selectedServers = new Set([filters.PublisherServer, filters.SubscriberServer].filter(Boolean));
+        const matchesServer = serverColumns.some(col => hasValue(row, col) && selectedServers.has(String(row[col])));
+        if (!matchesServer) return false;
+      }
+
+      if (filters.PublisherDB) {
+        constrained = true;
+        const matchesDatabase = databaseColumns.some(col => hasValue(row, col) && String(row[col]) === filters.PublisherDB);
+        if (!matchesDatabase) return false;
+      }
+
+      if (filters.PublicationName) {
+        constrained = true;
+        const matchesRelatedServer = serverColumns.some(col => hasValue(row, col) && context.inventoryServers.has(String(row[col])));
+        const matchesRelatedDatabase = databaseColumns.some(col => hasValue(row, col) && context.inventoryDatabases.has(String(row[col])));
+        if (!matchesRelatedServer && !matchesRelatedDatabase) return false;
+      }
+
+      if (filters.ReplicationType && !constrained) {
+        const matchesRelatedServer = serverColumns.some(col => hasValue(row, col) && context.inventoryServers.has(String(row[col])));
+        const matchesRelatedDatabase = databaseColumns.some(col => hasValue(row, col) && context.inventoryDatabases.has(String(row[col])));
+        return matchesRelatedServer || matchesRelatedDatabase;
+      }
+
+      return constrained || !context.activeCount;
+    }
+
     function filteredRows(key = state.active) {
       const context = renderContext || buildFilterContext();
       if (context.filteredRows.has(key)) return context.filteredRows.get(key);
@@ -630,9 +689,11 @@
       const filters = context.filters;
       let rows = tables[key].rows.filter(row => {
         const relationshipAware = key === "articles" || key === "distributors" || key === "inventory";
+        const detailAware = ["databaseInventory", "agReplicas", "agDatabases", "agListeners", "cdcDatabases", "cdcTables", "cdcJobs"].includes(key);
         if (relationshipAware && !rowMatchesRelationship(key, row, context)) return false;
+        if (detailAware && !rowMatchesDetailFilters(key, row, context)) return false;
         for (const [col, val] of Object.entries(filters)) {
-          if (val && !relationshipAware && String(row[col] || "") !== val) return false;
+          if (val && !relationshipAware && !detailAware && String(row[col] || "") !== val) return false;
         }
         if (!search) return true;
         return Object.values(row).some(v => String(v || "").toLowerCase().includes(search));
@@ -676,6 +737,9 @@
         ["Publishers", unique(f("publications").concat(f("topology")), "PublisherServer")],
         ["Publications", unique(f("publications").concat(f("topology")), "PublicationName")],
         ["Articles", unique(f("articles"), "ArticleName")],
+        ["Databases", unique(f("databaseInventory"), "DatabaseName")],
+        ["AGs", unique(f("agReplicas").concat(f("agDatabases").concat(f("agListeners"))), "AGName")],
+        ["CDC DBs", unique(f("cdcDatabases").concat(f("cdcTables").concat(f("cdcJobs"))), "DatabaseName")],
         ["Subscribers", unique(f("subscriptions").concat(f("topology")), "SubscriberServer")],
         ["Distributors", unique(f("distributors").concat(f("topology")), "DistributorServer") || unique(f("distributors"), "ServerName")],
         ["Selected", state.selectedArticles.size]
