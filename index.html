@@ -321,7 +321,7 @@
             <input id="dropTemplate" type="file" accept=".sql">
           </div>
         </div>
-        <div class="status" id="templateStatus">Templates: probing relative script paths</div>
+        <div class="status" id="templateStatus">Templates: upload add/drop SQL files</div>
       </div>
 
       <div class="panel pad">
@@ -418,20 +418,9 @@
       generatedName: "replication_generated.sql",
       addTemplate: "",
       dropTemplate: "",
+      addTemplateName: "",
+      dropTemplateName: "",
       pendingGenerateKind: ""
-    };
-
-    const templatePaths = {
-      add: [
-        "../scripts/Generate-ReplicationAddScripts.sql",
-        "Generate-ReplicationAddScripts.sql",
-        "./scripts/Generate-ReplicationAddScripts.sql"
-      ],
-      drop: [
-        "../scripts/Generate-ReplicationDropScripts.sql",
-        "Generate-ReplicationDropScripts.sql",
-        "./scripts/Generate-ReplicationDropScripts.sql"
-      ]
     };
 
     const demoRows = {
@@ -494,67 +483,15 @@
       return "";
     }
 
-    async function fetchFirstAvailable(paths) {
-      for (const path of paths) {
-        try {
-          const response = await fetch(path);
-          if (response.ok) return await response.text();
-        } catch {
-          // Local file pages often block fetch; uploaded templates still work.
-        }
-      }
-      return "";
-    }
-
-    function templateCacheKey(kind) {
-      return `replication-dashboard-${kind}-template`;
-    }
-
-    function readTemplateCache(kind) {
-      try {
-        return localStorage.getItem(templateCacheKey(kind)) || "";
-      } catch {
-        return "";
-      }
-    }
-
-    function writeTemplateCache(kind, text) {
-      try {
-        localStorage.setItem(templateCacheKey(kind), text);
-      } catch {
-        // Some local file/browser privacy modes disable storage. File inputs still work.
-      }
-    }
-
-    async function loadRelativeTemplates() {
-      state.addTemplate = state.addTemplate || readTemplateCache("add");
-      state.dropTemplate = state.dropTemplate || readTemplateCache("drop");
-      renderTemplateStatus();
-
-      const add = fetchFirstAvailable(templatePaths.add);
-      const drop = fetchFirstAvailable(templatePaths.drop);
-      const [addText, dropText] = await Promise.allSettled([add, drop]);
-      const fetchedAdd = addText.status === "fulfilled" ? addText.value : "";
-      const fetchedDrop = dropText.status === "fulfilled" ? dropText.value : "";
-      if (fetchedAdd) {
-        state.addTemplate = fetchedAdd;
-        writeTemplateCache("add", fetchedAdd);
-      }
-      if (fetchedDrop) {
-        state.dropTemplate = fetchedDrop;
-        writeTemplateCache("drop", fetchedDrop);
-      }
+    function initializeTemplateStatus() {
       renderTemplateStatus();
     }
 
     function renderTemplateStatus() {
-      const add = state.addTemplate ? "add loaded" : "add missing";
-      const drop = state.dropTemplate ? "drop loaded" : "drop missing";
-      const fileMode = location.protocol === "file:";
+      const add = state.addTemplate ? `add loaded (${escapeHtml(state.addTemplateName || "uploaded")})` : "add missing";
+      const drop = state.dropTemplate ? `drop loaded (${escapeHtml(state.dropTemplateName || "uploaded")})` : "drop missing";
       const hint = !state.addTemplate || !state.dropTemplate
-        ? fileMode
-          ? " Choose the SQL files below once, or click Generate and pick the requested template."
-          : " Check template file paths or choose the SQL files below."
+        ? " Choose the SQL files below, or click Generate and pick the requested template."
         : "";
       document.getElementById("templateStatus").innerHTML = `Templates: <strong>${add}</strong>, <strong>${drop}</strong>.${hint}`;
     }
@@ -614,12 +551,41 @@
       if (!activeCount) return true;
 
       const relatedRows = relatedRowsForFilters(filters);
+      if (key === "articles") {
+        const directFilterColumns = Object.entries(filters)
+          .filter(([, val]) => val)
+          .map(([col]) => col);
+        const canMatchDirectly = directFilterColumns.every(col => hasValue(row, col));
+        if (canMatchDirectly) return rowMatchesFilters(row, filters);
+
+        return relatedRows.some(related => {
+          const publicationKeys = ["PublisherServer", "PublisherDB", "PublicationName"];
+          const sharedKeys = publicationKeys.filter(col => hasValue(row, col) && hasValue(related, col));
+          const identifiesPublication = hasValue(row, "PublicationName")
+            && hasValue(related, "PublicationName")
+            && String(row.PublicationName) === String(related.PublicationName);
+          if (identifiesPublication && sharedKeys.every(col => String(row[col]) === String(related[col]))) {
+            return true;
+          }
+          return hasValue(row, "ArticleName")
+            && hasValue(related, "ArticleName")
+            && String(row.ArticleName) === String(related.ArticleName);
+        });
+      }
+
       if (key === "distributors") {
         const distributorServers = new Set(relatedRows.map(r => r.DistributorServer).filter(Boolean));
         return distributorServers.has(row.ServerName) || distributorServers.has(row.DistributorServer);
       }
 
       if (key === "inventory") {
+        const selectedPublisher = filters.PublisherServer;
+        const selectedSubscriber = filters.SubscriberServer;
+        if (selectedPublisher || selectedSubscriber) {
+          const selectedServers = new Set([selectedPublisher, selectedSubscriber].filter(Boolean));
+          return selectedServers.has(row.ServerName);
+        }
+
         const serverNames = new Set(relatedRows.flatMap(r => [
           r.PublisherServer,
           r.DistributorServer,
@@ -639,7 +605,7 @@
       const search = document.getElementById("searchBox").value.trim().toLowerCase();
       const filters = activeFilters();
       let rows = tables[key].rows.filter(row => {
-        const relationshipAware = key === "distributors" || key === "inventory";
+        const relationshipAware = key === "articles" || key === "distributors" || key === "inventory";
         if (relationshipAware && !rowMatchesRelationship(key, row, filters)) return false;
         for (const [col, val] of Object.entries(filters)) {
           if (val && !relationshipAware && String(row[col] || "") !== val) return false;
@@ -780,19 +746,36 @@
       return { sql: template.replace(pattern, block), replaced: true };
     }
 
+    function validateTemplateKind(kind, template) {
+      const lowered = template.toLowerCase();
+      const hasInputBlock = /insert\s+into\s+@inputarticles\s*\(\s*\[?articlename\]?\s*\)\s*values/im.test(template);
+      if (!hasInputBlock) {
+        return "The uploaded SQL does not contain an INSERT INTO @InputArticles (ArticleName) VALUES block.";
+      }
+      if (kind === "add" && !lowered.includes("sp_addarticle")) {
+        return "The uploaded SQL does not look like the Add template because sp_addarticle was not found.";
+      }
+      if (kind === "drop" && !lowered.includes("sp_droparticle")) {
+        return "The uploaded SQL does not look like the Drop template because sp_droparticle was not found.";
+      }
+      return "";
+    }
+
     function replaceConfig(sql) {
       const dist = document.getElementById("distributionDb").value.trim() || "distribution";
       const force = document.getElementById("forceSnapshot").value;
       return sql
-        .replace(/DECLARE @DistributionDB SYSNAME = N'[^']*';/, `DECLARE @DistributionDB SYSNAME = ${sqlQuote(dist)};`)
-        .replace(/DECLARE @ExecuteGenerated BIT = 1;/, "DECLARE @ExecuteGenerated BIT = 0;")
-        .replace(/DECLARE @ForceInvalidateSnapshot BIT = [01];/, `DECLARE @ForceInvalidateSnapshot BIT = ${force};`);
+        .replace(/DECLARE\s+@DistributionDB\s+SYSNAME\s*=\s*N'[^']*';/i, `DECLARE @DistributionDB SYSNAME = ${sqlQuote(dist)};`)
+        .replace(/DECLARE\s+@ExecuteGenerated\s+BIT\s*=\s*[01];/i, "DECLARE @ExecuteGenerated BIT = 0;")
+        .replace(/DECLARE\s+@ForceInvalidateSnapshot\s+BIT\s*=\s*[01];/i, `DECLARE @ForceInvalidateSnapshot BIT = ${force};`);
     }
 
     function requestTemplate(kind) {
       const inputId = kind === "add" ? "addTemplate" : "dropTemplate";
       state.pendingGenerateKind = kind;
-      document.getElementById(inputId).click();
+      const input = document.getElementById(inputId);
+      input.value = "";
+      input.click();
     }
 
     function generateScript(kind) {
@@ -807,6 +790,11 @@
         document.getElementById("scriptStatus").textContent = `${label} SQL template is not loaded. Pick ${label.toLowerCase()} template file to continue.`;
         renderTemplateStatus();
         requestTemplate(kind);
+        return;
+      }
+      const validationError = validateTemplateKind(kind, template);
+      if (validationError) {
+        document.getElementById("scriptStatus").textContent = validationError;
         return;
       }
       const replacement = replaceInputArticles(template, articles);
@@ -847,30 +835,42 @@
       renderAll();
     });
 
-    document.getElementById("addTemplate").addEventListener("change", async event => {
+    async function handleTemplateUpload(kind, event) {
       const file = event.target.files[0];
-      if (file) {
-        state.addTemplate = await file.text();
-        writeTemplateCache("add", state.addTemplate);
-      }
-      renderTemplateStatus();
-      if (state.pendingGenerateKind === "add") {
+      if (!file) return;
+
+      const text = await file.text();
+      const validationError = validateTemplateKind(kind, text);
+      if (validationError) {
+        document.getElementById("scriptStatus").textContent = validationError;
         state.pendingGenerateKind = "";
-        generateScript("add");
+        event.target.value = "";
+        return;
       }
+
+      if (kind === "add") {
+        state.addTemplate = text;
+        state.addTemplateName = file.name;
+      } else {
+        state.dropTemplate = text;
+        state.dropTemplateName = file.name;
+      }
+
+      renderTemplateStatus();
+      event.target.value = "";
+
+      if (state.pendingGenerateKind === kind) {
+        state.pendingGenerateKind = "";
+        generateScript(kind);
+      }
+    }
+
+    document.getElementById("addTemplate").addEventListener("change", event => {
+      handleTemplateUpload("add", event);
     });
 
-    document.getElementById("dropTemplate").addEventListener("change", async event => {
-      const file = event.target.files[0];
-      if (file) {
-        state.dropTemplate = await file.text();
-        writeTemplateCache("drop", state.dropTemplate);
-      }
-      renderTemplateStatus();
-      if (state.pendingGenerateKind === "drop") {
-        state.pendingGenerateKind = "";
-        generateScript("drop");
-      }
+    document.getElementById("dropTemplate").addEventListener("change", event => {
+      handleTemplateUpload("drop", event);
     });
 
     ["searchBox", "publisherFilter", "publisherDbFilter", "publicationFilter", "subscriberFilter", "typeFilter"].forEach(id => {
@@ -948,7 +948,7 @@
       renderAll();
     });
 
-    loadRelativeTemplates();
+    initializeTemplateStatus();
     renderAll();
   </script>
 </body>
