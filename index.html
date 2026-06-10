@@ -487,6 +487,24 @@
         .map(r => Object.fromEntries(headers.map((h, i) => [h, r[i] ?? ""])));
     }
 
+    function dedupeRows(key, rows) {
+      const keyColumns = {
+        databaseInventory: ["ServerName", "DatabaseName"],
+        agReplicas: ["AGName", "ReplicaServer", "EndpointUrl"],
+        agDatabases: ["AGName", "DatabaseName", "ReplicaServer"],
+        agListeners: ["AGName", "ListenerDNS", "ListenerPort", "IPAddress"]
+      }[key];
+      if (!keyColumns) return rows;
+
+      const seen = new Set();
+      return rows.filter(row => {
+        const signature = keyColumns.map(col => String(row[col] || "").toLowerCase()).join("\u001f");
+        if (seen.has(signature)) return false;
+        seen.add(signature);
+        return true;
+      });
+    }
+
     function detectTable(fileName) {
       const name = fileName.toLowerCase();
       if (name.includes("replicationtopology")) return "topology";
@@ -923,14 +941,22 @@
     }
 
     document.getElementById("csvFiles").addEventListener("change", async event => {
+      const skipped = [];
       for (const file of event.target.files) {
+        if (!file.name.toLowerCase().endsWith(".csv")) {
+          skipped.push(file.name);
+          continue;
+        }
         const key = detectTable(file.name);
         if (!key) continue;
-        const rows = parseCsv(await file.text());
+        const rows = dedupeRows(key, parseCsv(await file.text()));
         tables[key].rows = rows;
         if (!tables[key].columns.length && rows[0]) tables[key].columns = Object.keys(rows[0]);
       }
       renderAll({ populateFilters: true });
+      if (skipped.length) {
+        document.getElementById("datasetStatus").textContent += ` | Skipped non-CSV file(s): ${skipped.join(", ")}`;
+      }
     });
 
     async function handleTemplateUpload(kind, event) {

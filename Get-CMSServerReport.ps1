@@ -1313,6 +1313,39 @@ if ($allDatabaseInventory.Count -gt 0) {
     Write-Host "  Database inventory: $($allDatabaseInventory.Count) unique rows" -ForegroundColor DarkGray
 }
 
+if ($allAGDetails.Count -gt 0) {
+    $agBefore = $allAGDetails.Count
+    $allAGDetails = $allAGDetails |
+        Group-Object AGName, ReplicaServer, EndpointUrl |
+        ForEach-Object { $_.Group | Select-Object -First 1 } |
+        Sort-Object AGName, ReplicaServer
+    if ($agBefore -ne $allAGDetails.Count) {
+        Write-Host "  AG replicas: $($allAGDetails.Count) unique rows ($($agBefore - $allAGDetails.Count) duplicate removed)" -ForegroundColor DarkGray
+    }
+}
+
+if ($allAGDatabases.Count -gt 0) {
+    $agDbBefore = $allAGDatabases.Count
+    $allAGDatabases = $allAGDatabases |
+        Group-Object AGName, DatabaseName, ReplicaServer |
+        ForEach-Object { $_.Group | Select-Object -First 1 } |
+        Sort-Object AGName, DatabaseName, ReplicaServer
+    if ($agDbBefore -ne $allAGDatabases.Count) {
+        Write-Host "  AG databases: $($allAGDatabases.Count) unique rows ($($agDbBefore - $allAGDatabases.Count) duplicate removed)" -ForegroundColor DarkGray
+    }
+}
+
+if ($allAGListeners.Count -gt 0) {
+    $agListenerBefore = $allAGListeners.Count
+    $allAGListeners = $allAGListeners |
+        Group-Object AGName, ListenerDNS, ListenerPort, IPAddress |
+        ForEach-Object { $_.Group | Select-Object -First 1 } |
+        Sort-Object AGName, ListenerDNS, IPAddress
+    if ($agListenerBefore -ne $allAGListeners.Count) {
+        Write-Host "  AG listeners: $($allAGListeners.Count) unique rows ($($agListenerBefore - $allAGListeners.Count) duplicate removed)" -ForegroundColor DarkGray
+    }
+}
+
 # ─────────────────────────────────────────────────────────────────────────────
 # 2c. Deduplicate replication data (publisher-side + distributor-side overlap)
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1692,6 +1725,10 @@ Write-Host ""
 # Export Database Inventory Excel workbook
 # ─────────────────────────────────────────────────────────────────────────────
 if ($allDatabaseInventory.Count -gt 0) {
+    $allDatabaseInventory | Sort-Object ServerName, DatabaseType, DatabaseName |
+        Export-Csv "$($csvBase)_DatabaseInventory.csv" -NoTypeInformation
+    Write-Host "  Database inventory CSV: $($csvBase)_DatabaseInventory.csv" -ForegroundColor Green
+
     # Ensure ImportExcel is available (may not be loaded if input was CMS, not Excel)
     if (-not (Get-Module -Name ImportExcel)) {
         if (Get-Module -ListAvailable -Name ImportExcel) {
@@ -1744,10 +1781,7 @@ if ($allDatabaseInventory.Count -gt 0) {
         Write-Host "  Database inventory Excel: $xlPath" -ForegroundColor Green
     }
     else {
-        Write-Warning "ImportExcel module not available. Exporting database inventory as CSV instead."
-        $allDatabaseInventory | Sort-Object ServerName, DatabaseType, DatabaseName |
-            Export-Csv "$($csvBase)_DatabaseInventory.csv" -NoTypeInformation
-        Write-Host "  Database inventory CSV: $($csvBase)_DatabaseInventory.csv" -ForegroundColor Green
+        Write-Warning "ImportExcel module not available. Database inventory Excel workbook was skipped; CSV was still exported."
     }
 }
 
