@@ -164,6 +164,27 @@
       margin: 4px 0 12px;
       overflow-x: auto;
     }
+    .view-tabs {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+      margin-bottom: 10px;
+    }
+    .view-tab {
+      border: 1px solid var(--line);
+      background: #f7fafc;
+      color: var(--text);
+      border-radius: 6px;
+      padding: 8px 10px;
+      cursor: pointer;
+      min-height: 36px;
+    }
+    .view-tab.active {
+      background: var(--accent);
+      border-color: var(--accent);
+      color: #fff;
+      font-weight: 700;
+    }
     .tab {
       border: 0;
       border-bottom: 3px solid transparent;
@@ -368,6 +389,7 @@
       <div class="metric-grid" id="metrics"></div>
 
       <div class="panel pad">
+        <div class="view-tabs" id="viewTabs"></div>
         <div class="tabs" id="tabs"></div>
         <div id="tableHost"></div>
       </div>
@@ -419,6 +441,7 @@
     };
 
     const state = {
+      group: "replication",
       active: "topology",
       selectedArticles: new Set(),
       sort: { key: "", dir: 1 },
@@ -428,6 +451,29 @@
       addTemplateName: "",
       dropTemplateName: "",
       pendingGenerateKind: ""
+    };
+
+    const tableGroups = {
+      replication: {
+        title: "Replication",
+        tables: ["topology", "publications", "articles", "subscriptions", "schedules", "distributors"]
+      },
+      server: {
+        title: "Server Inventory",
+        tables: ["inventory"]
+      },
+      database: {
+        title: "Database Inventory",
+        tables: ["databaseInventory"]
+      },
+      ag: {
+        title: "Availability Groups",
+        tables: ["agReplicas", "agDatabases", "agListeners"]
+      },
+      cdc: {
+        title: "CDC",
+        tables: ["cdcDatabases", "cdcTables", "cdcJobs"]
+      }
     };
 
     let renderContext = null;
@@ -774,10 +820,33 @@
       if (value) value.textContent = state.selectedArticles.size;
     }
 
+    function activeGroupKeys() {
+      return tableGroups[state.group]?.tables || tableGroups.replication.tables;
+    }
+
+    function ensureActiveTableInGroup() {
+      const keys = activeGroupKeys();
+      if (!keys.includes(state.active)) {
+        state.active = keys[0];
+        state.sort = { key: "", dir: 1 };
+      }
+    }
+
+    function renderViewTabs() {
+      document.getElementById("viewTabs").innerHTML = Object.entries(tableGroups).map(([key, group]) => {
+        const count = group.tables.reduce((sum, tableKey) => sum + filteredRows(tableKey).length, 0);
+        return `<button class="view-tab ${key === state.group ? "active" : ""}" data-group="${key}" type="button">${group.title} (${count})</button>`;
+      }).join("");
+    }
+
     function renderTabs() {
-      document.getElementById("tabs").innerHTML = Object.entries(tables).map(([key, table]) => `
+      ensureActiveTableInGroup();
+      document.getElementById("tabs").innerHTML = activeGroupKeys().map(key => {
+        const table = tables[key];
+        return `
         <button class="tab ${key === state.active ? "active" : ""}" data-tab="${key}" type="button">${table.title} (${filteredRows(key).length})</button>
-      `).join("");
+      `;
+      }).join("");
     }
 
     function renderTable() {
@@ -837,6 +906,7 @@
       if (options.populateFilters) populateFilters();
       renderContext = buildFilterContext();
       renderMetrics();
+      renderViewTabs();
       renderTabs();
       renderTable();
       renderBasket();
@@ -1005,6 +1075,14 @@
 
     ["publisherFilter", "publisherDbFilter", "publicationFilter", "subscriberFilter", "typeFilter"].forEach(id => {
       document.getElementById(id).addEventListener("change", () => renderAll());
+    });
+
+    document.getElementById("viewTabs").addEventListener("click", event => {
+      const group = event.target.closest("[data-group]");
+      if (!group) return;
+      state.group = group.dataset.group;
+      ensureActiveTableInGroup();
+      renderAll();
     });
 
     document.getElementById("tabs").addEventListener("click", event => {
