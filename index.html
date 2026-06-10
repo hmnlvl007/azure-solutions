@@ -3,7 +3,7 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Replication Operations Dashboard</title>
+  <title>Database Operations Dashboard</title>
   <style>
     :root {
       --bg: #f6f7f9;
@@ -293,7 +293,7 @@
 <body>
   <header>
     <div>
-      <h1>Replication Operations Dashboard</h1>
+      <h1>Database Operations Dashboard</h1>
       <div class="subhead" id="datasetStatus">No CMS report files loaded</div>
     </div>
     <div class="toolbar">
@@ -1073,7 +1073,7 @@
 
     document.getElementById("downloadStateBtn").addEventListener("click", () => {
       const data = Object.fromEntries(Object.entries(tables).map(([k, t]) => [k, t.rows]));
-      downloadText("replication_dashboard_data.json", JSON.stringify(data, null, 2), "application/json");
+      downloadText("database_operations_dashboard_data.json", JSON.stringify(data, null, 2), "application/json");
     });
 
     document.getElementById("loadDemoBtn").addEventListener("click", () => {
