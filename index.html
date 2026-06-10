@@ -417,12 +417,21 @@
       sort: { key: "", dir: 1 },
       generatedName: "replication_generated.sql",
       addTemplate: "",
-      dropTemplate: ""
+      dropTemplate: "",
+      pendingGenerateKind: ""
     };
 
     const templatePaths = {
-      add: "../scripts/Generate-ReplicationAddScripts.sql",
-      drop: "../scripts/Generate-ReplicationDropScripts.sql"
+      add: [
+        "../scripts/Generate-ReplicationAddScripts.sql",
+        "Generate-ReplicationAddScripts.sql",
+        "./scripts/Generate-ReplicationAddScripts.sql"
+      ],
+      drop: [
+        "../scripts/Generate-ReplicationDropScripts.sql",
+        "Generate-ReplicationDropScripts.sql",
+        "./scripts/Generate-ReplicationDropScripts.sql"
+      ]
     };
 
     const demoRows = {
@@ -485,19 +494,69 @@
       return "";
     }
 
+    async function fetchFirstAvailable(paths) {
+      for (const path of paths) {
+        try {
+          const response = await fetch(path);
+          if (response.ok) return await response.text();
+        } catch {
+          // Local file pages often block fetch; uploaded templates still work.
+        }
+      }
+      return "";
+    }
+
+    function templateCacheKey(kind) {
+      return `replication-dashboard-${kind}-template`;
+    }
+
+    function readTemplateCache(kind) {
+      try {
+        return localStorage.getItem(templateCacheKey(kind)) || "";
+      } catch {
+        return "";
+      }
+    }
+
+    function writeTemplateCache(kind, text) {
+      try {
+        localStorage.setItem(templateCacheKey(kind), text);
+      } catch {
+        // Some local file/browser privacy modes disable storage. File inputs still work.
+      }
+    }
+
     async function loadRelativeTemplates() {
-      const add = fetch(templatePaths.add).then(r => r.ok ? r.text() : "");
-      const drop = fetch(templatePaths.drop).then(r => r.ok ? r.text() : "");
+      state.addTemplate = state.addTemplate || readTemplateCache("add");
+      state.dropTemplate = state.dropTemplate || readTemplateCache("drop");
+      renderTemplateStatus();
+
+      const add = fetchFirstAvailable(templatePaths.add);
+      const drop = fetchFirstAvailable(templatePaths.drop);
       const [addText, dropText] = await Promise.allSettled([add, drop]);
-      state.addTemplate = addText.status === "fulfilled" ? addText.value : "";
-      state.dropTemplate = dropText.status === "fulfilled" ? dropText.value : "";
+      const fetchedAdd = addText.status === "fulfilled" ? addText.value : "";
+      const fetchedDrop = dropText.status === "fulfilled" ? dropText.value : "";
+      if (fetchedAdd) {
+        state.addTemplate = fetchedAdd;
+        writeTemplateCache("add", fetchedAdd);
+      }
+      if (fetchedDrop) {
+        state.dropTemplate = fetchedDrop;
+        writeTemplateCache("drop", fetchedDrop);
+      }
       renderTemplateStatus();
     }
 
     function renderTemplateStatus() {
       const add = state.addTemplate ? "add loaded" : "add missing";
       const drop = state.dropTemplate ? "drop loaded" : "drop missing";
-      document.getElementById("templateStatus").innerHTML = `Templates: <strong>${add}</strong>, <strong>${drop}</strong>`;
+      const fileMode = location.protocol === "file:";
+      const hint = !state.addTemplate || !state.dropTemplate
+        ? fileMode
+          ? " Choose the SQL files below once, or click Generate and pick the requested template."
+          : " Check template file paths or choose the SQL files below."
+        : "";
+      document.getElementById("templateStatus").innerHTML = `Templates: <strong>${add}</strong>, <strong>${drop}</strong>.${hint}`;
     }
 
     function activeFilters() {
@@ -714,10 +773,11 @@
 
     function replaceInputArticles(template, articles) {
       const block = buildInputArticlesBlock(articles);
-      return template.replace(
-        /INSERT INTO @InputArticles \(ArticleName\)\s*VALUES\s*[\s\S]*?;/m,
-        block
-      );
+      const pattern = /INSERT\s+INTO\s+@InputArticles\s*\(\s*\[?ArticleName\]?\s*\)\s*VALUES\s*[\s\S]*?;/im;
+      if (!pattern.test(template)) {
+        return { sql: template, replaced: false };
+      }
+      return { sql: template.replace(pattern, block), replaced: true };
     }
 
     function replaceConfig(sql) {
@@ -729,6 +789,12 @@
         .replace(/DECLARE @ForceInvalidateSnapshot BIT = [01];/, `DECLARE @ForceInvalidateSnapshot BIT = ${force};`);
     }
 
+    function requestTemplate(kind) {
+      const inputId = kind === "add" ? "addTemplate" : "dropTemplate";
+      state.pendingGenerateKind = kind;
+      document.getElementById(inputId).click();
+    }
+
     function generateScript(kind) {
       const articles = [...state.selectedArticles].sort((a, b) => a.localeCompare(b));
       if (!articles.length) {
@@ -737,13 +803,21 @@
       }
       const template = kind === "add" ? state.addTemplate : state.dropTemplate;
       if (!template) {
-        document.getElementById("scriptStatus").textContent = `Load the ${kind} SQL template first.`;
+        const label = kind === "add" ? "Add" : "Drop";
+        document.getElementById("scriptStatus").textContent = `${label} SQL template is not loaded. Pick ${label.toLowerCase()} template file to continue.`;
+        renderTemplateStatus();
+        requestTemplate(kind);
         return;
       }
-      const sql = replaceConfig(replaceInputArticles(template, articles));
+      const replacement = replaceInputArticles(template, articles);
+      if (!replacement.replaced) {
+        document.getElementById("scriptStatus").textContent = "Template loaded, but the @InputArticles VALUES block was not found. The SQL was not generated.";
+        return;
+      }
+      const sql = replaceConfig(replacement.sql);
       state.generatedName = `replication_${kind}_${new Date().toISOString().slice(0, 19).replaceAll(":", "").replace("T", "_")}.sql`;
       document.getElementById("scriptOutput").value = sql;
-      document.getElementById("scriptStatus").innerHTML = `<strong>${articles.length}</strong> article(s), ${kind.toUpperCase()} script ready.`;
+      document.getElementById("scriptStatus").innerHTML = `<strong>${articles.length}</strong> selected article(s) written to @InputArticles. ${kind.toUpperCase()} script ready.`;
     }
 
     function downloadText(name, text, type = "text/plain") {
@@ -775,14 +849,28 @@
 
     document.getElementById("addTemplate").addEventListener("change", async event => {
       const file = event.target.files[0];
-      if (file) state.addTemplate = await file.text();
+      if (file) {
+        state.addTemplate = await file.text();
+        writeTemplateCache("add", state.addTemplate);
+      }
       renderTemplateStatus();
+      if (state.pendingGenerateKind === "add") {
+        state.pendingGenerateKind = "";
+        generateScript("add");
+      }
     });
 
     document.getElementById("dropTemplate").addEventListener("change", async event => {
       const file = event.target.files[0];
-      if (file) state.dropTemplate = await file.text();
+      if (file) {
+        state.dropTemplate = await file.text();
+        writeTemplateCache("drop", state.dropTemplate);
+      }
       renderTemplateStatus();
+      if (state.pendingGenerateKind === "drop") {
+        state.pendingGenerateKind = "";
+        generateScript("drop");
+      }
     });
 
     ["searchBox", "publisherFilter", "publisherDbFilter", "publicationFilter", "subscriberFilter", "typeFilter"].forEach(id => {
@@ -835,7 +923,12 @@
     document.getElementById("generateDropBtn").addEventListener("click", () => generateScript("drop"));
     document.getElementById("downloadSqlBtn").addEventListener("click", () => {
       const text = document.getElementById("scriptOutput").value;
-      if (text.trim()) downloadText(state.generatedName, text, "application/sql");
+      if (text.trim()) {
+        downloadText(state.generatedName, text, "application/sql");
+        document.getElementById("scriptStatus").innerHTML = `<strong>${state.generatedName}</strong> downloaded.`;
+      } else {
+        document.getElementById("scriptStatus").textContent = "Generate an add or drop script before downloading.";
+      }
     });
 
     document.getElementById("downloadStateBtn").addEventListener("click", () => {
