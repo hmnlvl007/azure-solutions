@@ -310,7 +310,7 @@
         <div class="file-grid">
           <div class="field">
             <label for="csvFiles">CMS CSV output</label>
-            <input id="csvFiles" type="file" accept=".csv" multiple>
+            <input id="csvFiles" type="file" multiple>
           </div>
           <div class="field">
             <label for="addTemplate">Add script template</label>
@@ -500,18 +500,90 @@
       document.getElementById("templateStatus").innerHTML = `Templates: <strong>${add}</strong>, <strong>${drop}</strong>`;
     }
 
-    function filteredRows(key = state.active) {
-      const search = document.getElementById("searchBox").value.trim().toLowerCase();
-      const filters = {
+    function activeFilters() {
+      return {
         PublisherServer: document.getElementById("publisherFilter").value,
         PublisherDB: document.getElementById("publisherDbFilter").value,
         PublicationName: document.getElementById("publicationFilter").value,
         SubscriberServer: document.getElementById("subscriberFilter").value,
         ReplicationType: document.getElementById("typeFilter").value
       };
+    }
+
+    function hasValue(row, key) {
+      return Object.prototype.hasOwnProperty.call(row, key) && String(row[key] || "") !== "";
+    }
+
+    function rowMatchesFilters(row, filters, ignoreMissing = false) {
+      let compared = 0;
+      for (const [col, val] of Object.entries(filters)) {
+        if (!val) continue;
+        if (!hasValue(row, col)) {
+          if (ignoreMissing) continue;
+          return false;
+        }
+        compared++;
+        if (String(row[col] || "") !== val) return false;
+      }
+      return compared > 0 || !Object.values(filters).some(Boolean);
+    }
+
+    function relatedRowsForFilters(filters) {
+      const activeCount = Object.values(filters).filter(Boolean).length;
+      if (!activeCount) {
+        return ["topology", "publications", "subscriptions", "articles", "schedules"]
+          .flatMap(name => tables[name].rows);
+      }
+
+      if (tables.topology.rows.length) {
+        return tables.topology.rows.filter(row => rowMatchesFilters(row, filters));
+      }
+
+      const sourceRows = ["publications", "subscriptions", "articles", "schedules"]
+        .flatMap(name => tables[name].rows);
+      const exactMatches = sourceRows.filter(row => {
+        const hasEveryActiveColumn = Object.entries(filters)
+          .every(([col, val]) => !val || hasValue(row, col));
+        return hasEveryActiveColumn && rowMatchesFilters(row, filters);
+      });
+      if (exactMatches.length) return exactMatches;
+      return sourceRows.filter(row => rowMatchesFilters(row, filters, true));
+    }
+
+    function rowMatchesRelationship(key, row, filters) {
+      const activeCount = Object.values(filters).filter(Boolean).length;
+      if (!activeCount) return true;
+
+      const relatedRows = relatedRowsForFilters(filters);
+      if (key === "distributors") {
+        const distributorServers = new Set(relatedRows.map(r => r.DistributorServer).filter(Boolean));
+        return distributorServers.has(row.ServerName) || distributorServers.has(row.DistributorServer);
+      }
+
+      if (key === "inventory") {
+        const serverNames = new Set(relatedRows.flatMap(r => [
+          r.PublisherServer,
+          r.DistributorServer,
+          r.SubscriberServer
+        ]).filter(Boolean));
+        const databaseNames = new Set(relatedRows.flatMap(r => [
+          r.PublisherDB,
+          r.SubscriberDB
+        ]).filter(Boolean));
+        return serverNames.has(row.ServerName) || databaseNames.has(row.DatabaseName);
+      }
+
+      return false;
+    }
+
+    function filteredRows(key = state.active) {
+      const search = document.getElementById("searchBox").value.trim().toLowerCase();
+      const filters = activeFilters();
       let rows = tables[key].rows.filter(row => {
+        const relationshipAware = key === "distributors" || key === "inventory";
+        if (relationshipAware && !rowMatchesRelationship(key, row, filters)) return false;
         for (const [col, val] of Object.entries(filters)) {
-          if (val && String(row[col] || "") !== val) return false;
+          if (val && !relationshipAware && String(row[col] || "") !== val) return false;
         }
         if (!search) return true;
         return Object.values(row).some(v => String(v || "").toLowerCase().includes(search));
