@@ -423,6 +423,8 @@
       pendingGenerateKind: ""
     };
 
+    let renderContext = null;
+
     const demoRows = {
       topology: [
         { DistributorServer: "SQLDIST01", PublisherServer: "SQLPUB01", PublisherDB: "Sales", PublicationName: "SalesOrdersPub", ReplicationType: "Transactional", PublicationStatus: "Active", ArticleCount: "3", SubscriberServer: "SQLSUB01", SubscriberDB: "SalesReporting", SubscriptionType: "Push", SubscriptionStatus: "Active", AgentName: "SalesOrdersPub-SQLSUB01", ScheduleFrequency: "Continuous", JobEnabled: "True" },
@@ -524,6 +526,14 @@
       return compared > 0 || !Object.values(filters).some(Boolean);
     }
 
+    function publicationKey(row) {
+      return [row.PublisherServer || "", row.PublisherDB || "", row.PublicationName || ""].join("\u001f");
+    }
+
+    function rowHasPublicationKey(row) {
+      return hasValue(row, "PublisherServer") && hasValue(row, "PublisherDB") && hasValue(row, "PublicationName");
+    }
+
     function relatedRowsForFilters(filters) {
       const activeCount = Object.values(filters).filter(Boolean).length;
       if (!activeCount) {
@@ -546,36 +556,57 @@
       return sourceRows.filter(row => rowMatchesFilters(row, filters, true));
     }
 
-    function rowMatchesRelationship(key, row, filters) {
+    function buildFilterContext() {
+      const filters = activeFilters();
+      const search = document.getElementById("searchBox").value.trim().toLowerCase();
       const activeCount = Object.values(filters).filter(Boolean).length;
-      if (!activeCount) return true;
+      const context = {
+        filters,
+        search,
+        activeCount,
+        activeFilterColumns: Object.entries(filters).filter(([, val]) => val).map(([col]) => col),
+        relatedRows: [],
+        publicationKeys: new Set(),
+        articleNames: new Set(),
+        distributorServers: new Set(),
+        inventoryServers: new Set(),
+        inventoryDatabases: new Set(),
+        filteredRows: new Map()
+      };
+
+      if (!activeCount) return context;
 
       const relatedRows = relatedRowsForFilters(filters);
+      context.relatedRows = relatedRows;
+      relatedRows.forEach(row => {
+        if (rowHasPublicationKey(row)) context.publicationKeys.add(publicationKey(row));
+        if (hasValue(row, "ArticleName")) context.articleNames.add(String(row.ArticleName));
+        if (hasValue(row, "DistributorServer")) context.distributorServers.add(String(row.DistributorServer));
+        ["PublisherServer", "DistributorServer", "SubscriberServer"].forEach(col => {
+          if (hasValue(row, col)) context.inventoryServers.add(String(row[col]));
+        });
+        ["PublisherDB", "SubscriberDB"].forEach(col => {
+          if (hasValue(row, col)) context.inventoryDatabases.add(String(row[col]));
+        });
+      });
+
+      return context;
+    }
+
+    function rowMatchesRelationship(key, row, context) {
+      const filters = context.filters;
+      if (!context.activeCount) return true;
+
       if (key === "articles") {
-        const directFilterColumns = Object.entries(filters)
-          .filter(([, val]) => val)
-          .map(([col]) => col);
-        const canMatchDirectly = directFilterColumns.every(col => hasValue(row, col));
+        const canMatchDirectly = context.activeFilterColumns.every(col => hasValue(row, col));
         if (canMatchDirectly) return rowMatchesFilters(row, filters);
 
-        return relatedRows.some(related => {
-          const publicationKeys = ["PublisherServer", "PublisherDB", "PublicationName"];
-          const sharedKeys = publicationKeys.filter(col => hasValue(row, col) && hasValue(related, col));
-          const identifiesPublication = hasValue(row, "PublicationName")
-            && hasValue(related, "PublicationName")
-            && String(row.PublicationName) === String(related.PublicationName);
-          if (identifiesPublication && sharedKeys.every(col => String(row[col]) === String(related[col]))) {
-            return true;
-          }
-          return hasValue(row, "ArticleName")
-            && hasValue(related, "ArticleName")
-            && String(row.ArticleName) === String(related.ArticleName);
-        });
+        if (rowHasPublicationKey(row) && context.publicationKeys.has(publicationKey(row))) return true;
+        return hasValue(row, "ArticleName") && context.articleNames.has(String(row.ArticleName));
       }
 
       if (key === "distributors") {
-        const distributorServers = new Set(relatedRows.map(r => r.DistributorServer).filter(Boolean));
-        return distributorServers.has(row.ServerName) || distributorServers.has(row.DistributorServer);
+        return context.distributorServers.has(row.ServerName) || context.distributorServers.has(row.DistributorServer);
       }
 
       if (key === "inventory") {
@@ -586,27 +617,20 @@
           return selectedServers.has(row.ServerName);
         }
 
-        const serverNames = new Set(relatedRows.flatMap(r => [
-          r.PublisherServer,
-          r.DistributorServer,
-          r.SubscriberServer
-        ]).filter(Boolean));
-        const databaseNames = new Set(relatedRows.flatMap(r => [
-          r.PublisherDB,
-          r.SubscriberDB
-        ]).filter(Boolean));
-        return serverNames.has(row.ServerName) || databaseNames.has(row.DatabaseName);
+        return context.inventoryServers.has(row.ServerName) || context.inventoryDatabases.has(row.DatabaseName);
       }
 
       return false;
     }
 
     function filteredRows(key = state.active) {
-      const search = document.getElementById("searchBox").value.trim().toLowerCase();
-      const filters = activeFilters();
+      const context = renderContext || buildFilterContext();
+      if (context.filteredRows.has(key)) return context.filteredRows.get(key);
+      const search = context.search;
+      const filters = context.filters;
       let rows = tables[key].rows.filter(row => {
         const relationshipAware = key === "articles" || key === "distributors" || key === "inventory";
-        if (relationshipAware && !rowMatchesRelationship(key, row, filters)) return false;
+        if (relationshipAware && !rowMatchesRelationship(key, row, context)) return false;
         for (const [col, val] of Object.entries(filters)) {
           if (val && !relationshipAware && String(row[col] || "") !== val) return false;
         }
@@ -620,6 +644,7 @@
           return av.localeCompare(bv, undefined, { numeric: true, sensitivity: "base" }) * state.sort.dir;
         });
       }
+      context.filteredRows.set(key, rows);
       return rows;
     }
 
@@ -658,6 +683,13 @@
       document.getElementById("metrics").innerHTML = metrics.map(([label, value]) => `
         <div class="metric"><div class="value">${value}</div><div class="label">${label}</div></div>
       `).join("");
+    }
+
+    function renderSelectedMetric() {
+      const cards = [...document.querySelectorAll("#metrics .metric")];
+      const selectedCard = cards.find(card => card.querySelector(".label")?.textContent === "Selected");
+      const value = selectedCard?.querySelector(".value");
+      if (value) value.textContent = state.selectedArticles.size;
     }
 
     function renderTabs() {
@@ -719,13 +751,15 @@
       document.getElementById("datasetStatus").textContent = loaded.length ? loaded.join(" | ") : "No CMS report files loaded";
     }
 
-    function renderAll() {
-      populateFilters();
+    function renderAll(options = {}) {
+      if (options.populateFilters) populateFilters();
+      renderContext = buildFilterContext();
       renderMetrics();
       renderTabs();
       renderTable();
       renderBasket();
       renderStatus();
+      renderContext = null;
     }
 
     function sqlQuote(value) {
@@ -832,7 +866,7 @@
         tables[key].rows = rows;
         if (!tables[key].columns.length && rows[0]) tables[key].columns = Object.keys(rows[0]);
       }
-      renderAll();
+      renderAll({ populateFilters: true });
     });
 
     async function handleTemplateUpload(kind, event) {
@@ -873,8 +907,14 @@
       handleTemplateUpload("drop", event);
     });
 
-    ["searchBox", "publisherFilter", "publisherDbFilter", "publicationFilter", "subscriberFilter", "typeFilter"].forEach(id => {
-      document.getElementById(id).addEventListener("input", renderAll);
+    let searchRenderTimer = 0;
+    document.getElementById("searchBox").addEventListener("input", () => {
+      clearTimeout(searchRenderTimer);
+      searchRenderTimer = setTimeout(() => renderAll(), 120);
+    });
+
+    ["publisherFilter", "publisherDbFilter", "publicationFilter", "subscriberFilter", "typeFilter"].forEach(id => {
+      document.getElementById(id).addEventListener("change", () => renderAll());
     });
 
     document.getElementById("tabs").addEventListener("click", event => {
@@ -899,24 +939,34 @@
       if (!checkbox) return;
       if (checkbox.checked) state.selectedArticles.add(checkbox.dataset.article);
       else state.selectedArticles.delete(checkbox.dataset.article);
-      renderAll();
+      renderBasket();
+      renderSelectedMetric();
     });
 
     document.getElementById("articleBasket").addEventListener("click", event => {
       const remove = event.target.closest("[data-remove]");
       if (!remove) return;
       state.selectedArticles.delete(remove.dataset.remove);
-      renderAll();
+      document.querySelectorAll("#tableHost [data-article]")
+        .forEach(checkbox => {
+          if (checkbox.dataset.article === remove.dataset.remove) checkbox.checked = false;
+        });
+      renderBasket();
+      renderSelectedMetric();
     });
 
     document.getElementById("selectVisibleBtn").addEventListener("click", () => {
       filteredRows("articles").forEach(row => row.ArticleName && state.selectedArticles.add(row.ArticleName));
-      renderAll();
+      document.querySelectorAll("#tableHost [data-article]").forEach(checkbox => { checkbox.checked = true; });
+      renderBasket();
+      renderSelectedMetric();
     });
 
     document.getElementById("clearSelectionBtn").addEventListener("click", () => {
       state.selectedArticles.clear();
-      renderAll();
+      document.querySelectorAll("#tableHost [data-article]").forEach(checkbox => { checkbox.checked = false; });
+      renderBasket();
+      renderSelectedMetric();
     });
 
     document.getElementById("generateAddBtn").addEventListener("click", () => generateScript("add"));
@@ -938,18 +988,18 @@
 
     document.getElementById("loadDemoBtn").addEventListener("click", () => {
       for (const [key, rows] of Object.entries(demoRows)) tables[key].rows = rows;
-      renderAll();
+      renderAll({ populateFilters: true });
     });
 
     document.getElementById("clearBtn").addEventListener("click", () => {
       for (const table of Object.values(tables)) table.rows = [];
       state.selectedArticles.clear();
       document.getElementById("scriptOutput").value = "";
-      renderAll();
+      renderAll({ populateFilters: true });
     });
 
     initializeTemplateStatus();
-    renderAll();
+    renderAll({ populateFilters: true });
   </script>
 </body>
 </html>
