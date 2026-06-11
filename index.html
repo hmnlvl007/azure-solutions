@@ -458,23 +458,33 @@
     const tableGroups = {
       replication: {
         title: "Replication",
-        tables: ["topology", "publications", "articles", "subscriptions", "schedules", "distributors"]
+        tables: ["topology", "publications", "articles", "subscriptions", "schedules", "distributors"],
+        countTable: "topology",
+        countLabel: "topology rows"
       },
       server: {
         title: "Server Inventory",
-        tables: ["inventory"]
+        tables: ["inventory"],
+        countTable: "inventory",
+        countLabel: "servers"
       },
       database: {
         title: "Database Inventory",
-        tables: ["databaseInventory", "databaseUserDatabases", "databaseServerSummary"]
+        tables: ["databaseInventory", "databaseUserDatabases", "databaseServerSummary"],
+        countTable: "databaseInventory",
+        countLabel: "rows"
       },
       ag: {
         title: "Availability Groups",
-        tables: ["agReplicas", "agDatabases", "agListeners"]
+        tables: ["agReplicas", "agDatabases", "agListeners"],
+        countUnique: ["agReplicas", "agDatabases", "agListeners", "AGName"],
+        countLabel: "AGs"
       },
       cdc: {
         title: "CDC",
-        tables: ["cdcDatabases", "cdcTables", "cdcJobs"]
+        tables: ["cdcDatabases", "cdcTables", "cdcJobs"],
+        countTable: "cdcDatabases",
+        countLabel: "DBs"
       }
     };
 
@@ -809,7 +819,8 @@
         ["Publishers", unique(f("publications").concat(f("topology")), "PublisherServer")],
         ["Publications", unique(f("publications").concat(f("topology")), "PublicationName")],
         ["Articles", unique(f("articles"), "ArticleName")],
-        ["Databases", unique(f("databaseInventory").concat(f("databaseUserDatabases")), "DatabaseName")],
+        ["DB Rows", f("databaseInventory").length],
+        ["Unique DB Names", unique(f("databaseInventory"), "DatabaseName")],
         ["AGs", unique(f("agReplicas").concat(f("agDatabases").concat(f("agListeners"))), "AGName")],
         ["CDC DBs", unique(f("cdcDatabases").concat(f("cdcTables").concat(f("cdcJobs"))), "DatabaseName")],
         ["Subscribers", unique(f("subscriptions").concat(f("topology")), "SubscriberServer")],
@@ -842,8 +853,10 @@
 
     function renderViewTabs() {
       document.getElementById("viewTabs").innerHTML = Object.entries(tableGroups).map(([key, group]) => {
-        const count = group.tables.reduce((sum, tableKey) => sum + filteredRows(tableKey).length, 0);
-        return `<button class="view-tab ${key === state.group ? "active" : ""}" data-group="${key}" type="button">${group.title} (${count})</button>`;
+        const count = group.countUnique
+          ? new Set(group.countUnique.slice(0, -1).flatMap(tableKey => filteredRows(tableKey).map(row => row[group.countUnique.at(-1)]).filter(Boolean))).size
+          : filteredRows(group.countTable || group.tables[0]).length;
+        return `<button class="view-tab ${key === state.group ? "active" : ""}" data-group="${key}" type="button">${group.title} (${count} ${group.countLabel || "rows"})</button>`;
       }).join("");
     }
 
@@ -906,7 +919,23 @@
     }
 
     function renderStatus() {
-      const loaded = Object.entries(tables).filter(([, t]) => t.rows.length).map(([k, t]) => `${t.title}: ${t.rows.length}`);
+      const loaded = [
+        tables.topology.rows.length ? `Topology: ${tables.topology.rows.length}` : "",
+        tables.publications.rows.length ? `Publications: ${tables.publications.rows.length}` : "",
+        tables.articles.rows.length ? `Articles: ${tables.articles.rows.length}` : "",
+        tables.subscriptions.rows.length ? `Subscriptions: ${tables.subscriptions.rows.length}` : "",
+        tables.distributors.rows.length ? `Distributors: ${tables.distributors.rows.length}` : "",
+        tables.inventory.rows.length ? `Server Inventory: ${tables.inventory.rows.length}` : "",
+        tables.databaseInventory.rows.length ? `All Databases: ${tables.databaseInventory.rows.length}` : "",
+        tables.databaseUserDatabases.rows.length ? `User Databases: ${tables.databaseUserDatabases.rows.length}` : "",
+        tables.databaseServerSummary.rows.length ? `DB Server Summary: ${tables.databaseServerSummary.rows.length}` : "",
+        tables.agReplicas.rows.length ? `AG Replicas: ${tables.agReplicas.rows.length}` : "",
+        tables.agDatabases.rows.length ? `AG Database Rows: ${tables.agDatabases.rows.length}` : "",
+        tables.agListeners.rows.length ? `AG Listeners: ${tables.agListeners.rows.length}` : "",
+        tables.cdcDatabases.rows.length ? `CDC Databases: ${tables.cdcDatabases.rows.length}` : "",
+        tables.cdcTables.rows.length ? `CDC Tables: ${tables.cdcTables.rows.length}` : "",
+        tables.cdcJobs.rows.length ? `CDC Jobs: ${tables.cdcJobs.rows.length}` : ""
+      ].filter(Boolean);
       document.getElementById("datasetStatus").textContent = loaded.length ? loaded.join(" | ") : "No CMS report files loaded";
     }
 
