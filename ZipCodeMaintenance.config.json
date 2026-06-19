@@ -1,0 +1,30 @@
+{
+  "OutputDirectory": "C:\\Temp\\ZipCodeReports",
+  "CredentialDirectory": ".secrets",
+  "SchemaName": "dbo",
+  "TableName": "ZipCodes",
+  "BackupTablePrefix": "ZipCodes_Backup",
+  "KeyColumns": [
+    "ZipCode"
+  ],
+  "Environments": {
+    "Dev": {
+      "Server": "DEV-SQL-SERVER",
+      "Database": "YourDatabase",
+      "IntegratedSecurity": false,
+      "CredentialTarget": "ZipCodeSelfService-Dev"
+    },
+    "IT": {
+      "Server": "IT-SQL-SERVER",
+      "Database": "YourDatabase",
+      "IntegratedSecurity": false,
+      "CredentialTarget": "ZipCodeSelfService-IT"
+    },
+    "Prod": {
+      "Server": "PROD-SQL-SERVER",
+      "Database": "YourDatabase",
+      "IntegratedSecurity": false,
+      "CredentialTarget": "ZipCodeSelfService-Prod"
+    }
+  }
+}
