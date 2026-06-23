@@ -9,6 +9,7 @@ param(
     [string]$Environment = 'Dev',
 
     [string]$ConfigPath = (Join-Path $PSScriptRoot 'ZipCodeMaintenance.config.json'),
+    [Alias('OutputPtath')]
     [string]$OutputPath,
     [string]$BackupTable,
     [switch]$Force
@@ -303,12 +304,15 @@ function Get-ValidationData {
     $backupTableName = $RequestedBackupTable
 
     if ([string]::IsNullOrWhiteSpace($backupTableName)) {
+        Write-Host "Finding latest backup table for $EnvironmentName..."
         $backupTableName = Get-LatestBackupTableName -ConnectionString $connectionString -SchemaName $schemaName -BackupTablePrefix $Config.BackupTablePrefix
     }
     elseif ($backupTableName.Contains('.')) {
         $backupTableName = $backupTableName.Split('.')[-1].Trim('[', ']')
     }
 
+    Write-Host "Using backup table $schemaName.$backupTableName for $EnvironmentName."
+    Write-Host "Reading column list for $schemaName.$currentTableName..."
     $columns = Get-TableColumnNames -ConnectionString $connectionString -SchemaName $schemaName -TableName $currentTableName
     $selectColumns = ($columns | ForEach-Object { 'src.' + (Join-SqlName $_) }) -join ', '
     $keyPredicateCurrentMissing = ($Config.KeyColumns | ForEach-Object {
@@ -345,15 +349,20 @@ ORDER BY $orderByColumns;
 SELECT $selectColumns
 FROM $backupTable src
 LEFT JOIN $currentTable cur ON $deletedJoinPredicate
-WHERE $keyPredicateCurrentMissing
+    WHERE $keyPredicateCurrentMissing
 ORDER BY $orderByColumns;
 "@
+
+    Write-Host "Checking new rows for $EnvironmentName..."
+    $newRows = Invoke-SqlDataTable -ConnectionString $connectionString -CommandText $newSql
+    Write-Host "Checking deleted rows for $EnvironmentName..."
+    $deletedRows = Invoke-SqlDataTable -ConnectionString $connectionString -CommandText $deletedSql
 
     [pscustomobject]@{
         EnvironmentName = $EnvironmentName
         BackupTable     = "$schemaName.$backupTableName"
-        NewRows         = Invoke-SqlDataTable -ConnectionString $connectionString -CommandText $newSql
-        DeletedRows     = Invoke-SqlDataTable -ConnectionString $connectionString -CommandText $deletedSql
+        NewRows         = $newRows
+        DeletedRows     = $deletedRows
     }
 }
 
@@ -399,6 +408,7 @@ function Add-WorksheetFromDataTable {
 
     $worksheet = $Workbook.Worksheets.Add()
     $worksheet.Name = $WorksheetName
+    Write-Host "Writing worksheet $WorksheetName..."
 
     for ($columnIndex = 0; $columnIndex -lt $Table.Columns.Count; $columnIndex++) {
         $worksheet.Cells.Item(1, $columnIndex + 1) = $Table.Columns[$columnIndex].ColumnName
@@ -461,6 +471,7 @@ function Export-ValidationWorkbook {
         [string]$Path
     )
 
+    $resolvedPath = [System.IO.Path]::GetFullPath($Path)
     $excel = $null
     $workbook = $null
 
@@ -469,16 +480,21 @@ function Export-ValidationWorkbook {
         $excel.Visible = $false
         $excel.DisplayAlerts = $false
 
-        $directory = Split-Path -Parent $Path
+        $directory = Split-Path -Parent $resolvedPath
         if (-not (Test-Path -LiteralPath $directory)) {
             New-Item -ItemType Directory -Path $directory | Out-Null
         }
 
-        if (Test-Path -LiteralPath $Path) {
-            $workbook = $excel.Workbooks.Open($Path)
+        Write-Host "Writing validation workbook: $resolvedPath"
+        if (Test-Path -LiteralPath $resolvedPath) {
+            $workbook = $excel.Workbooks.Open($resolvedPath)
         }
         else {
             $workbook = $excel.Workbooks.Add()
+        }
+
+        if ($workbook.ReadOnly) {
+            throw "Workbook is read-only or locked by another process: $resolvedPath. Close it in Excel and rerun Validate."
         }
 
         foreach ($envName in @('Dev', 'IT', 'Prod')) {
@@ -496,12 +512,16 @@ function Export-ValidationWorkbook {
         Set-WorksheetOrder -Workbook $workbook
         Remove-BlankWorksheets -Workbook $workbook
 
-        if (Test-Path -LiteralPath $Path) {
+        if (Test-Path -LiteralPath $resolvedPath) {
             $workbook.Save()
         }
         else {
-            $workbook.SaveAs($Path, 51)
+            $workbook.SaveAs($resolvedPath, 51)
         }
+
+        $sheetNames = @($workbook.Worksheets | ForEach-Object { $_.Name }) -join ', '
+        Write-Host "Workbook sheets: $sheetNames"
+        return $resolvedPath
     }
     finally {
         if ($null -ne $workbook) {
@@ -550,12 +570,12 @@ switch ($Action) {
             $OutputPath = Join-Path $outputDirectory ('ZipCodeChanges{0}.xlsx' -f (Get-Date -Format 'yyyyMMdd_HHmmss'))
         }
 
-        Export-ValidationWorkbook -ValidationData $data -Path $OutputPath
+        $savedOutputPath = Export-ValidationWorkbook -ValidationData $data -Path $OutputPath
 
         foreach ($item in $data) {
             Write-Host ("{0}: Backup={1}; New={2}; Deleted={3}" -f $item.EnvironmentName, $item.BackupTable, $item.NewRows.Rows.Count, $item.DeletedRows.Rows.Count)
         }
 
-        Write-Host "Validation workbook created: $OutputPath"
+        Write-Host "Validation workbook created: $savedOutputPath"
     }
 }
