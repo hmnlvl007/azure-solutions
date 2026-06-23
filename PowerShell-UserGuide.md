@@ -53,6 +53,17 @@ To validate one environment:
 .\Invoke-ZipCodeMaintenance.ps1 Validate Dev
 ```
 
+To accumulate environment tabs into the same workbook, pass the same `-OutputPath` for each environment:
+
+```powershell
+$report = 'C:\Temp\ZipCodeReports\ZipCodeChanges20260618.xlsx'
+.\Invoke-ZipCodeMaintenance.ps1 Validate Dev -OutputPath $report
+.\Invoke-ZipCodeMaintenance.ps1 Validate IT -OutputPath $report
+.\Invoke-ZipCodeMaintenance.ps1 Validate Prod -OutputPath $report
+```
+
+If the workbook already exists, the script replaces only the selected environment's `New` and `Deleted` tabs and leaves the other environment tabs in place.
+
 To compare against a specific backup table:
 
 ```powershell

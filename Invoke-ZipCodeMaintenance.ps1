@@ -357,6 +357,39 @@ ORDER BY $orderByColumns;
     }
 }
 
+function Get-WorksheetByName {
+    param(
+        [object]$Workbook,
+        [string]$WorksheetName
+    )
+
+    foreach ($worksheet in $Workbook.Worksheets) {
+        if ($worksheet.Name -eq $WorksheetName) {
+            return $worksheet
+        }
+    }
+
+    return $null
+}
+
+function Remove-WorksheetByName {
+    param(
+        [object]$Workbook,
+        [string]$WorksheetName
+    )
+
+    $worksheet = Get-WorksheetByName -Workbook $Workbook -WorksheetName $WorksheetName
+    if ($null -eq $worksheet) {
+        return
+    }
+
+    if ($Workbook.Worksheets.Count -eq 1) {
+        [void]$Workbook.Worksheets.Add($null, $Workbook.Worksheets.Item($Workbook.Worksheets.Count))
+    }
+
+    $worksheet.Delete()
+}
+
 function Add-WorksheetFromDataTable {
     param(
         [object]$Workbook,
@@ -364,7 +397,7 @@ function Add-WorksheetFromDataTable {
         [System.Data.DataTable]$Table
     )
 
-    $worksheet = $Workbook.Worksheets.Add()
+    $worksheet = $Workbook.Worksheets.Add($null, $Workbook.Worksheets.Item($Workbook.Worksheets.Count))
     $worksheet.Name = $WorksheetName
 
     for ($columnIndex = 0; $columnIndex -lt $Table.Columns.Count; $columnIndex++) {
@@ -385,6 +418,43 @@ function Add-WorksheetFromDataTable {
     }
 }
 
+function Remove-BlankWorksheets {
+    param([object]$Workbook)
+
+    foreach ($worksheet in @($Workbook.Worksheets)) {
+        if ($Workbook.Worksheets.Count -eq 1) {
+            break
+        }
+
+        $usedRange = $worksheet.UsedRange
+        if ($usedRange.Rows.Count -eq 1 -and
+            $usedRange.Columns.Count -eq 1 -and
+            [string]::IsNullOrWhiteSpace([string]$usedRange.Cells.Item(1, 1).Text)) {
+            $worksheet.Delete()
+        }
+    }
+}
+
+function Set-WorksheetOrder {
+    param([object]$Workbook)
+
+    $orderedNames = @(
+        'DevNew',
+        'DevDeleted',
+        'ITNew',
+        'ITDeleted',
+        'ProdNew',
+        'ProdDeleted'
+    )
+
+    for ($index = $orderedNames.Count - 1; $index -ge 0; $index--) {
+        $worksheet = Get-WorksheetByName -Workbook $Workbook -WorksheetName $orderedNames[$index]
+        if ($null -ne $worksheet) {
+            $worksheet.Move($Workbook.Worksheets.Item(1))
+        }
+    }
+}
+
 function Export-ValidationWorkbook {
     param(
         [pscustomobject[]]$ValidationData,
@@ -398,32 +468,40 @@ function Export-ValidationWorkbook {
         $excel = New-Object -ComObject Excel.Application
         $excel.Visible = $false
         $excel.DisplayAlerts = $false
-        $workbook = $excel.Workbooks.Add()
-
-        while ($workbook.Worksheets.Count -gt 1) {
-            $workbook.Worksheets.Item(1).Delete()
-        }
-
-        foreach ($envName in @('Prod', 'IT', 'Dev')) {
-            $data = $ValidationData | Where-Object { $_.EnvironmentName -eq $envName } | Select-Object -First 1
-            if ($null -eq $data) {
-                continue
-            }
-
-            Add-WorksheetFromDataTable -Workbook $workbook -WorksheetName "$($envName)Deleted" -Table $data.DeletedRows
-            Add-WorksheetFromDataTable -Workbook $workbook -WorksheetName "$($envName)New" -Table $data.NewRows
-        }
-
-        if ($workbook.Worksheets.Count -gt 6) {
-            $workbook.Worksheets.Item($workbook.Worksheets.Count).Delete()
-        }
 
         $directory = Split-Path -Parent $Path
         if (-not (Test-Path -LiteralPath $directory)) {
             New-Item -ItemType Directory -Path $directory | Out-Null
         }
 
-        $workbook.SaveAs($Path, 51)
+        if (Test-Path -LiteralPath $Path) {
+            $workbook = $excel.Workbooks.Open($Path)
+        }
+        else {
+            $workbook = $excel.Workbooks.Add()
+        }
+
+        foreach ($envName in @('Dev', 'IT', 'Prod')) {
+            $data = $ValidationData | Where-Object { $_.EnvironmentName -eq $envName } | Select-Object -First 1
+            if ($null -eq $data) {
+                continue
+            }
+
+            Remove-WorksheetByName -Workbook $workbook -WorksheetName "$($envName)New"
+            Remove-WorksheetByName -Workbook $workbook -WorksheetName "$($envName)Deleted"
+            Add-WorksheetFromDataTable -Workbook $workbook -WorksheetName "$($envName)New" -Table $data.NewRows
+            Add-WorksheetFromDataTable -Workbook $workbook -WorksheetName "$($envName)Deleted" -Table $data.DeletedRows
+        }
+
+        Set-WorksheetOrder -Workbook $workbook
+        Remove-BlankWorksheets -Workbook $workbook
+
+        if (Test-Path -LiteralPath $Path) {
+            $workbook.Save()
+        }
+        else {
+            $workbook.SaveAs($Path, 51)
+        }
     }
     finally {
         if ($null -ne $workbook) {
