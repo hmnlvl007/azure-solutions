@@ -108,7 +108,7 @@ function Invoke-SqlDataTable {
 
     try {
         [void]$adapter.Fill($table)
-        return $table
+        return ,$table
     }
     finally {
         $adapter.Dispose()
