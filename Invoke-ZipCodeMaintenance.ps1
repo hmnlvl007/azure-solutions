@@ -384,7 +384,7 @@ function Remove-WorksheetByName {
     }
 
     if ($Workbook.Worksheets.Count -eq 1) {
-        [void]$Workbook.Worksheets.Add($null, $Workbook.Worksheets.Item($Workbook.Worksheets.Count))
+        [void]$Workbook.Worksheets.Add()
     }
 
     $worksheet.Delete()
@@ -397,7 +397,7 @@ function Add-WorksheetFromDataTable {
         [System.Data.DataTable]$Table
     )
 
-    $worksheet = $Workbook.Worksheets.Add($null, $Workbook.Worksheets.Item($Workbook.Worksheets.Count))
+    $worksheet = $Workbook.Worksheets.Add()
     $worksheet.Name = $WorksheetName
 
     for ($columnIndex = 0; $columnIndex -lt $Table.Columns.Count; $columnIndex++) {
