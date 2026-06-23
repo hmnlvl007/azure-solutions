@@ -168,7 +168,17 @@ function Save-EnvironmentCredential {
         New-Item -ItemType Directory -Path $credentialDirectory | Out-Null
     }
 
-    $credential = Get-Credential -Message "Enter the SQL credential for $EnvironmentName ($($envConfig.Server)\$($envConfig.Database)). It will be DPAPI-encrypted for this Windows user."
+    Write-Host "Enter the SQL credential for $EnvironmentName ($($envConfig.Server), database $($envConfig.Database))."
+    Write-Host 'Use the SQL Server login name, not your Windows account, unless this SQL login is intentionally mapped that way.'
+    Write-Host 'The password will be masked and DPAPI-encrypted for this Windows user.'
+
+    $userName = Read-Host 'SQL login'
+    if ([string]::IsNullOrWhiteSpace($userName)) {
+        throw 'SQL login is required.'
+    }
+
+    $password = Read-Host 'SQL password' -AsSecureString
+    $credential = [System.Management.Automation.PSCredential]::new($userName, $password)
     $credential | Export-Clixml -LiteralPath $credentialFile
     Write-Host "Saved encrypted credential for $EnvironmentName to $credentialFile"
 }

@@ -16,6 +16,8 @@ This adds a PowerShell wrapper for the self-service zip code workflow.
 
 The credential files are written under `.secrets` and encrypted with Windows DPAPI for the current Windows user on this computer. Users do not need to enter SQL credentials during normal runs.
 
+When prompted, enter the SQL Server login name and password for that environment. The password prompt is masked in the console.
+
 If an environment uses Windows authentication, set `IntegratedSecurity` to `true` in the config and skip `SetupCredential` for that environment.
 
 ## Load prep
@@ -56,4 +58,3 @@ To compare against a specific backup table:
 ```powershell
 .\Invoke-ZipCodeMaintenance.ps1 Validate Dev -BackupTable dbo.ZipCodes_Backup_20260619_101500
 ```
-
