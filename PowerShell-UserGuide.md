@@ -20,6 +20,33 @@ When prompted, enter the SQL Server login name and password for that environment
 
 If an environment uses Windows authentication, set `IntegratedSecurity` to `true` in the config and skip `SetupCredential` for that environment.
 
+## Email notifications
+
+Email notification is optional and disabled by default. To enable it, edit `EmailNotification` in `ZipCodeMaintenance.config.json`:
+
+```json
+"EmailNotification": {
+  "Enabled": true,
+  "SmtpServer": "smtp.yourcompany.com",
+  "Port": 25,
+  "UseSsl": false,
+  "From": "zipcode-maintenance@yourcompany.com",
+  "To": [
+    "dba-team@yourcompany.com"
+  ],
+  "Cc": [],
+  "SubjectPrefix": "Zip Code Maintenance"
+}
+```
+
+The script sends a completion email after these successful actions:
+
+- `SetupCredential`: environment and SQL target
+- `LoadPrep`: source table, backup table, backed-up row count, and deleted row count
+- `Validate`: workbook path plus `New` and `Deleted` counts by environment
+
+If one of these actions fails after the config is loaded, the script sends a failure email with the error message and still writes the normal PowerShell error to the console.
+
 ## Load prep
 
 Backs up the current table with SQL Server `SELECT INTO`, deletes all rows from the live table, and prints the backup table name.
@@ -63,6 +90,8 @@ $report = 'C:\Temp\ZipCodeReports\ZipCodeChanges20260618.xlsx'
 ```
 
 If the workbook already exists, the script replaces only the selected environment's `New` and `Deleted` tabs and leaves the other environment tabs in place.
+
+Close the workbook in Excel before running validation. Excel can lock the file while it is open.
 
 To compare against a specific backup table:
 

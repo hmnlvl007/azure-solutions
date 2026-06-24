@@ -140,6 +140,126 @@ function Invoke-SqlNonQuery {
     }
 }
 
+function ConvertTo-StringArray {
+    param([object]$Value)
+
+    if ($null -eq $Value) {
+        return @()
+    }
+
+    if ($Value -is [array]) {
+        return @($Value | Where-Object { -not [string]::IsNullOrWhiteSpace([string]$_) } | ForEach-Object { [string]$_ })
+    }
+
+    if ($Value -is [string]) {
+        return @($Value.Split(';') | Where-Object { -not [string]::IsNullOrWhiteSpace($_) } | ForEach-Object { $_.Trim() })
+    }
+
+    return @([string]$Value)
+}
+
+function Get-OptionalPropertyValue {
+    param(
+        [object]$Object,
+        [string]$Name,
+        [object]$DefaultValue = $null
+    )
+
+    if ($null -eq $Object) {
+        return $DefaultValue
+    }
+
+    $property = $Object.PSObject.Properties[$Name]
+    if ($null -eq $property) {
+        return $DefaultValue
+    }
+
+    return $property.Value
+}
+
+function Send-CompletionNotification {
+    param(
+        [pscustomobject]$Config,
+        [string]$ActionName,
+        [string]$EnvironmentName,
+        [string]$Status = 'completed',
+        [string[]]$DetailLines
+    )
+
+    $emailConfigProperty = $Config.PSObject.Properties['EmailNotification']
+    if ($null -eq $emailConfigProperty) {
+        return
+    }
+
+    $emailConfig = $emailConfigProperty.Value
+    if ($null -eq $emailConfig -or -not (Get-OptionalPropertyValue -Object $emailConfig -Name 'Enabled' -DefaultValue $false)) {
+        return
+    }
+
+    $to = ConvertTo-StringArray (Get-OptionalPropertyValue -Object $emailConfig -Name 'To')
+    if ($to.Count -eq 0) {
+        Write-Warning 'Email notification is enabled, but no recipients are configured.'
+        return
+    }
+
+    $smtpServer = [string](Get-OptionalPropertyValue -Object $emailConfig -Name 'SmtpServer')
+    $from = [string](Get-OptionalPropertyValue -Object $emailConfig -Name 'From')
+    if ([string]::IsNullOrWhiteSpace($smtpServer) -or [string]::IsNullOrWhiteSpace($from)) {
+        Write-Warning 'Email notification is enabled, but SmtpServer or From is missing.'
+        return
+    }
+
+    $subjectPrefix = [string](Get-OptionalPropertyValue -Object $emailConfig -Name 'SubjectPrefix')
+    if ([string]::IsNullOrWhiteSpace($subjectPrefix)) {
+        $subjectPrefix = 'Zip Code Maintenance'
+    }
+
+    $subject = "$subjectPrefix - $ActionName $Status for $EnvironmentName"
+    $bodyLines = @(
+        "Action: $ActionName",
+        "Environment: $EnvironmentName",
+        "Status: $Status",
+        "Completed: $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')",
+        "User: $env:USERNAME",
+        "Computer: $env:COMPUTERNAME"
+    )
+
+    if ($DetailLines.Count -gt 0) {
+        $bodyLines += ''
+        $bodyLines += $DetailLines
+    }
+
+    $mailParameters = @{
+        SmtpServer = $smtpServer
+        From       = $from
+        To         = $to
+        Subject    = $subject
+        Body       = ($bodyLines -join [Environment]::NewLine)
+    }
+
+    $port = Get-OptionalPropertyValue -Object $emailConfig -Name 'Port'
+    if ($null -ne $port) {
+        $mailParameters.Port = [int]$port
+    }
+
+    if (Get-OptionalPropertyValue -Object $emailConfig -Name 'UseSsl' -DefaultValue $false) {
+        $mailParameters.UseSsl = $true
+    }
+
+    $cc = ConvertTo-StringArray (Get-OptionalPropertyValue -Object $emailConfig -Name 'Cc')
+    if ($cc.Count -gt 0) {
+        $mailParameters.Cc = $cc
+    }
+
+    try {
+        Send-MailMessage @mailParameters
+        Write-Host "Email notification sent to $($to -join ', ')."
+    }
+    catch {
+        Write-Warning "Email notification failed: $($_.Exception.Message)"
+    }
+}
+
 function Save-EnvironmentCredential {
     param(
         [pscustomobject]$Config,
@@ -147,10 +267,10 @@ function Save-EnvironmentCredential {
     )
 
     if ($EnvironmentName -eq 'All') {
-        foreach ($name in @('Dev', 'IT', 'Prod')) {
+        $results = foreach ($name in @('Dev', 'IT', 'Prod')) {
             Save-EnvironmentCredential -Config $Config -EnvironmentName $name
         }
-        return
+        return ,$results
     }
 
     $envConfig = $Config.Environments.$EnvironmentName
@@ -160,7 +280,13 @@ function Save-EnvironmentCredential {
 
     if ($envConfig.IntegratedSecurity) {
         Write-Host "$EnvironmentName uses Integrated Security. No saved credential is needed."
-        return
+        return [pscustomobject]@{
+            EnvironmentName = $EnvironmentName
+            Status          = 'IntegratedSecurity'
+            Server          = $envConfig.Server
+            Database        = $envConfig.Database
+            CredentialFile  = $null
+        }
     }
 
     $credentialFile = Get-CredentialFilePath -Config $Config -EnvironmentName $EnvironmentName
@@ -182,6 +308,14 @@ function Save-EnvironmentCredential {
     $credential = [System.Management.Automation.PSCredential]::new($userName, $password)
     $credential | Export-Clixml -LiteralPath $credentialFile
     Write-Host "Saved encrypted credential for $EnvironmentName to $credentialFile"
+
+    [pscustomobject]@{
+        EnvironmentName = $EnvironmentName
+        Status          = 'Saved'
+        Server          = $envConfig.Server
+        Database        = $envConfig.Database
+        CredentialFile  = $credentialFile
+    }
 }
 
 function Invoke-LoadPrep {
@@ -230,7 +364,10 @@ SELECT
         $confirmation = Read-Host "Type $EnvironmentName to continue"
         if ($confirmation -ne $EnvironmentName) {
             Write-Host 'Load prep cancelled.'
-            return
+            return [pscustomobject]@{
+                EnvironmentName = $EnvironmentName
+                Status          = 'Cancelled'
+            }
         }
     }
 
@@ -238,6 +375,20 @@ SELECT
         $result = Invoke-SqlDataTable -ConnectionString $connectionString -CommandText $sql
         $result | Format-Table -AutoSize
         Write-Host "$EnvironmentName is ready to load new data. Backup table: $schemaName.$backupName"
+
+        return [pscustomobject]@{
+            EnvironmentName = $EnvironmentName
+            Status          = 'Completed'
+            SourceTable     = "$schemaName.$tableName"
+            BackupTable     = "$schemaName.$backupName"
+            BackedUpRows    = $result.Rows[0]['BackedUpRows']
+            DeletedRows     = $result.Rows[0]['DeletedRows']
+        }
+    }
+
+    [pscustomobject]@{
+        EnvironmentName = $EnvironmentName
+        Status          = 'Skipped'
     }
 }
 
@@ -539,43 +690,90 @@ function Export-ValidationWorkbook {
     }
 }
 
-$config = Read-JsonConfig -Path $ConfigPath
+$config = $null
 
-switch ($Action) {
-    'SetupCredential' {
-        Save-EnvironmentCredential -Config $config -EnvironmentName $Environment
-    }
+try {
+    $config = Read-JsonConfig -Path $ConfigPath
 
-    'LoadPrep' {
-        if ($Environment -eq 'All') {
-            throw 'LoadPrep requires one environment: Dev, IT, or Prod.'
-        }
+    switch ($Action) {
+        'SetupCredential' {
+            $credentialResults = @(Save-EnvironmentCredential -Config $config -EnvironmentName $Environment)
+            $detailLines = foreach ($item in $credentialResults) {
+                if ($null -eq $item) {
+                    continue
+                }
 
-        Invoke-LoadPrep -Config $config -EnvironmentName $Environment
-    }
-
-    'Validate' {
-        $envNames = Get-EnvironmentNames -RequestedEnvironment $Environment
-        $data = foreach ($envName in $envNames) {
-            Write-Host "Collecting validation data for $envName..."
-            Get-ValidationData -Config $config -EnvironmentName $envName -RequestedBackupTable $BackupTable
-        }
-
-        if ([string]::IsNullOrWhiteSpace($OutputPath)) {
-            $outputDirectory = $config.OutputDirectory
-            if (-not [System.IO.Path]::IsPathRooted($outputDirectory)) {
-                $outputDirectory = Join-Path $PSScriptRoot $outputDirectory
+                if ($item.Status -eq 'Saved') {
+                    "Credential saved for $($item.EnvironmentName): $($item.Server), database $($item.Database)"
+                }
+                elseif ($item.Status -eq 'IntegratedSecurity') {
+                    "$($item.EnvironmentName) uses Integrated Security; no credential file was needed."
+                }
             }
 
-            $OutputPath = Join-Path $outputDirectory ('ZipCodeChanges{0}.xlsx' -f (Get-Date -Format 'yyyyMMdd_HHmmss'))
+            Send-CompletionNotification -Config $config -ActionName 'SetupCredential' -EnvironmentName $Environment -DetailLines $detailLines
         }
 
-        $savedOutputPath = Export-ValidationWorkbook -ValidationData $data -Path $OutputPath
+        'LoadPrep' {
+            if ($Environment -eq 'All') {
+                throw 'LoadPrep requires one environment: Dev, IT, or Prod.'
+            }
 
-        foreach ($item in $data) {
-            Write-Host ("{0}: Backup={1}; New={2}; Deleted={3}" -f $item.EnvironmentName, $item.BackupTable, $item.NewRows.Rows.Count, $item.DeletedRows.Rows.Count)
+            $loadResult = Invoke-LoadPrep -Config $config -EnvironmentName $Environment
+            if ($null -ne $loadResult -and $loadResult.Status -eq 'Completed') {
+                $detailLines = @(
+                    "Source table: $($loadResult.SourceTable)",
+                    "Backup table: $($loadResult.BackupTable)",
+                    "Backed up rows: $($loadResult.BackedUpRows)",
+                    "Deleted rows: $($loadResult.DeletedRows)"
+                )
+
+                Send-CompletionNotification -Config $config -ActionName 'LoadPrep' -EnvironmentName $Environment -DetailLines $detailLines
+            }
         }
 
-        Write-Host "Validation workbook created: $savedOutputPath"
+        'Validate' {
+            $envNames = Get-EnvironmentNames -RequestedEnvironment $Environment
+            $data = foreach ($envName in $envNames) {
+                Write-Host "Collecting validation data for $envName..."
+                Get-ValidationData -Config $config -EnvironmentName $envName -RequestedBackupTable $BackupTable
+            }
+
+            if ([string]::IsNullOrWhiteSpace($OutputPath)) {
+                $outputDirectory = $config.OutputDirectory
+                if (-not [System.IO.Path]::IsPathRooted($outputDirectory)) {
+                    $outputDirectory = Join-Path $PSScriptRoot $outputDirectory
+                }
+
+                $OutputPath = Join-Path $outputDirectory ('ZipCodeChanges{0}.xlsx' -f (Get-Date -Format 'yyyyMMdd_HHmmss'))
+            }
+
+            $savedOutputPath = Export-ValidationWorkbook -ValidationData $data -Path $OutputPath
+
+            foreach ($item in $data) {
+                Write-Host ("{0}: Backup={1}; New={2}; Deleted={3}" -f $item.EnvironmentName, $item.BackupTable, $item.NewRows.Rows.Count, $item.DeletedRows.Rows.Count)
+            }
+
+            Write-Host "Validation workbook created: $savedOutputPath"
+
+            $detailLines = @("Workbook: $savedOutputPath")
+            $detailLines += foreach ($item in $data) {
+                "$($item.EnvironmentName): Backup=$($item.BackupTable); New=$($item.NewRows.Rows.Count); Deleted=$($item.DeletedRows.Rows.Count)"
+            }
+
+            Send-CompletionNotification -Config $config -ActionName 'Validate' -EnvironmentName $Environment -DetailLines $detailLines
+        }
     }
+}
+catch {
+    if ($null -ne $config) {
+        $detailLines = @(
+            "Error: $($_.Exception.Message)",
+            "Script: $($MyInvocation.MyCommand.Path)"
+        )
+
+        Send-CompletionNotification -Config $config -ActionName $Action -EnvironmentName $Environment -Status 'failed' -DetailLines $detailLines
+    }
+
+    throw
 }

@@ -7,6 +7,18 @@
   "KeyColumns": [
     "ZipCode"
   ],
+  "EmailNotification": {
+    "Enabled": false,
+    "SmtpServer": "smtp.yourcompany.com",
+    "Port": 25,
+    "UseSsl": false,
+    "From": "zipcode-maintenance@yourcompany.com",
+    "To": [
+      "dba-team@yourcompany.com"
+    ],
+    "Cc": [],
+    "SubjectPrefix": "Zip Code Maintenance"
+  },
   "Environments": {
     "Dev": {
       "Server": "DEV-SQL-SERVER",
