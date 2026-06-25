@@ -196,7 +196,7 @@ function Send-CompletionNotification {
         return
     }
 
-    $to = ConvertTo-StringArray (Get-OptionalPropertyValue -Object $emailConfig -Name 'To')
+    $to = @(ConvertTo-StringArray (Get-OptionalPropertyValue -Object $emailConfig -Name 'To'))
     if ($to.Count -eq 0) {
         Write-Warning 'Email notification is enabled, but no recipients are configured.'
         return
@@ -224,9 +224,10 @@ function Send-CompletionNotification {
         "Computer: $env:COMPUTERNAME"
     )
 
-    if ($DetailLines.Count -gt 0) {
+    $details = @($DetailLines)
+    if ($details.Count -gt 0) {
         $bodyLines += ''
-        $bodyLines += $DetailLines
+        $bodyLines += $details
     }
 
     $mailParameters = @{
@@ -246,7 +247,7 @@ function Send-CompletionNotification {
         $mailParameters.UseSsl = $true
     }
 
-    $cc = ConvertTo-StringArray (Get-OptionalPropertyValue -Object $emailConfig -Name 'Cc')
+    $cc = @(ConvertTo-StringArray (Get-OptionalPropertyValue -Object $emailConfig -Name 'Cc'))
     if ($cc.Count -gt 0) {
         $mailParameters.Cc = $cc
     }
