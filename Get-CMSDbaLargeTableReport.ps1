@@ -134,6 +134,7 @@ if (-not $invokeDbaQueryCommand) {
 
 $script:InvokeDbaQuerySupportsTrustServerCertificate = $invokeDbaQueryCommand.Parameters.ContainsKey('TrustServerCertificate')
 $script:InvokeDbaQuerySupportsEncryptConnection = $invokeDbaQueryCommand.Parameters.ContainsKey('EncryptConnection')
+$script:LastSqlQueryError = $null
 
 function Invoke-SqlQuerySafe {
     param(
@@ -148,6 +149,8 @@ function Invoke-SqlQuerySafe {
 
         [int]$QueryTimeout = 120
     )
+
+    $script:LastSqlQueryError = $null
 
     try {
         $queryParams = @{
@@ -168,7 +171,8 @@ function Invoke-SqlQuerySafe {
         Invoke-DbaQuery @queryParams
     }
     catch {
-        Write-Warning "Failed to query [$ServerInstance]: $($_.Exception.Message)"
+        $script:LastSqlQueryError = $_.Exception.Message
+        Write-Warning "Failed to query [$ServerInstance]: $script:LastSqlQueryError"
         return $null
     }
 }
@@ -281,9 +285,9 @@ if (-not (Test-Path $OutputPath -PathType Container)) {
     New-Item -ItemType Directory -Force -Path $OutputPath -ErrorAction Stop | Out-Null
 }
 
-Write-Host "═══════════════════════════════════════════════════════════════" -ForegroundColor Cyan
+Write-Host "===============================================================" -ForegroundColor Cyan
 Write-Host "  SQL Server CMS - DBA Large Tables Report                     " -ForegroundColor Cyan
-Write-Host "═══════════════════════════════════════════════════════════════" -ForegroundColor Cyan
+Write-Host "===============================================================" -ForegroundColor Cyan
 Write-Host ""
 
 if ($PSCmdlet.ParameterSetName -eq 'Excel') {
@@ -349,9 +353,21 @@ Write-Host ""
 
 $escapedDatabaseName = $DatabaseName.Replace("'", "''")
 $collectionQuery = @"
-IF DB_ID(N'$escapedDatabaseName') IS NULL
+DECLARE @TargetDatabase sysname;
+
+SELECT TOP (1)
+    @TargetDatabase = d.name
+FROM sys.databases d
+WHERE d.name = N'$escapedDatabaseName'
+   OR UPPER(d.name) = UPPER(N'$escapedDatabaseName')
+ORDER BY
+    CASE WHEN d.name = N'$escapedDatabaseName' THEN 0 ELSE 1 END,
+    d.name;
+
+IF @TargetDatabase IS NULL
 BEGIN
     SELECT
+        CAST(N'$escapedDatabaseName' AS sysname) AS DatabaseName,
         CAST(NULL AS sysname) AS SchemaName,
         CAST(NULL AS sysname) AS TableName,
         CAST(NULL AS bigint) AS RowCounts,
@@ -363,7 +379,7 @@ BEGIN
 END;
 
 DECLARE @sql nvarchar(max) = N'
-USE ' + QUOTENAME(N'$escapedDatabaseName') + N';
+USE ' + QUOTENAME(@TargetDatabase) + N';
 
 ;WITH RowCounts AS
 (
@@ -389,6 +405,7 @@ DatabaseSize AS
     FROM sys.database_files
 )
 SELECT TOP ($Top)
+    DB_NAME() AS DatabaseName,
     s.name AS SchemaName,
     t.name AS TableName,
     CONVERT(bigint, ISNULL(rc.RowCounts, 0)) AS RowCounts,
@@ -423,7 +440,7 @@ foreach ($server in $registeredServers) {
             ServerName = $server
             DatabaseName = $DatabaseName
             Status = "Collection failed"
-            Error = "Unable to query server or database."
+            Error = if ([string]::IsNullOrWhiteSpace($script:LastSqlQueryError)) { "Unable to query server or database." } else { $script:LastSqlQueryError }
         })
         continue
     }
@@ -452,7 +469,7 @@ foreach ($server in $registeredServers) {
 
         [void]$eligibleTables.Add([pscustomobject]@{
             ServerName = $server
-            DatabaseName = $DatabaseName
+            DatabaseName = $row.DatabaseName
             SchemaName = $row.SchemaName
             TableName = $row.TableName
             RowCounts = $row.RowCounts
