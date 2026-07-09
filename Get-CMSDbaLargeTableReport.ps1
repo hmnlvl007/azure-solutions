@@ -438,11 +438,21 @@ foreach ($server in $registeredServers) {
     $databaseLookupResult = Invoke-SqlQuerySafe -ServerInstance $server -Database master -Query $databaseLookupQuery -QueryTimeout $QueryTimeout
 
     if ($null -eq $databaseLookupResult) {
+        if ([string]::IsNullOrWhiteSpace($script:LastSqlQueryError)) {
+            [void]$collectionIssues.Add([pscustomobject]@{
+                ServerName = $server
+                DatabaseName = $DatabaseName
+                Status = "Database not found"
+                Error = ""
+            })
+            continue
+        }
+
         [void]$collectionIssues.Add([pscustomobject]@{
             ServerName = $server
             DatabaseName = $DatabaseName
             Status = "Collection failed"
-            Error = if ([string]::IsNullOrWhiteSpace($script:LastSqlQueryError)) { "Unable to query server or database." } else { $script:LastSqlQueryError }
+            Error = $script:LastSqlQueryError
         })
         continue
     }
@@ -473,11 +483,21 @@ foreach ($server in $registeredServers) {
     $queryResult = Invoke-SqlQuerySafe -ServerInstance $server -Database $actualDatabaseName -Query $collectionQuery -QueryTimeout $QueryTimeout
 
     if ($null -eq $queryResult) {
+        if ([string]::IsNullOrWhiteSpace($script:LastSqlQueryError)) {
+            [void]$collectionIssues.Add([pscustomobject]@{
+                ServerName = $server
+                DatabaseName = $actualDatabaseName
+                Status = "No eligible tables found"
+                Error = ""
+            })
+            continue
+        }
+
         [void]$collectionIssues.Add([pscustomobject]@{
             ServerName = $server
             DatabaseName = $actualDatabaseName
             Status = "Collection failed"
-            Error = if ([string]::IsNullOrWhiteSpace($script:LastSqlQueryError)) { "Unable to query server or database." } else { $script:LastSqlQueryError }
+            Error = $script:LastSqlQueryError
         })
         continue
     }
