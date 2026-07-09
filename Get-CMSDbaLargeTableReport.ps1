@@ -416,8 +416,7 @@ SELECT TOP ($Top)
     CONVERT(bigint, ISNULL(rc.RowCounts, 0)) AS RowCounts,
     CONVERT(decimal(18,2), ts.TotalSpaceMB) AS TotalSpaceMB,
     CONVERT(decimal(18,2), ts.UsedSpaceMB) AS UsedSpaceMB,
-    CONVERT(decimal(18,2), ds.DatabaseMB) AS DatabaseMB,
-    CAST(''OK'' AS varchar(100)) AS CollectionStatus
+    CONVERT(decimal(18,2), ds.DatabaseMB) AS DatabaseMB
 FROM sys.tables t
 INNER JOIN sys.schemas s ON t.schema_id = s.schema_id
 INNER JOIN TableSpace ts ON t.object_id = ts.object_id
@@ -495,16 +494,6 @@ foreach ($server in $registeredServers) {
     }
 
     foreach ($row in $rows) {
-        if ($row.CollectionStatus -ne 'OK') {
-            [void]$collectionIssues.Add([pscustomobject]@{
-                ServerName = $server
-                DatabaseName = $actualDatabaseName
-                Status = $row.CollectionStatus
-                Error = ""
-            })
-            continue
-        }
-
         [void]$eligibleTables.Add([pscustomobject]@{
             ServerName = $server
             DatabaseName = $row.DatabaseName
