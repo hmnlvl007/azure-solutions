@@ -37,6 +37,14 @@
 .PARAMETER OutputPath
     Folder where the HTML report will be saved. Defaults to the current directory.
 
+.PARAMETER QueryTimeout
+    Query timeout in seconds for per-server collection queries. Defaults to 120.
+
+.PARAMETER SqlCredential
+    Optional SQL credential used for CMS discovery and server queries when the
+    dbatools command supports SqlCredential. If omitted, dbatools uses the
+    current Windows security context.
+
 .PARAMETER SmtpServer
     SMTP server used to email the report. If omitted, no email is sent.
 
@@ -83,6 +91,11 @@ param(
     [int]$Top = 5,
 
     [string]$OutputPath = (Get-Location).Path,
+
+    [ValidateRange(1, 2147483647)]
+    [int]$QueryTimeout = 120,
+
+    [System.Management.Automation.PSCredential]$SqlCredential,
 
     [string]$SmtpServer,
 
@@ -134,6 +147,7 @@ if (-not $invokeDbaQueryCommand) {
 
 $script:InvokeDbaQuerySupportsTrustServerCertificate = $invokeDbaQueryCommand.Parameters.ContainsKey('TrustServerCertificate')
 $script:InvokeDbaQuerySupportsEncryptConnection = $invokeDbaQueryCommand.Parameters.ContainsKey('EncryptConnection')
+$script:InvokeDbaQuerySupportsSqlCredential = $invokeDbaQueryCommand.Parameters.ContainsKey('SqlCredential')
 $script:LastSqlQueryError = $null
 
 function Invoke-SqlQuerySafe {
@@ -166,6 +180,9 @@ function Invoke-SqlQuerySafe {
         }
         if ($SkipCertValidation -and $script:InvokeDbaQuerySupportsEncryptConnection) {
             $queryParams.EncryptConnection = $false
+        }
+        if ($SqlCredential -and $script:InvokeDbaQuerySupportsSqlCredential) {
+            $queryParams.SqlCredential = $SqlCredential
         }
 
         Invoke-DbaQuery @queryParams
@@ -202,6 +219,9 @@ function Get-CmsRegisteredServers {
     }
     if ($SkipCertValidation -and $registeredServerCommand.Parameters.ContainsKey('EncryptConnection')) {
         $cmsParams.EncryptConnection = $false
+    }
+    if ($SqlCredential -and $registeredServerCommand.Parameters.ContainsKey('SqlCredential')) {
+        $cmsParams.SqlCredential = $SqlCredential
     }
 
     & $registeredServerCommandName @cmsParams |
@@ -352,35 +372,20 @@ Write-Host "  Found $($registeredServers.Count) server(s) from $serverSource." -
 Write-Host ""
 
 $escapedDatabaseName = $DatabaseName.Replace("'", "''")
-$collectionQuery = @"
-DECLARE @TargetDatabase sysname;
-
+$databaseLookupQuery = @"
 SELECT TOP (1)
-    @TargetDatabase = d.name
+    d.name AS DatabaseName,
+    d.state_desc AS DatabaseState,
+    HAS_DBACCESS(d.name) AS HasDbAccess
 FROM sys.databases d
 WHERE d.name = N'$escapedDatabaseName'
    OR UPPER(d.name) = UPPER(N'$escapedDatabaseName')
 ORDER BY
     CASE WHEN d.name = N'$escapedDatabaseName' THEN 0 ELSE 1 END,
     d.name;
+"@
 
-IF @TargetDatabase IS NULL
-BEGIN
-    SELECT
-        CAST(N'$escapedDatabaseName' AS sysname) AS DatabaseName,
-        CAST(NULL AS sysname) AS SchemaName,
-        CAST(NULL AS sysname) AS TableName,
-        CAST(NULL AS bigint) AS RowCounts,
-        CAST(NULL AS decimal(18,2)) AS TotalSpaceMB,
-        CAST(NULL AS decimal(18,2)) AS UsedSpaceMB,
-        CAST(NULL AS decimal(18,2)) AS DatabaseMB,
-        CAST('Database not found' AS varchar(100)) AS CollectionStatus
-    RETURN;
-END;
-
-DECLARE @sql nvarchar(max) = N'
-USE ' + QUOTENAME(@TargetDatabase) + N';
-
+$collectionQuery = @"
 ;WITH RowCounts AS
 (
     SELECT
@@ -420,9 +425,7 @@ LEFT JOIN RowCounts rc ON t.object_id = rc.object_id
 CROSS JOIN DatabaseSize ds
 WHERE t.is_ms_shipped = 0
   AND ts.UsedSpaceMB >= $MinUsedSpaceMB
-ORDER BY ts.UsedSpaceMB DESC, ts.TotalSpaceMB DESC, s.name, t.name;';
-
-EXEC sys.sp_executesql @sql;
+ORDER BY ts.UsedSpaceMB DESC, ts.TotalSpaceMB DESC, s.name, t.name;
 "@
 
 $eligibleTables = [System.Collections.Generic.List[PSObject]]::new()
@@ -433,12 +436,47 @@ foreach ($server in $registeredServers) {
     $serverCount++
     Write-Host "[$serverCount/$($registeredServers.Count)] Querying $server ..." -ForegroundColor White
 
-    $queryResult = Invoke-SqlQuerySafe -ServerInstance $server -Database master -Query $collectionQuery
+    $databaseLookupResult = Invoke-SqlQuerySafe -ServerInstance $server -Database master -Query $databaseLookupQuery -QueryTimeout $QueryTimeout
+
+    if ($null -eq $databaseLookupResult) {
+        [void]$collectionIssues.Add([pscustomobject]@{
+            ServerName = $server
+            DatabaseName = $DatabaseName
+            Status = "Collection failed"
+            Error = if ([string]::IsNullOrWhiteSpace($script:LastSqlQueryError)) { "Unable to query server or database." } else { $script:LastSqlQueryError }
+        })
+        continue
+    }
+
+    $databaseLookupRows = @($databaseLookupResult)
+    if ($databaseLookupRows.Count -eq 0) {
+        [void]$collectionIssues.Add([pscustomobject]@{
+            ServerName = $server
+            DatabaseName = $DatabaseName
+            Status = "Database not found"
+            Error = ""
+        })
+        continue
+    }
+
+    $databaseInfo = $databaseLookupRows[0]
+    $actualDatabaseName = [string]$databaseInfo.DatabaseName
+    if ($databaseInfo.HasDbAccess -ne 1) {
+        [void]$collectionIssues.Add([pscustomobject]@{
+            ServerName = $server
+            DatabaseName = $actualDatabaseName
+            Status = "Database inaccessible"
+            Error = "State=$($databaseInfo.DatabaseState); HAS_DBACCESS=$($databaseInfo.HasDbAccess)"
+        })
+        continue
+    }
+
+    $queryResult = Invoke-SqlQuerySafe -ServerInstance $server -Database $actualDatabaseName -Query $collectionQuery -QueryTimeout $QueryTimeout
 
     if ($null -eq $queryResult) {
         [void]$collectionIssues.Add([pscustomobject]@{
             ServerName = $server
-            DatabaseName = $DatabaseName
+            DatabaseName = $actualDatabaseName
             Status = "Collection failed"
             Error = if ([string]::IsNullOrWhiteSpace($script:LastSqlQueryError)) { "Unable to query server or database." } else { $script:LastSqlQueryError }
         })
@@ -449,7 +487,7 @@ foreach ($server in $registeredServers) {
     if ($rows.Count -eq 0) {
         [void]$collectionIssues.Add([pscustomobject]@{
             ServerName = $server
-            DatabaseName = $DatabaseName
+            DatabaseName = $actualDatabaseName
             Status = "No eligible tables found"
             Error = ""
         })
@@ -460,7 +498,7 @@ foreach ($server in $registeredServers) {
         if ($row.CollectionStatus -ne 'OK') {
             [void]$collectionIssues.Add([pscustomobject]@{
                 ServerName = $server
-                DatabaseName = $DatabaseName
+                DatabaseName = $actualDatabaseName
                 Status = $row.CollectionStatus
                 Error = ""
             })
