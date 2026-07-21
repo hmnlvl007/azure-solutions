@@ -266,6 +266,55 @@ function Get-AllPages {
         return $added
     }
 
+    function Get-ResultIds {
+        param([object[]]$Items)
+
+        $ids = [System.Collections.Generic.List[string]]::new()
+        foreach ($item in @($Items)) {
+            $id = ''
+            try { $id = [string]$item.id } catch { $id = '' }
+            if (-not [string]::IsNullOrWhiteSpace($id)) {
+                $ids.Add($id)
+            }
+        }
+
+        return @($ids)
+    }
+
+    function Add-DiscoveryResultIds {
+        param(
+            [string[]]$Ids,
+            [System.Collections.Generic.HashSet[string]]$SeenIds
+        )
+
+        $newCount = 0
+        foreach ($id in @($Ids)) {
+            if ([string]::IsNullOrWhiteSpace($id)) { continue }
+            if ($SeenIds.Add($id)) { $newCount++ }
+        }
+
+        return $newCount
+    }
+
+    function Get-ResponseTotal {
+        param([object]$Response)
+
+        if ($null -eq $Response) { return $null }
+
+        foreach ($name in @('totalSize', 'total')) {
+            $prop = $null
+            try { $prop = $Response.PSObject.Properties[$name] } catch { $prop = $null }
+            if ($null -eq $prop -or $null -eq $prop.Value) { continue }
+
+            $value = 0
+            if ([int]::TryParse([string]$prop.Value, [ref]$value)) {
+                return $value
+            }
+        }
+
+        return $null
+    }
+
     function Invoke-V2PageDiscovery {
         param([switch]$RelaxedStatus)
 
@@ -346,6 +395,7 @@ function Get-AllPages {
 
         $addedTotal = 0
         $start = 0
+        $seenContentIds = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
         while ($true) {
             if ($Relaxed) {
                 $uri = "$ApiBase/content?spaceKey=$([Uri]::EscapeDataString($Key))&type=page&expand=ancestors,version&limit=$BatchSize&start=$start"
@@ -357,6 +407,13 @@ function Get-AllPages {
             $response = Invoke-RestMethod -Uri $uri -Method Get -Headers $Headers -ErrorAction Stop
             $batch = @(Get-ApiResultItems -Response $response)
             if ($batch.Count -eq 0) { break }
+            $batchIds = @(Get-ResultIds -Items $batch)
+            $newToDiscovery = Add-DiscoveryResultIds -Ids $batchIds -SeenIds $seenContentIds
+            if ($batchIds.Count -gt 0 -and $newToDiscovery -eq 0) {
+                $label = if ($Relaxed) { 'content-relaxed' } else { 'content' }
+                Write-Host ("  {0,-12} start={1,4} got={2,3} repeated result window; stopping pagination" -f $label, $start, $batch.Count) -ForegroundColor DarkYellow
+                break
+            }
 
             $added = Add-UniquePages -Items $batch
             $addedTotal += $added
@@ -365,6 +422,8 @@ function Get-AllPages {
             Write-BatchDiagnostics -Label $label -Start $start -Returned $batch.Count -Response $response -Added $added -Unique $byId.Count
             $start += $batch.Count
             if (-not $response._links.next) { break }
+            $reportedTotal = Get-ResponseTotal -Response $response
+            if ($null -ne $reportedTotal -and $start -ge $reportedTotal) { break }
         }
 
         return $addedTotal
@@ -375,12 +434,19 @@ function Get-AllPages {
     $searchTotal = 0
     try {
         $start = 0
+        $seenSearchIds = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
         $cql = [Uri]::EscapeDataString("space=`"$Key`" AND type=page")
         while ($true) {
             $uri = "$ApiBase/content/search?cql=$cql&expand=ancestors,version&limit=$BatchSize&start=$start"
             $response = Invoke-RestMethod -Uri $uri -Method Get -Headers $Headers -ErrorAction Stop
             $batch = @(Get-ApiResultItems -Response $response)
             if ($batch.Count -eq 0) { break }
+            $batchIds = @(Get-ResultIds -Items $batch)
+            $newToDiscovery = Add-DiscoveryResultIds -Ids $batchIds -SeenIds $seenSearchIds
+            if ($batchIds.Count -gt 0 -and $newToDiscovery -eq 0) {
+                Write-Host ("  cql-search start={0,4} got={1,3} repeated result window; stopping pagination" -f $start, $batch.Count) -ForegroundColor DarkYellow
+                break
+            }
             $added = Add-UniquePages -Items $batch
             $searchTotal += $added
             Write-Host ("  cql-search start={0,4} got={1,3} added={2,3} total={3}" -f $start, $batch.Count, $added, $byId.Count) -ForegroundColor DarkGray
@@ -390,9 +456,7 @@ function Get-AllPages {
             # meets or exceeds the API-reported totalSize (Confluence CQL returns this).
             if (-not $response._links.next) { break }
             if ($batch.Count -lt $BatchSize) { break }
-            $reportedTotal = $null
-            if ($null -ne $response.totalSize) { $reportedTotal = [int]$response.totalSize }
-            elseif ($null -ne $response.total)  { $reportedTotal = [int]$response.total }
+            $reportedTotal = Get-ResponseTotal -Response $response
             if ($null -ne $reportedTotal -and $start -ge $reportedTotal) { break }
         }
     } catch {
@@ -403,11 +467,18 @@ function Get-AllPages {
     if (-not [string]::IsNullOrWhiteSpace($HomePageId)) {
         try {
             $start = 0
+            $seenDescendantIds = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
             while ($true) {
                 $uri = "$ApiBase/content/$HomePageId/descendant/page?expand=ancestors,version&limit=$BatchSize&start=$start"
                 $response = Invoke-RestMethod -Uri $uri -Method Get -Headers $Headers -ErrorAction Stop
                 $batch = @(Get-ApiResultItems -Response $response)
                 if ($batch.Count -eq 0) { break }
+                $batchIds = @(Get-ResultIds -Items $batch)
+                $newToDiscovery = Add-DiscoveryResultIds -Ids $batchIds -SeenIds $seenDescendantIds
+                if ($batchIds.Count -gt 0 -and $newToDiscovery -eq 0) {
+                    Write-Host ("  descendants start={0,4} got={1,3} repeated result window; stopping pagination" -f $start, $batch.Count) -ForegroundColor DarkYellow
+                    break
+                }
                 $added = Add-UniquePages -Items $batch
                 $descTotal += $added
                 Write-Host ("  descendants start={0,4} got={1,3} added={2,3} total={3}" -f $start, $batch.Count, $added, $byId.Count) -ForegroundColor DarkGray
@@ -415,9 +486,7 @@ function Get-AllPages {
                 $start += $batch.Count
                 if (-not $response._links.next) { break }
                 if ($batch.Count -lt $BatchSize) { break }
-                $reportedTotal = $null
-                if ($null -ne $response.totalSize) { $reportedTotal = [int]$response.totalSize }
-                elseif ($null -ne $response.total)  { $reportedTotal = [int]$response.total }
+                $reportedTotal = Get-ResponseTotal -Response $response
                 if ($null -ne $reportedTotal -and $start -ge $reportedTotal) { break }
             }
         } catch {
@@ -1790,7 +1859,7 @@ $wikiBase = Get-WikiBaseUrl -BaseUrl $ConfluenceBaseUrl
 $apiBase = "$wikiBase/rest/api"
 $headers = Get-AuthHeaders -UserEmail $Email -Token $ApiToken
 
-$exporterVersion = '2026-05-29-media-session-fix'
+$exporterVersion = '2026-07-21-pagination-repeat-guard'
 Write-Host ("Exporter version: {0}" -f $exporterVersion) -ForegroundColor DarkCyan
 Write-Host ("Exporter script : {0}" -f $PSCommandPath) -ForegroundColor DarkCyan
 
