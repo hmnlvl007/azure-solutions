@@ -386,7 +386,14 @@ function Get-AllPages {
             Write-Host ("  cql-search start={0,4} got={1,3} added={2,3} total={3}" -f $start, $batch.Count, $added, $byId.Count) -ForegroundColor DarkGray
             Write-BatchDiagnostics -Label 'cql' -Start $start -Returned $batch.Count -Response $response -Added $added -Unique $byId.Count
             $start += $batch.Count
+            # Stop when: no next link, got fewer than requested (last page), or start now
+            # meets or exceeds the API-reported totalSize (Confluence CQL returns this).
             if (-not $response._links.next) { break }
+            if ($batch.Count -lt $BatchSize) { break }
+            $reportedTotal = $null
+            if ($null -ne $response.totalSize) { $reportedTotal = [int]$response.totalSize }
+            elseif ($null -ne $response.total)  { $reportedTotal = [int]$response.total }
+            if ($null -ne $reportedTotal -and $start -ge $reportedTotal) { break }
         }
     } catch {
         Write-Host ("  cql-search unavailable: {0}" -f $_.Exception.Message) -ForegroundColor DarkYellow
@@ -407,6 +414,11 @@ function Get-AllPages {
                 Write-BatchDiagnostics -Label 'descendants' -Start $start -Returned $batch.Count -Response $response -Added $added -Unique $byId.Count
                 $start += $batch.Count
                 if (-not $response._links.next) { break }
+                if ($batch.Count -lt $BatchSize) { break }
+                $reportedTotal = $null
+                if ($null -ne $response.totalSize) { $reportedTotal = [int]$response.totalSize }
+                elseif ($null -ne $response.total)  { $reportedTotal = [int]$response.total }
+                if ($null -ne $reportedTotal -and $start -ge $reportedTotal) { break }
             }
         } catch {
             Write-Host ("  descendants unavailable: {0}" -f $_.Exception.Message) -ForegroundColor DarkYellow
@@ -1808,7 +1820,18 @@ $spaceRoot = Join-Path -Path $OutputPath -ChildPath $SpaceKey
 if ($ExportMode -eq 'Full') {
     Write-Host 'Resetting output folder for full export...' -ForegroundColor DarkCyan
     if (Test-Path -LiteralPath $spaceRoot) {
-        Remove-Item -LiteralPath $spaceRoot -Recurse -Force
+        # Remove-Item -Recurse fails when any file path exceeds MAX_PATH (260 chars).
+        # Use robocopy /MIR from an empty temp folder to delete all contents first,
+        # then remove the now-empty directory. robocopy handles long paths natively.
+        $emptyTemp = Join-Path -Path ([IO.Path]::GetTempPath()) -ChildPath ([Guid]::NewGuid().ToString())
+        [IO.Directory]::CreateDirectory($emptyTemp) | Out-Null
+        try {
+            & robocopy $emptyTemp $spaceRoot /MIR /NFL /NDL /NP /R:1 /W:0 | Out-Null
+        }
+        finally {
+            Remove-Item -LiteralPath $emptyTemp -Force -ErrorAction SilentlyContinue
+        }
+        Remove-Item -LiteralPath $spaceRoot -Force -ErrorAction SilentlyContinue
     }
 }
 Ensure-Directory -Path $spaceRoot
