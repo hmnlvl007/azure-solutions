@@ -73,6 +73,63 @@ CREATE TABLE IF NOT EXISTS TENANT_ID_NAME_CATALOG (
     discovered_at           TIMESTAMP_LTZ NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS TENANT_ID_DEFINITION_INSPECTION (
+    inspection_id VARCHAR NOT NULL, run_id VARCHAR NOT NULL,
+    object_fqn VARCHAR NOT NULL, object_type VARCHAR, is_dynamic VARCHAR,
+    is_secure BOOLEAN, column_name VARCHAR NOT NULL, effective_collation VARCHAR,
+    ddl_object_type VARCHAR, definition_text VARCHAR,
+    definition_has_collate BOOLEAN, definition_has_upper BOOLEAN,
+    definition_has_collation_function BOOLEAN,
+    definition_has_lower BOOLEAN, definition_has_ilike BOOLEAN,
+    tenant_expression_has_collate BOOLEAN,
+    tenant_expression_has_upper BOOLEAN,
+    tenant_expression_has_lower BOOLEAN,
+    inspection_status VARCHAR NOT NULL, error_message VARCHAR,
+    inspected_at TIMESTAMP_LTZ NOT NULL,
+    CONSTRAINT PK_TENANT_DEFINITION_INSPECTION PRIMARY KEY (inspection_id) NOT ENFORCED
+);
+ALTER TABLE TENANT_ID_DEFINITION_INSPECTION
+    ADD COLUMN IF NOT EXISTS definition_has_collation_function BOOLEAN;
+ALTER TABLE TENANT_ID_DEFINITION_INSPECTION ADD COLUMN IF NOT EXISTS is_secure BOOLEAN;
+ALTER TABLE TENANT_ID_DEFINITION_INSPECTION ADD COLUMN IF NOT EXISTS tenant_expression_has_collate BOOLEAN;
+ALTER TABLE TENANT_ID_DEFINITION_INSPECTION ADD COLUMN IF NOT EXISTS tenant_expression_has_upper BOOLEAN;
+ALTER TABLE TENANT_ID_DEFINITION_INSPECTION ADD COLUMN IF NOT EXISTS tenant_expression_has_lower BOOLEAN;
+
+CREATE TABLE IF NOT EXISTS TENANT_ID_VIEW_DEFINITION_SCAN (
+    scan_id VARCHAR NOT NULL, run_id VARCHAR NOT NULL,
+    database_name VARCHAR NOT NULL, schema_name VARCHAR NOT NULL,
+    view_name VARCHAR NOT NULL, object_fqn VARCHAR NOT NULL,
+    is_secure BOOLEAN, view_definition VARCHAR,
+    definition_available BOOLEAN NOT NULL,
+    references_tenant_identifier BOOLEAN NOT NULL,
+    tenant_expression_has_collate BOOLEAN NOT NULL,
+    tenant_expression_has_upper BOOLEAN NOT NULL,
+    tenant_expression_has_lower BOOLEAN NOT NULL,
+    tenant_expression_has_ilike BOOLEAN NOT NULL,
+    scanned_at TIMESTAMP_LTZ NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS TENANT_ID_COLUMN_LINEAGE (
+    lineage_id VARCHAR NOT NULL, run_id VARCHAR NOT NULL,
+    root_dynamic_table_fqn VARCHAR NOT NULL,
+    root_column_name VARCHAR NOT NULL,
+    direction VARCHAR NOT NULL,
+    source_object_database VARCHAR, source_object_schema VARCHAR,
+    source_object_name VARCHAR, source_object_domain VARCHAR,
+    source_column_name VARCHAR, source_status VARCHAR,
+    target_object_database VARCHAR, target_object_schema VARCHAR,
+    target_object_name VARCHAR, target_object_domain VARCHAR,
+    target_column_name VARCHAR, target_status VARCHAR,
+    distance NUMBER, process VARIANT, collected_at TIMESTAMP_LTZ NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS TENANT_ID_COLUMN_LINEAGE_ERRORS (
+    error_id VARCHAR NOT NULL, run_id VARCHAR NOT NULL,
+    root_dynamic_table_fqn VARCHAR NOT NULL,
+    root_column_name VARCHAR NOT NULL, direction VARCHAR NOT NULL,
+    error_message VARCHAR NOT NULL, occurred_at TIMESTAMP_LTZ NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS DEPENDENCY_CATALOG (
     upstream_fqn            VARCHAR NOT NULL,
     upstream_domain         VARCHAR,

@@ -36,12 +36,16 @@ string columns.
 2. `01_discover.sql` installs account-wide catalog discovery.
 3. `01b_access_history_optional.sql` optionally records where `TENANT_ID` was
    accessed in the last 30 days. It requires Enterprise Edition or higher.
-4. `02_analyze.sql` installs bounded `QUICK` and `FULL` analysis.
-5. `03_plan.sql` calculates risk and populates the migration manifest.
-6. `04_migrate.sql` installs guarded registration, approval, optional
+4. `02_analyze.sql` installs bounded `QUICK` and `FULL` data analysis.
+5. `02a_inspect_definitions.sql` inspects effective collation and DDL evidence
+   for tables, views, and Dynamic Tables.
+6. `02b_collect_column_lineage.sql` starts from Dynamic Table tenant columns and
+   collects native upstream/downstream column lineage, including renames.
+7. `03_plan.sql` calculates risk and populates the migration manifest.
+8. `04_migrate.sql` installs guarded registration, approval, optional
    application, and rollback procedures.
-7. `05_validate.sql` installs validation and reporting views.
-8. `06_health_checks.sql` installs read-only control-plane invariant checks.
+9. `05_validate.sql` installs validation and reporting views.
+10. `06_health_checks.sql` installs read-only control-plane invariant checks.
 
 Run the scripts with a role that can:
 
@@ -91,7 +95,135 @@ ORDER BY edit_distance, object_fqn, ordinal_position;
 
 SELECT *
 FROM DLA_SEMANTIC.TENANT_ID_ADMIN.V_TENANT_ID_COLUMN_AMBIGUITY;
+
+CALL DLA_SEMANTIC.TENANT_ID_ADMIN.INSPECT_TENANT_ID_DEFINITIONS(
+  'FV_PROD_US_SHARD_I',
+  ARRAY_CONSTRUCT('RAW', 'STAGING', 'REPORTING', 'DATABRIDGE'),
+  'ALL',
+  5000
+);
+
+SELECT
+  object_fqn, object_type, is_dynamic, column_name, effective_collation,
+  definition_has_collate, definition_has_collation_function,
+  definition_has_upper, definition_has_lower, definition_has_ilike,
+  inspection_status, error_message
+FROM DLA_SEMANTIC.TENANT_ID_ADMIN.V_LATEST_TENANT_ID_DEFINITION_INSPECTION
+ORDER BY object_type, object_fqn, column_name;
+
+SELECT
+  object_fqn, architecture_layer, view_type, is_secure, column_name,
+  effective_collation, tenant_case_handling,
+  tenant_expression_has_collate, tenant_expression_has_upper,
+  tenant_expression_has_lower
+FROM DLA_SEMANTIC.TENANT_ID_ADMIN.V_TENANT_ID_VIEW_DEFINITION_USAGE
+ORDER BY architecture_layer, object_fqn, column_name;
+
+-- Scan every view definition, including internal-only tenant joins/filters.
+CALL DLA_SEMANTIC.TENANT_ID_ADMIN.SCAN_TENANT_ID_VIEW_DEFINITIONS(
+  'FV_PROD_US_SHARD_I',
+  ARRAY_CONSTRUCT('REPORTING', 'DATABRIDGE')
+);
+
+SELECT
+  object_fqn, is_secure, definition_available,
+  references_tenant_identifier,
+  tenant_expression_has_collate, tenant_expression_has_upper,
+  tenant_expression_has_lower, tenant_expression_has_ilike,
+  view_definition
+FROM DLA_SEMANTIC.TENANT_ID_ADMIN.V_LATEST_TENANT_ID_VIEW_DEFINITION_SCAN
+ORDER BY schema_name, view_name;
 ```
+
+`effective_collation` is the direct result of calling `COLLATION()` on the
+exact, quoted column. It is `NULL` for an uncollated column and can also be
+`NULL` when an object has no row to probe, so use the retained `definition_text`
+as the second source of evidence. The `definition_has_*` fields scan the whole
+object DDL and are triage signals; inspect `definition_text` to confirm that a
+function belongs to the tenant-column expression rather than another column.
+
+`SCHEMA_FILTERS` accepts an array of stored schema names, normally uppercase.
+Pass `NULL` for all schemas in the selected database. `OBJECT_TYPE_FILTER`
+accepts `ALL`, `TABLE`, `DYNAMIC_TABLE`, `VIEW`, or `MATERIALIZED_VIEW`.
+
+Useful scoped runs:
+
+```sql
+-- RAW base tables only.
+CALL DLA_SEMANTIC.TENANT_ID_ADMIN.INSPECT_TENANT_ID_DEFINITIONS(
+  'FV_PROD_US_SHARD_I', ARRAY_CONSTRUCT('RAW'), 'TABLE', 5000);
+
+-- STAGING Dynamic Tables only.
+CALL DLA_SEMANTIC.TENANT_ID_ADMIN.INSPECT_TENANT_ID_DEFINITIONS(
+  'FV_PROD_US_SHARD_I', ARRAY_CONSTRUCT('STAGING'), 'DYNAMIC_TABLE', 5000);
+
+-- REPORTING plus known consumer schemas, regular and secure views.
+CALL DLA_SEMANTIC.TENANT_ID_ADMIN.INSPECT_TENANT_ID_DEFINITIONS(
+  'FV_PROD_US_SHARD_I',
+  ARRAY_CONSTRUCT('REPORTING', 'DATABRIDGE'), 'VIEW', 5000);
+
+-- Every schema in the database, including unknown downstream view schemas.
+CALL DLA_SEMANTIC.TENANT_ID_ADMIN.INSPECT_TENANT_ID_DEFINITIONS(
+  'FV_PROD_US_SHARD_I', NULL, 'ALL', 10000);
+
+-- All regular and secure view definitions in every schema of the database.
+CALL DLA_SEMANTIC.TENANT_ID_ADMIN.SCAN_TENANT_ID_VIEW_DEFINITIONS(
+  'FV_PROD_US_SHARD_I', NULL);
+```
+
+## Dynamic-Table-rooted column lineage
+
+Object dependencies are not sufficient for renamed columns. The lineage
+collector uses native `SNOWFLAKE.CORE.GET_LINEAGE` with domain `COLUMN`, starts
+from each approved tenant-like column on a Dynamic Table, and collects both
+upstream and downstream edges. This preserves mappings such as:
+
+```text
+RAW.ORG.ID -> STAGING.ORG.TENANTID -> REPORTING.SOME_VIEW.TENANT_ID
+```
+
+Install `02b_collect_column_lineage.sql`, then run:
+
+```sql
+CALL DLA_SEMANTIC.TENANT_ID_ADMIN.COLLECT_DYNAMIC_TABLE_TENANT_LINEAGE(
+  'FV_PROD_US_SHARD_I',
+  ARRAY_CONSTRUCT('STAGING'),
+  5,
+  5000
+);
+```
+
+Use the returned `run_id` to isolate the snapshot:
+
+```sql
+SELECT
+  root_dynamic_table_fqn,
+  root_column_name,
+  direction,
+  distance,
+  source_object_fqn,
+  source_column_name,
+  source_object_type,
+  source_is_dynamic,
+  target_object_fqn,
+  target_column_name,
+  target_object_type,
+  target_is_dynamic,
+  column_renamed,
+  process
+FROM DLA_SEMANTIC.TENANT_ID_ADMIN.V_DYNAMIC_TABLE_TENANT_COLUMN_LINEAGE
+WHERE run_id = '<run-id-returned-by-procedure>'
+ORDER BY root_dynamic_table_fqn, root_column_name, direction, distance,
+         source_object_fqn, target_object_fqn;
+
+SELECT *
+FROM DLA_SEMANTIC.TENANT_ID_ADMIN.TENANT_ID_COLUMN_LINEAGE_ERRORS
+WHERE run_id = '<run-id-returned-by-procedure>';
+```
+
+`GET_LINEAGE` requires Enterprise Edition, supports a maximum distance of five,
+and returns no rows when Snowflake has no recorded lineage. Missing access is
+captured in the error table rather than terminating the full run.
 
 ## Safety model
 
